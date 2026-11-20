@@ -56,6 +56,8 @@ class Map:
         self.refs = d["refs"]
         self.derive = d["derive"]
         self.import_use = set(d["import_use"])
+        self.classes = d.get("classes", {})
+        self.class_uses = d.get("class_uses", {})
         self.by_file: dict[str, set[int]] = {}
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
@@ -272,6 +274,21 @@ def defined_names(stmt):
     return names
 
 
+def class_path(tree, ln):
+    """Names of the classes (not inside functions) whose body or header holds line ln."""
+    path = []
+    body = tree.body
+    while True:
+        for stmt in body:
+            lo = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
+            if isinstance(stmt, ast.ClassDef) and lo <= ln <= stmt.end_lineno:
+                path.append(stmt.name)
+                body = stmt.body
+                break
+        else:
+            return path
+
+
 class PyFile:
     def __init__(self, m: Map, path: str, old_text: str, new_text: str):
         self.m, self.path = m, path
@@ -282,11 +299,47 @@ class PyFile:
         self.new_lines = new_text.split("\n")
         self.own_tests = m.by_file.get(path, set())
 
+    def class_level(self, stmt, cls, tree_is_old):
+        """A changed statement in the body (or header) of class `cls`: the tests that
+        used that class or a subclass, plus classes whose body copies from it.
+        None when the map knows nothing about the class."""
+        m = self.m
+        key = self.path + "::" + ".".join(cls)
+        sid = m.classes.get(key)
+        if sid is None:
+            return None
+        acc = m.set_of(sid)
+        if acc is ALL:
+            return ALL
+        if tree_is_old and isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for lo, hi in func_body_lines(stmt):
+                acc = add(acc, m.span(self.path, lo, hi))
+                if acc is ALL:
+                    return ALL
+        for name in defined_names(stmt):
+            for other, caps in m.class_uses.get(name, []):
+                if other == key or other.startswith(key + ".") or cls[0] not in caps:
+                    continue
+                osid = m.classes.get(other)
+                if osid is None:
+                    return ALL
+                acc = add(acc, m.set_of(osid))
+                if acc is ALL:
+                    return ALL
+        return acc
+
     def import_level(self, stmt, tree_is_old):
         """Tests affected by a changed import-time statement."""
         m = self.m
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             return ALL
+        if self.path.startswith("sqlglot/"):
+            tree = self.old_tree if tree_is_old else self.new_tree
+            cls = class_path(tree, stmt.lineno)
+            if cls:
+                r = self.class_level(stmt, cls, tree_is_old)
+                if r is not None:
+                    return r
         if self.own_tests and self.path.startswith("tests/"):
             acc = set(self.own_tests)
             names = defined_names(stmt)

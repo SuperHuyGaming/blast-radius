@@ -68,6 +68,36 @@ class InlineExecutor(_cf.Executor):
 _cf.ProcessPoolExecutor = InlineExecutor
 import concurrent.futures.process as _cfp  # noqa: E402
 _cfp.ProcessPoolExecutor = InlineExecutor
+# Which sqlglot classes each context used: the type of `self` / `cls` of every
+# sqlglot function call. A class-level change can only reach tests that used
+# that class or a subclass.
+import threading
+SQLROOT = os.path.join(ROOT, "sqlglot") + os.sep
+types_by_ctx: dict = {}
+
+
+def _prof(frame, event, arg):
+    if event != "call":
+        return
+    co = frame.f_code
+    if co.co_argcount == 0 or not co.co_filename.startswith(SQLROOT):
+        return
+    v = co.co_varnames[0]
+    if v != "self" and v != "cls":
+        return
+    try:
+        o = frame.f_locals[v]
+    except Exception:
+        return
+    t = o if v == "cls" else type(o)
+    s = types_by_ctx.get(current[0])
+    if s is None:
+        s = types_by_ctx[current[0]] = set()
+    s.add(t)
+
+
+sys.setprofile(_prof)
+threading.setprofile(_prof)
 cov.start()
 _set("<import>")
 
@@ -130,3 +160,24 @@ def pytest_sessionfinish(session, exitstatus):
     json.dump({k: sorted(v) for k, v in opens.items()}, open(os.path.join(OUT, "opens.json"), "w"))
     json.dump(outcomes, open(os.path.join(OUT, "outcomes.json"), "w"))
     json.dump(order, open(os.path.join(OUT, "order.json"), "w"))
+    sys.setprofile(None)
+    keys: dict = {}
+
+    def class_keys(t):
+        if t not in keys:
+            ks = []
+            for c in getattr(t, "__mro__", ()):
+                mod = sys.modules.get(getattr(c, "__module__", ""), None)
+                f = getattr(mod, "__file__", None) or ""
+                f = os.path.realpath(f)
+                if f.startswith(SQLROOT):
+                    ks.append(os.path.relpath(f, ROOT).replace(os.sep, "/") + "::" + c.__qualname__)
+            keys[t] = ks
+        return keys[t]
+
+    classes: dict = {}
+    for ctx, ts in types_by_ctx.items():
+        for t in ts:
+            for k in class_keys(t):
+                classes.setdefault(k, set()).add(ctx)
+    json.dump({k: sorted(v) for k, v in classes.items()}, open(os.path.join(OUT, "classes.json"), "w"))

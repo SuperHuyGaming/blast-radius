@@ -183,6 +183,55 @@ for top in ("sqlglot", "tests"):
                 continue
             visit_level(tree.body, rel)
 
+# Classes each test used (type of self/cls in sqlglot calls, with its bases).
+classes_out = {}
+cpath = os.path.join(raw, "classes.json")
+if os.path.exists(cpath):
+    for key, ctxs in json.load(open(cpath)).items():
+        acc = set()
+        for c in ctxs:
+            t = translate(c)
+            if t is ALL:
+                acc = ALL
+                break
+            acc |= t
+        classes_out[key] = sid(acc)
+
+# Class-body statements that use a name together with other (class) names, so a
+# change to Snowflake.X also reaches a class whose body copies Snowflake.X.
+class_uses = defaultdict(list)
+
+
+def visit_classes(body, rel, prefix):
+    for stmt in body:
+        if isinstance(stmt, ast.ClassDef):
+            q = prefix + [stmt.name]
+            key = rel + "::" + ".".join(q)
+            for inner in stmt.body:
+                if isinstance(inner, ast.ClassDef):
+                    continue
+                if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    parts = inner.decorator_list + inner.args.defaults
+                else:
+                    parts = [inner]
+                used = {u for part in parts for u in names_in(part)}
+                caps = sorted(u for u in used if u[:1].isupper())
+                for u in used:
+                    class_uses[u].append([key, caps])
+            visit_classes(stmt.body, rel, q)
+
+
+for top in ("sqlglot",):
+    for dp, _, fs in os.walk(os.path.join(src, top)):
+        for fn in fs:
+            if fn.endswith(".py"):
+                p = os.path.join(dp, fn)
+                rel = os.path.relpath(p, src).replace(os.sep, "/")
+                try:
+                    visit_classes(ast.parse(open(p, encoding="utf-8").read()).body, rel, [])
+                except SyntaxError:
+                    pass
+
 refs_out = {n: sid(s) for n, s in refs.items()}
 for n in refs_all:
     refs_out[n] = -1
@@ -194,6 +243,8 @@ data = {
     "refs": refs_out,
     "derive": {k: sorted(v) for k, v in derive.items()},
     "import_use": sorted(import_use),
+    "classes": classes_out,
+    "class_uses": class_uses,
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:
     json.dump(data, f, separators=(",", ":"))
