@@ -93,6 +93,18 @@ refs = defaultdict(set)
 refs_all = set()
 derive = defaultdict(set)
 import_use = set()
+qrefs = defaultdict(set)    # "Cls.attr" -> tests that ran a function-body line reading it
+qrefs_all = set()
+qderive = defaultdict(set)  # "Cls.attr" -> names defined by import-time statements reading it
+
+
+def qual_keys(node):
+    for n in ast.walk(node):
+        if isinstance(n, ast.Attribute):
+            v = n.value
+            base = v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else None
+            if base:
+                yield n, base + "." + n.attr
 
 
 def names_in(node):
@@ -146,6 +158,11 @@ def visit_level(body, fname):
                 visit_level(h.body, fname)
         else:
             defs = defined_names(stmt)
+            for _n, k in qual_keys(stmt):
+                if defs:
+                    qderive[k].update(defs)
+                else:
+                    qderive[k].add("<ALL>")
             for u in names_in(stmt):
                 if defs:
                     for d in defs:
@@ -158,6 +175,14 @@ def visit_level(body, fname):
 def visit_body(body, fname):
     ls = line_sets.get(fname, {})
     for stmt in body:
+        for n, k in qual_keys(stmt):
+            s = ls.get(n.lineno)
+            if s is None:
+                continue
+            if s is ALL:
+                qrefs_all.add(k)
+            else:
+                qrefs[k] |= s
         for n in ast.walk(stmt):
             if isinstance(n, (ast.Name, ast.Attribute)) and hasattr(n, "lineno"):
                 nm = n.id if isinstance(n, ast.Name) else n.attr
@@ -244,6 +269,8 @@ data = {
     "derive": {k: sorted(v) for k, v in derive.items()},
     "import_use": sorted(import_use),
     "classes": classes_out,
+    "qrefs": {**{k: sid(v) for k, v in qrefs.items()}, **{k: -1 for k in qrefs_all}},
+    "qderive": {k: sorted(v) for k, v in qderive.items()},
     "class_uses": class_uses,
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:

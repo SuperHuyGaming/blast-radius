@@ -58,6 +58,8 @@ class Map:
         self.import_use = set(d["import_use"])
         self.classes = d.get("classes", {})
         self.class_uses = d.get("class_uses", {})
+        self.qrefs = d.get("qrefs", {})
+        self.qderive = d.get("qderive", {})
         self.by_file: dict[str, set[int]] = {}
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
@@ -317,6 +319,18 @@ class PyFile:
                 if acc is ALL:
                     return ALL
         for name in defined_names(stmt):
+            # Direct reads like `Parser.FACTOR`, in function bodies or copied at import time.
+            for c in cls:
+                k = c + "." + name
+                q = m.qrefs.get(k)
+                if q is not None:
+                    acc = add(acc, m.set_of(q))
+                    if acc is ALL:
+                        return ALL
+                for d in m.qderive.get(k, []):
+                    acc = add(acc, ALL if d == "<ALL>" else m.names([d]))
+                    if acc is ALL:
+                        return ALL
             for other, caps in m.class_uses.get(name, []):
                 if other == key or other.startswith(key + ".") or cls[0] not in caps:
                     continue
