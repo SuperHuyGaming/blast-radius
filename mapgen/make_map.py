@@ -28,13 +28,17 @@ for t, i in tindex.items():
 ALL = None
 
 
-def translate(ctx):
-    """Context name -> set of test indexes, or None for every test."""
+def translate(ctx, own_file=None):
+    """Context name -> set of test indexes, or None for every test.
+
+    Code that ran while a test file was being collected ran at import time:
+    for that test file's own lines it concerns that file's tests, for sqlglot
+    code it can break (or change) every module that imports it, so every test."""
     if ctx == "<import>":
         return ALL
     kind, rest = ctx.split("|", 1)
     if kind == "C":
-        return set(by_file.get(rest, [])) if rest.startswith("tests/") else ALL
+        return set(by_file.get(rest, [])) if rest == own_file else ALL
     if rest not in tindex:
         return set()
     if kind == "R":
@@ -43,6 +47,7 @@ def translate(ctx):
 
 
 ctx_sets = [translate(c) for c in cov["contexts"]]
+ctx_names = cov["contexts"]
 sets, set_ids = [], {}
 
 
@@ -56,10 +61,10 @@ def sid(s):
     return set_ids[key]
 
 
-def union(ctx_idx):
+def union(ctx_idx, own_file=None):
     acc = set()
     for c in ctx_idx:
-        s = ctx_sets[c]
+        s = ctx_sets[c] if own_file is None else translate(ctx_names[c], own_file)
         if s is ALL:
             return ALL
         acc |= s
@@ -69,7 +74,8 @@ def union(ctx_idx):
 lines = {}
 line_sets = {}
 for f, lm in cov["files"].items():
-    line_sets[f] = {int(l): union(cs) for l, cs in lm.items()}
+    own = f if f.startswith("tests/") else None
+    line_sets[f] = {int(l): union(cs, own) for l, cs in lm.items()}
     lines[f] = {l: sid(s) for l, s in line_sets[f].items()}
 
 opens = defaultdict(set)
@@ -210,11 +216,18 @@ for top in ("sqlglot", "tests"):
 
 # Classes each test used (type of self/cls in sqlglot calls, with its bases).
 classes_out = {}
+classes_import = set()
 cpath = os.path.join(raw, "classes.json")
 if os.path.exists(cpath):
     for key, ctxs in json.load(open(cpath)).items():
         acc = set()
         for c in ctxs:
+            if c == "<import>":
+                classes_import.add(key)  # used while a sqlglot module body ran
+                continue
+            if c.startswith("C|"):
+                acc |= set(by_file.get(c[2:], []))  # a test module's own top-level code
+                continue
             t = translate(c)
             if t is ALL:
                 acc = ALL
@@ -257,6 +270,21 @@ for top in ("sqlglot",):
                 except SyntaxError:
                     pass
 
+# Identifiers that also appear as string constants (getattr/setattr/settings
+# lists): reads of these can bypass attribute syntax, so never narrow by them.
+str_names = set()
+for top in ("sqlglot", "tests"):
+    for dp, _, fs in os.walk(os.path.join(src, top)):
+        for fn in fs:
+            if fn.endswith(".py"):
+                try:
+                    tree = ast.parse(open(os.path.join(dp, fn), encoding="utf-8").read())
+                except SyntaxError:
+                    continue
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+                        str_names.add(n.value)
+
 refs_out = {n: sid(s) for n, s in refs.items()}
 for n in refs_all:
     refs_out[n] = -1
@@ -269,8 +297,10 @@ data = {
     "derive": {k: sorted(v) for k, v in derive.items()},
     "import_use": sorted(import_use),
     "classes": classes_out,
+    "classes_import": sorted(classes_import),
     "qrefs": {**{k: sid(v) for k, v in qrefs.items()}, **{k: -1 for k in qrefs_all}},
     "qderive": {k: sorted(v) for k, v in qderive.items()},
+    "str_names": sorted(str_names),
     "class_uses": class_uses,
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:

@@ -35,6 +35,7 @@ SRC = Path(os.environ.get("BLAST_SRC", str(APP / "src")))
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 ALL = None  # "every test"
+UNKNOWN = object()  # "the map has nothing on this": callers fall back to another rule
 
 NO_EFFECT_PREFIXES = ("docs/", "posts/", "benchmarks/", "pdoc/", ".github/")
 NO_EFFECT_SUFFIXES = (".md", ".rst", ".txt", ".png", ".jpg", ".svg", ".gif")
@@ -60,6 +61,8 @@ class Map:
         self.class_uses = d.get("class_uses", {})
         self.qrefs = d.get("qrefs", {})
         self.qderive = d.get("qderive", {})
+        self.str_names = set(d.get("str_names", []))
+        self.classes_import = set(d.get("classes_import", []))
         self.by_file: dict[str, set[int]] = {}
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
@@ -276,6 +279,87 @@ def defined_names(stmt):
     return names
 
 
+CHECK_SCRIPT = r"""
+import importlib, importlib.abc, importlib.util, json, pkgutil, sys
+src, patched = sys.argv[1], json.loads(sys.argv[2])
+sys.path.insert(0, src)
+sys.dont_write_bytecode = True
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        f = patched.get(name)
+        if f is None:
+            return None
+        is_pkg = f.endswith("__init__.py")
+        return importlib.util.spec_from_file_location(
+            name, f, submodule_search_locations=[src + "/" + name.replace(".", "/")] if is_pkg else None)
+
+sys.meta_path.insert(0, Finder())
+failed = []
+try:
+    import sqlglot
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name == "sqlglot.__main__":
+            continue
+        try:
+            importlib.import_module(info.name)
+        except BaseException as e:
+            failed.append(info.name)
+except BaseException:
+    failed.append("sqlglot")
+print(json.dumps(sorted(failed)))
+"""
+
+
+class ImportCheck:
+    """Imports every sqlglot module, pristine once and with a patched file swapped in,
+    in a subprocess. A patch passes when it makes no module fail to import."""
+
+    def __init__(self):
+        self.baseline = None
+        self.cache = {}
+
+    def run(self, patched):
+        import subprocess
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c", CHECK_SCRIPT, str(SRC), json.dumps(patched)],
+                               capture_output=True, text=True, timeout=60, cwd="/tmp" if os.path.isdir("/tmp") else None)
+            return set(json.loads(r.stdout.strip().splitlines()[-1]))
+        except Exception as e:  # noqa: BLE001
+            log(f"import check error: {e!r}")
+            return None
+
+    def ok(self, path, new_text):
+        if not path.startswith("sqlglot/") or not path.endswith(".py"):
+            return False
+        key = (path, hash(new_text))
+        if key in self.cache:
+            return self.cache[key]
+        if self.baseline is None:
+            self.baseline = self.run({})
+        if self.baseline is None:
+            return False
+        import tempfile
+        mod = path[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        fd, tmp = tempfile.mkstemp(suffix=".py", dir="/tmp" if os.path.isdir("/tmp") else None)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        failed = self.run({mod: tmp})
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        good = failed is not None and failed <= self.baseline
+        self.cache[key] = good
+        log(f"import check {path}: {'ok' if good else 'FAILED'}")
+        return good
+
+
+IMPORTS = ImportCheck()
+
+
 def class_path(tree, ln):
     """Names of the classes (not inside functions) whose body or header holds line ln."""
     path = []
@@ -301,18 +385,45 @@ class PyFile:
         self.new_lines = new_text.split("\n")
         self.own_tests = m.by_file.get(path, set())
 
+    def narrow(self, stmt, users):
+        """For a plain class attribute (not a def or class), keep only the class's users
+        that also ran a line reading that attribute name. Only when every read of the
+        name is visible: not read at import time, never spelled as a string
+        (getattr/setattr), and known to the map."""
+        m = self.m
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            return users
+        names = defined_names(stmt)
+        if not names:
+            return users
+        reads: set[int] = set()
+        for n in names:
+            if n in m.str_names or n in m.import_use or n in m.derive:
+                return users
+            sid = m.refs.get(n)
+            if sid is None or sid == -1:
+                return users
+            reads.update(m.sets[sid])
+        return users & reads
+
     def class_level(self, stmt, cls, tree_is_old):
         """A changed statement in the body (or header) of class `cls`: the tests that
         used that class or a subclass, plus classes whose body copies from it.
-        None when the map knows nothing about the class."""
+        UNKNOWN when the map knows nothing about the class."""
         m = self.m
         key = self.path + "::" + ".".join(cls)
         sid = m.classes.get(key)
         if sid is None:
-            return None
+            return UNKNOWN
         acc = m.set_of(sid)
         if acc is ALL:
             return ALL
+        if key in m.classes_import:
+            # The class is also used while sqlglot modules load. Only if every
+            # module still imports with the patch applied are the run-time users
+            # enough; otherwise the change can break whole test files.
+            if not IMPORTS.ok(self.path, self.new_text):
+                return ALL
         if tree_is_old and isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for lo, hi in func_body_lines(stmt):
                 acc = add(acc, m.span(self.path, lo, hi))
@@ -352,7 +463,7 @@ class PyFile:
             cls = class_path(tree, stmt.lineno)
             if cls:
                 r = self.class_level(stmt, cls, tree_is_old)
-                if r is not None:
+                if r is not UNKNOWN:
                     return r
         if self.own_tests and self.path.startswith("tests/"):
             acc = set(self.own_tests)

@@ -96,6 +96,27 @@ def _prof(frame, event, arg):
     s.add(t)
 
 
+# Module bodies run at import time even when the import happens lazily inside a
+# test (sqlglot loads dialects on first use). Count that work as "<import>".
+import importlib._bootstrap_external as _be
+
+_orig_exec_module = _be._LoaderBasics.exec_module
+
+
+def _exec_module(self, module):
+    f = getattr(module, "__file__", None) or ""
+    if not os.path.realpath(f).startswith(SQLROOT):
+        return _orig_exec_module(self, module)
+    prev = current[0]
+    _set("<import>")
+    try:
+        return _orig_exec_module(self, module)
+    finally:
+        _set(prev)
+
+
+_be._LoaderBasics.exec_module = _exec_module
+
 sys.setprofile(_prof)
 threading.setprofile(_prof)
 cov.start()
