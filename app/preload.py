@@ -41,6 +41,10 @@ def _single_thread_duckdb() -> None:
 
 
 def install_environment(root: str) -> None:
+    # sqlglot checks at import whether a test framework is loaded (expressions/core.py UNITTEST)
+    # and then validates expression arguments strictly, as it does under pytest
+    import unittest  # noqa: F401
+
     import pool
 
     os.environ["SKIP_INTEGRATION"] = "0"

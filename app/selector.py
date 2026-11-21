@@ -32,11 +32,17 @@ RUN_SLOW = os.environ.get("BR_RUN_SLOW")  # validation mode: also run the slow t
 NO_REDUCE = os.environ.get("BR_NO_REDUCE")  # validation mode: always run whole tests
 MAPS_OBJ = None
 ANSWER_FD = None
+BASE_STATE = None
+BASE_FUNCTION_KEYS = frozenset()
+NO_DIFF = os.environ.get("BR_NO_DIFF")  # validation: no import-state diff
+CLASS_FILTER = os.environ.get("BR_CLASS_FILTER") == "1"  # off: the instantiation trace does not see every reader
+FRESH_REDUCE = os.environ.get("BR_FRESH_REDUCE", "1") == "1"
 
 WORKER_COST = 2.0
 HOLD_SECONDS = float(os.environ.get("BR_HOLD", "1.5"))  # test runs below this CPU cost always start
 COMMIT_SECONDS = float(os.environ.get("BR_COMMIT", "8.0"))  # CPU limit of the test runs of one commit
 FRESH_SECONDS = float(os.environ.get("BR_FRESH", "3.0"))  # the same for a commit that needs a new import
+INERT_SECONDS = 1.0  # the same when the import state did not change at all
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
@@ -69,6 +75,8 @@ class Maps:
         self.unit_cache = {}
         self.test_cache = {}
         self._paths = None
+        self._readers = None
+        self._class_users = None
         try:
             with open(os.path.join(path, "cost.bin"), "rb") as f:
                 self.cost = marshal.load(f)
@@ -119,6 +127,33 @@ class Maps:
             self.test_cache[number] = rec
         return rec
 
+    def readers(self, name):
+        """The function lines that read 'name': list of (path, line)."""
+        if self._readers is None:
+            try:
+                with open(os.path.join(self.path, "readers.bin"), "rb") as f:
+                    self._readers = marshal.loads(zlib.decompress(f.read()))
+            except OSError:
+                self._readers = {}
+        raw = self._readers.get(name)
+        if not raw:
+            return ()
+        arr = array("I")
+        arr.frombytes(raw)
+        paths = self.paths()
+        return [(paths[arr[i]], arr[i + 1]) for i in range(0, len(arr), 2)]
+
+    def class_users(self, name):
+        """Ids of the classes whose instances can read an attribute defined by class 'name',
+        or None when that cannot be told from instantiations."""
+        if self._class_users is None:
+            try:
+                with open(os.path.join(self.path, "classes.bin"), "rb") as f:
+                    self._class_users = marshal.loads(zlib.decompress(f.read()))
+            except OSError:
+                self._class_users = {}
+        return self._class_users.get(name)
+
     def paths(self):
         if self._paths is None:
             self._paths = {fid: rel for rel, fid in self.meta["files"].items()}
@@ -142,7 +177,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected")
 
     def __init__(self, commit):
         self.commit = commit
@@ -158,6 +193,16 @@ class Plan:
         self.broken = []  # modules that fail to import with the patch
         self.times = {}  # test -> CPU seconds of its run (for logs)
         self.pool_died = []  # tests during which a class-level process pool died
+        self.fpairs = []  # (old code, new code) of changed function bodies that also run at import
+        self.stmt_lines = {}  # path -> lines of changed function statements (import-time commits)
+        self.diff = None  # names whose import-time value the patch changes (import-state diff)
+        self.def_units = {}  # path -> lines of functions whose header (defaults, decorators) changed
+        self.data_cands = set()  # tests that read a changed file as data
+        self.skipped = set()  # tests not run because another test had failed already
+        self.diffable = True  # every changed .py file is a modified sqlglot/ module
+        self.class_filter = None  # class ids: only parts that create one of these can read the change
+        self.plain_lines = set()  # (path, line) of changed code itself: no class filter there
+        self.unaffected = set()  # candidates that cannot read the changed value at all
 
 
 CODING_RE = re.compile(r"coding[:=]\s*[-\w.]+")
@@ -234,6 +279,12 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             for g in groups:
                 for ln in range(g[0], g[0] + g[1]):
                     if stmt_pex[ln]:
+                        # the function also runs at import: its body change is known here
+                        plan.fpairs.extend(pairs)
+                        sl = plan.stmt_lines.setdefault(rel, set())
+                        for g2 in groups:
+                            for l2 in range(g2[0], g2[0] + g2[1]):
+                                sl.update(range(span_a[l2], span_b[l2] + 1) if span_a[l2] else (l2,))
                         return True
                     plan.cands.update(maps.tests(stmt_set[ln]))
                     touched.update(range(span_a[ln], span_b[ln] + 1) if span_a[ln] else (ln,))
@@ -256,6 +307,12 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
     n = len(def_set) - 2
     complete = True
     reader_lines = {}
+    units = rec[0]
+    # a change in a function header (defaults, decorators) reaches the tests that run the function
+    for o, nr, nl, na, removed, added in fp.groups:
+        for s, e, _, kind in units:
+            if kind == 0 and s <= o <= e and e > s:
+                plan.def_units.setdefault(fp.old_path, set()).update(range(s, e + 1))
     for o, nr, nl, na, removed, added in fp.groups:
         lines = range(o, o + nr) if nr else (o - 1, o)
         simple = nr == na and all(_indent(x) == _indent(y) for x, y in zip(removed, added))
@@ -340,11 +397,15 @@ def make_plan(commit, text, maps: Maps) -> Plan:
                 sid = maps.meta["opened"].get(key)
                 if sid:
                     plan.cands.update(maps.tests(sid))
+                    plan.data_cands.update(maps.tests(sid))
         if fp.status != "modify":
             d = os.path.dirname(path)
             sid = maps.meta["listed"].get(d)
             if sid:
                 plan.cands.update(maps.tests(sid))
+                plan.data_cands.update(maps.tests(sid))
+        if is_py and not (path.startswith("sqlglot/") and fp.status == "modify"):
+            plan.diffable = False
     if fresh:
         plan.mode = "fresh"
     elif plan.work or plan.cands:
@@ -364,7 +425,7 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
     """For each candidate test whose independent parts are mapped: the parts that run the
     changed code or read a changed fixture entry. Other parts cannot change their result."""
     keeps = {}
-    if plan.mode not in ("hot", "fresh"):
+    if plan.mode not in ("hot", "fresh", "fresh_purge"):
         return keeps
     if any(p.startswith("tests/") and p.endswith(".py") for p in plan.files):
         return keeps
@@ -384,6 +445,9 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
         if trec is None:
             continue
         stmts, units, patterns = trec[2], trec[3], trec[4]
+        unit_classes = trec[8] if len(trec) > 8 else None
+        base_classes = trec[9] if len(trec) > 9 else None
+        cfilter = plan.class_filter if unit_classes is not None else None
         chosen = set()
         if code_lines:
             seen = False
@@ -393,10 +457,21 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
                 if pat is None:
                     continue
                 seen = True
+                plain = cfilter is None or (rel, ln) in plan.plain_lines
                 if pat == BASE_PATTERN:
-                    whole = True
-                    break
-                chosen.update(patterns[pat])
+                    # the always-run part runs the line: the whole test runs, unless that
+                    # part creates no object that can read the changed value
+                    if plain or base_classes is None or not cfilter.isdisjoint(base_classes):
+                        whole = True
+                        break
+                    continue
+                if plain:
+                    chosen.update(patterns[pat])
+                else:
+                    for u in patterns[pat]:
+                        uc = unit_classes[u]
+                        if uc is None or not cfilter.isdisjoint(uc):
+                            chosen.add(u)
             if whole:
                 continue
             if not seen and (plan.work or plan.mode != "hot"):
@@ -423,6 +498,10 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
                     break
                 keep_stmts.update(p for p in parents if p >= 0)
         if not ok:
+            continue
+        if code_lines and not chosen and not keep_stmts and not fixtures and plan.class_filter is not None:
+            # no part of this test creates an object that can read the changed value
+            plan.unaffected.add(n)
             continue
         keeps[n] = (keep_stmts, keep_files, keep_tasks, n in keeps, chosen)
     return keeps
@@ -463,6 +542,8 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
                 continue
             if not reduce.apply_reduction(cls, test_id, os.path.join(ROOT, rel), shape, lines,
                                           frec[1], frec[2], keep_stmts, scaled):
+                if DEBUG:
+                    sys.stderr.write("reduction not applied: %s\n" % test_id)
                 continue
         out[n] = (keep_files, keep_tasks)
     return out
@@ -472,7 +553,7 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
 # Children
 
 
-def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
+def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=None):
     import runner
 
     last = [time.process_time()]
@@ -481,7 +562,8 @@ def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
 
     def emit(number, failed):
         now = time.process_time()
-        os.write(wfd, b"%d %d %d\n" % (number, 1 if failed else 0, int((now - last[0]) * 1e6)))
+        code = 2 if failed is None else (1 if failed else 0)  # 2 = not run
+        os.write(wfd, b"%d %d %d\n" % (number, code, int((now - last[0]) * 1e6)))
         last[0] = now
         if pool_module.InlinePool.broke_any:
             # the class's shared process pool died in this test: in a full run every later
@@ -519,6 +601,43 @@ def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
 
             for name in preload.broken_modules():
                 os.write(wfd, b"B %s\n" % name.encode())
+            if plan_fd is not None:
+                # What did the import leave behind, compared with the pinned tree? The parent
+                # turns the changed names into the tests (and test parts) that read them.
+                import statefp
+
+                alias = {}
+                if plan.fpairs:
+                    f0 = statefp.Fingerprinter()
+                    stack = list(plan.fpairs)
+                    while stack:
+                        old, new = stack.pop()
+                        alias[f0.code(new)] = f0.code(old)
+                        oc = [k for k in old.co_consts if isinstance(k, type(old))]
+                        nc = [k for k in new.co_consts if isinstance(k, type(new))]
+                        if len(oc) == len(nc):
+                            stack.extend(zip(oc, nc))
+                new_state, fpr = statefp.snapshot(alias)
+                changed = statefp.diff(BASE_STATE, new_state)
+                if len(changed) > 300:
+                    os.write(wfd, b"D many\n")
+                else:
+                    rows = [[list(k), k in fpr.function_keys or k in BASE_FUNCTION_KEYS] for k in changed]
+                    os.write(wfd, b"D " + json.dumps(rows).encode() + b"\n")
+                chunks = []
+                while True:
+                    chunk = os.read(plan_fd, 1 << 16)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                os.close(plan_fd)
+                todo = marshal.loads(b"".join(chunks)) if chunks else None
+                if not todo or not todo["order"]:
+                    os.write(wfd, b"END\n")
+                    os._exit(0)
+                order = todo["order"]
+                skip_after_fail = todo["skip"]
+                plan.keeps = todo["keeps"]
         else:
             for full, pairs in plan.work:
                 swaps = engine.plan_swaps(pairs, index)
@@ -547,17 +666,7 @@ def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
         t_setup = time.process_time()
-        if os.environ.get("BR_PROFILE"):
-            import cProfile
-            import pstats
-
-            prof = cProfile.Profile()
-            prof.enable()
-            runner.run_tests([(n, tests[n]["id"]) for n in order], emit, stop_after_fail, keeps, started)
-            prof.disable()
-            pstats.Stats(prof, stream=sys.stderr).sort_stats("cumulative").print_stats(45)
-        else:
-            runner.run_tests([(n, tests[n]["id"]) for n in order], emit, stop_after_fail, keeps, started)
+        runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail)
         if DEBUG:
             sys.stderr.write("child %s setup %.3f run %.3f\n" % (plan.commit, t_setup - t_child, time.process_time() - t_setup))
         os.write(wfd, b"END\n")
@@ -570,21 +679,30 @@ def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
         os._exit(0)
 
 
-def run_child(plan, order, tests, index, stop_after_fail, allowed, time_left):
+def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(), on_diff=None):
     """Runs the tests in a forked child. Returns (verdicts, status, hung test or None).
 
-    status: END, REDO, ERR, TIMEOUT, DIED. allowed[n] = seconds that test n may take."""
+    status: END, REDO, ERR, TIMEOUT, DIED. allowed[n] = seconds that test n may take.
+    on_diff: for a commit that changes import-time code. The child first reports which
+    import-time values differ from the pinned tree; on_diff(names) then decides what to run."""
     r, w = os.pipe()
+    plan_r = plan_w = None
+    if on_diff is not None:
+        plan_r, plan_w = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r)
+        if plan_w is not None:
+            os.close(plan_w)
         try:
             os.setpgid(0, 0)
         except OSError:
             pass
-        child_main(plan, order, tests, w, index, stop_after_fail)
+        child_main(plan, order, tests, w, index, skip_after_fail, plan_r)
         os._exit(0)
     os.close(w)
+    if plan_r is not None:
+        os.close(plan_r)
     verdicts = {}
     status = "DIED"
     hung = None
@@ -623,14 +741,29 @@ def run_child(plan, order, tests, index, stop_after_fail, allowed, time_left):
                 broken.append(line[2:].decode())
             elif line.startswith(b"P "):
                 plan.pool_died.append(int(line[2:]))
+            elif line.startswith(b"D "):
+                keys = None if line == b"D many" else json.loads(line[2:])
+                todo = on_diff(keys)
+                allowed = todo.pop("allowed")
+                data = marshal.dumps(todo)
+                while data:
+                    data = data[os.write(plan_w, data):]
+                os.close(plan_w)
+                plan_w = None
+                t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
             else:
                 parts = line.split()
-                verdicts[int(parts[0])] = parts[1] == b"1"
+                if parts[1] == b"2":
+                    plan.skipped.add(int(parts[0]))
+                else:
+                    verdicts[int(parts[0])] = parts[1] == b"1"
                 if len(parts) > 2:
                     plan.times[int(parts[0])] = int(parts[2]) / 1e6
                 current = None
                 t_test = time.monotonic() + 30.0
     os.close(r)
+    if plan_w is not None:
+        os.close(plan_w)
     try:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -645,6 +778,87 @@ def run_child(plan, order, tests, index, stop_after_fail, allowed, time_left):
         if current is not None:
             hung = current  # the test that killed the process fails in a full run too
     return verdicts, status, hung
+
+
+def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
+    """Uses the import-state diff of a commit that changes import-time code.
+
+    keys: the module globals and class attributes whose value differs from the pinned tree
+    (None = too many). Nothing differs and no function body changed: the Python edits do
+    nothing. Otherwise a test part can see the change only when it runs a line that reads
+    one of the changed names (or a changed function): the reduced runs apply to those lines."""
+    if keys is None:
+        plan.note.append("import state: many changes")
+        plan.lines = {"?": None}
+        return
+    names = set()
+    whole = False
+    owners = set()
+    for key, is_function in keys:
+        owners.add("%s.%s" % (key[1], key[2]) if key[0] == "A" else None)
+        name = key[-1]
+        if name == "__bases__" or not isinstance(name, str):
+            whole = True
+        elif is_function:
+            # A function is also reached by computed names (dispatch tables). The reduced
+            # runs are safe for it only when the patch changed that function's own header:
+            # then every user runs its body, and the body lines are known.
+            if not plan.def_units:
+                whole = True
+        else:
+            names.add(name)
+    plan.diff = sorted(names)
+    if not keys and not plan.fpairs:
+        # Nothing that the import leaves behind differs. The edit very likely does nothing;
+        # the cheapest candidates still run as a check, and nothing is selected unrun.
+        plan.note.append("import state unchanged")
+        plan.lines = {"?": None}
+        plan.keeps = compute_keeps(plan, maps, tests)
+        return
+    lines = {}
+    for name in names:
+        rs = maps.readers(name)
+        if not rs or len(rs) > 600:
+            whole = True  # read in an unknown way, or read everywhere
+            break
+        for path, ln in rs:
+            lines.setdefault(path, set()).add(ln)
+    if whole or not FRESH_REDUCE:
+        plan.note.append("import state: no reduced runs")
+        plan.lines = {"?": None}
+        plan.keeps = compute_keeps(plan, maps, tests)
+        return
+    # a reader line stands for its whole statement, as for edits in function bodies
+    full = {}
+    for path, lns in lines.items():
+        rec = maps.file(path)
+        acc = full.setdefault(path, set())
+        for ln in lns:
+            if rec is not None and ln < len(rec[9]) and rec[9][ln]:
+                acc.update(range(rec[9][ln], rec[10][ln] + 1))
+            else:
+                acc.add(ln)
+    for src in (plan.stmt_lines, plan.def_units):
+        for path, lns in src.items():
+            full.setdefault(path, set()).update(lns)
+            plan.plain_lines.update((path, ln) for ln in lns)
+    # Every changed value is an attribute of a known class: a part that creates no object of
+    # such a class (or of a dialect that hands the class out) cannot read the new value.
+    if owners and None not in owners and CLASS_FILTER:
+        wanted = set()
+        for owner in owners:
+            users = maps.class_users(owner)
+            if users is None:
+                wanted = None
+                break
+            wanted.update(users)
+        plan.class_filter = wanted
+    plan.lines = full
+    plan.note.append("import state: %d names" % len(names))
+    plan.keeps = compute_keeps(plan, maps, tests)
+    if plan.unaffected:
+        plan.cands -= plan.unaffected
+        plan.note.append("unaffected %d" % len(plan.unaffected))
 
 
 def estimate_cost(n, plan: Plan, maps: Maps, seconds):
@@ -806,7 +1020,9 @@ def run(t_start, deadline, state):
         # long test is left out (its selection would cost more than the small risk).
         # tests that the commit breaks. A very long test (the TPC-DS run) is left out unless a
         # failing test is close to it: same test class, or same fixture file.
-        if plan.broken or not verdicts or unknown:
+        if "import state unchanged" in plan.note and not failing and not plan.broken and not unknown:
+            pass  # the import left nothing different and the cheapest candidates pass
+        elif plan.broken or not verdicts or unknown:
             selected.update(held)
         else:
             # tests selected without a verdict count as evidence too: they may fail
@@ -836,88 +1052,109 @@ def run(t_start, deadline, state):
             debug_rows[c] = {
                 "mode": plan.mode, "status": status, "cands": sorted(plan.cands), "cpu": round(sum(os.times()[:4]), 3),
                 "verdicts": {str(k): int(v) for k, v in verdicts.items()}, "note": plan.note,
-                "reduced": sorted(plan.keeps), "held": sorted(held), "ran": len(ran),
+                "reduced": sorted(plan.keeps), "held": sorted(held), "ran": len(ran), "diff": plan.diff,
                 "times": {str(k): round(v, 4) for k, v in plan.times.items()},
                 "costs": {str(n): round(estimate_cost(n, plan, maps, seconds), 4) for n in ran},
                 "est": round(sum(estimate_cost(n, plan, maps, seconds) for n in ran), 3),
             }
 
-    def execute(c, plan, index):
+    def choose(plan):
+        """Splits the candidates into tests to run and tests that are held (not run)."""
         cands = sorted(plan.cands)
         cost = {n: estimate_cost(n, plan, maps, seconds) for n in cands}
         if RUN_ALL:
-            ran, held = [n for n in cands if cost[n] <= 60 or RUN_SLOW], []
-        else:
-            # a test is held (not run, selected as it is) when a run costs more CPU than
-            # its selection costs in the worst case
-            limit = {n: max(HOLD_SECONDS, HOLD_FACTOR * (WORKER_COST + seconds[n])) for n in cands}
-            ran = [n for n in cands if cost[n] <= limit[n]]
-            held = [n for n in cands if cost[n] > limit[n]]
-            budget = COMMIT_SECONDS if plan.mode == "hot" else FRESH_SECONDS
-            total = sum(cost[n] for n in ran)
-            if total > budget:
-                # keep the cheapest tests up to the limit; the others are held
-                keep_set = set()
-                acc = 0.0
-                for n in sorted(ran, key=lambda n: cost[n]):
-                    if acc + cost[n] > budget:
-                        break
-                    acc += cost[n]
-                    keep_set.add(n)
-                held += [n for n in ran if n not in keep_set]
-                ran = [n for n in ran if n in keep_set]
-        if not ran:
-            if held and not RUN_ALL and plan.mode in ("hot", "fresh", "fresh_purge"):
-                plan.note.append("only held tests")
-            finish(c, plan, {}, "END", ran, held)
+            return [n for n in cands if cost[n] <= 60 or RUN_SLOW], [], cost
+        # a test is held (not run, selected as it is) when a run costs more CPU than
+        # its selection costs in the worst case
+        limit = {n: max(HOLD_SECONDS, HOLD_FACTOR * (WORKER_COST + seconds[n])) for n in cands}
+        ran = [n for n in cands if cost[n] <= limit[n]]
+        held = [n for n in cands if cost[n] > limit[n]]
+        budget = COMMIT_SECONDS if plan.mode == "hot" else FRESH_SECONDS
+        if "import state unchanged" in plan.note:
+            budget = INERT_SECONDS
+        if sum(cost[n] for n in ran) > budget:
+            # keep the cheapest tests up to the limit; the others are held
+            keep_set = set()
+            acc = 0.0
+            for n in sorted(ran, key=lambda n: cost[n]):
+                if acc + cost[n] > budget:
+                    break
+                acc += cost[n]
+                keep_set.add(n)
+            held += [n for n in ran if n not in keep_set]
+            ran = [n for n in ran if n in keep_set]
+        return ran, held, cost
+
+    def execute(c, plan, index):
+        box = {}
+
+        def prepare():
+            ran, held, cost = choose(plan)
+            box["ran"], box["held"] = ran, held
+            allowed = {n: max(TEST_TIMEOUT, 25.0 * cost[n]) * SLOWDOWN for n in ran}
+            # Once a test has failed, the commit is known to break something. A further
+            # verdict then only saves the recorded seconds of a passing test, so only runs
+            # that are cheap next to those seconds go on; the others are selected as they are.
+            skip = set() if RUN_ALL else {n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n])}
+            return ran, allowed, skip
+
+        left = deadline - time.monotonic()
+        if left < 3.0:
+            ran, held, _ = choose(plan)
+            finish(c, plan, {}, "DEADLINE", ran, held)
             return
-        allowed = {n: max(TEST_TIMEOUT, 25.0 * cost[n]) * SLOWDOWN for n in ran}
-        verdicts = {}
-        status = "END"
-        todo = ran
-        blind = []
-        stop_at_fail = not RUN_ALL
-        for attempt in range(4):
-            left = deadline - time.monotonic()
-            if left < 3.0:
-                status = "DEADLINE"
-                break
-            v, status, hung = run_child(plan, todo, tests, index, stop_at_fail, allowed, left - 2.0)
+        use_diff = plan.mode != "hot" and plan.diffable and BASE_STATE is not None and not NO_DIFF
+        if use_diff:
+            def on_diff(keys):
+                refine_with_diff(plan, keys, maps, tests)
+                ran, allowed, skip = prepare()
+                return {"order": ran, "keeps": plan.keeps, "skip": skip, "allowed": allowed}
+
+            verdicts, status, hung = run_child(plan, None, tests, index, {}, left - 2.0, (), on_diff)
+            if "ran" not in box:
+                # the child never reported its import state: nothing is known
+                ran, held, _ = choose(plan)
+                if status in ("TIMEOUT", "DIED"):
+                    for p in plan.files:
+                        if p.endswith(".py"):
+                            plan.broken.append(p[:-3].replace("/", "."))
+                    plan.note.append("import does not end")
+                finish(c, plan, {}, status, ran, held)
+                return
+
+        else:
+            ran, allowed, skip = prepare()
+            if not ran:
+                finish(c, plan, {}, "END", ran, box["held"])
+                return
+            verdicts, status, hung = run_child(plan, ran, tests, index, allowed, left - 2.0, skip)
             if status == "REDO":
                 return "REDO"
-            verdicts.update(v)
-            if status in ("TIMEOUT", "DIED") and hung is None and not v and plan.mode != "hot":
-                # the import of the patched tree hangs or kills the process: every test that
-                # loads a patched module fails in a full run
+            if status in ("TIMEOUT", "DIED") and hung is None and not verdicts and plan.mode != "hot":
                 for p in plan.files:
                     if p.endswith(".py"):
                         plan.broken.append(p[:-3].replace("/", "."))
                 plan.note.append("import does not end")
+        ran, held = box["ran"], box["held"]
+        # a test that does not end is a timeout in the full run; the tests after it run again
+        for attempt in range(2):
+            if hung is None:
                 break
-            if hung is not None:
-                verdicts[hung] = True  # a test that does not end is a timeout in the full run
-            todo = [n for n in todo if n not in verdicts]
-            if plan.pool_died:
-                first = min(plan.pool_died)
-                cls_id = tests[first]["id"].rsplit("::", 1)[0]
-                users = set(maps.tests(maps.meta.get("pool_users", 0)))
-                dead = [n for n in todo if n > first and n in users and tests[n]["id"].rsplit("::", 1)[0] == cls_id]
-                blind += dead
-                todo = [n for n in todo if n not in set(dead)]
-            if stop_at_fail and any(verdicts.values()) and todo:
-                # The commit breaks something. From here a verdict only saves the recorded
-                # seconds of a passing test, so only runs that are cheap next to that go on;
-                # the other candidates are selected as they are.
-                stop_at_fail = False
-                cheap = [n for n in todo if cost[n] <= max(0.03, AFTER_FAIL_RATIO * seconds[n])]
-                blind += [n for n in todo if n not in set(cheap)]
-                todo = cheap
-                if todo:
-                    continue
-                status = "END"
+            verdicts[hung] = True
+            todo = [n for n in ran if n not in verdicts and n not in plan.skipped]
+            left = deadline - time.monotonic()
+            if not todo or left < 3.0:
                 break
-            if status == "END" or not todo or hung is None:
-                break
+            cost_allowed = {n: TEST_TIMEOUT * SLOWDOWN for n in todo}
+            v, status, hung = run_child(plan, todo, tests, index, cost_allowed, left - 2.0, set(todo))
+            verdicts.update(v)
+        blind = [n for n in ran if n in plan.skipped and n not in verdicts]
+        if plan.pool_died:
+            first = min(plan.pool_died)
+            cls_id = tests[first]["id"].rsplit("::", 1)[0]
+            users = set(maps.tests(maps.meta.get("pool_users", 0)))
+            blind += [n for n in ran if n not in verdicts and n > first and n in users
+                      and tests[n]["id"].rsplit("::", 1)[0] == cls_id]
         finish(c, plan, verdicts, status, ran, held, blind)
 
     # 1. answers that need no run
@@ -955,8 +1192,18 @@ def run(t_start, deadline, state):
     #    replaces code objects). Commits that change import-time code run after them: their
     #    child drops the loaded sqlglot modules and imports the patched tree again.
     index = None
-    if hot:
+    global BASE_STATE, BASE_FUNCTION_KEYS
+    want_diff = bool(fresh) and not NO_DIFF and any(plans[c].diffable for c in fresh)
+    if hot or want_diff:
         preload.import_sqlglot()
+    if want_diff:
+        # The import state of the pinned tree, to compare each patched import with. It is
+        # taken before any test module is loaded, because tests change module state.
+        import statefp
+
+        BASE_STATE, base_fpr = statefp.snapshot()
+        BASE_FUNCTION_KEYS = base_fpr.function_keys
+    if hot:
         mods = sorted({tests[n]["file"][:-3].replace("/", ".") for c in hot for n in plans[c].cands})
         preload.import_tests(mods)
         import reduce
@@ -973,12 +1220,13 @@ def run(t_start, deadline, state):
         index = engine.FunctionIndex(ROOT)
         gc.collect()
         gc.freeze()
-    purge = bool(hot)
+    purge = bool(hot) or want_diff
     for c in hot:
         if execute(c, plans[c], index) == "REDO":
             fresh.append(c)
             plan = plans[c]
             plan.note.append("redo")
+            plan.diffable = False
             for p in plan.files:
                 rec = maps.file(p)
                 if rec is not None:
