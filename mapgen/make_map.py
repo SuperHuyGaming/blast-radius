@@ -309,7 +309,7 @@ if merged_seen:
 # Tests that share one process pool kept on the test class (self.pool / cls.pool):
 # a patch that crashes a pool worker breaks the pool for every later user, so they
 # fail together. Found as the tests that ran a `self.pool.submit(` line.
-pool_groups = []
+pool_by_class = defaultdict(set)
 for f, ls in line_sets.items():
     if not f.startswith("tests/"):
         continue
@@ -319,7 +319,9 @@ for f, ls in line_sets.items():
         continue
     for ln, s in ls.items():
         if s is not ALL and 0 < ln <= len(text) and re.search(r"(self|cls)\.\w*pool\w*\.(submit|map)\(", text[ln - 1]):
-            pool_groups.append(sid(s))
+            for i in s:  # group by the test class that owns the pool
+                pool_by_class[tests[i].rsplit("::", 1)[0]].add(i)
+pool_groups = [sid(g) for g in pool_by_class.values()]
 
 refs_out = {n: sid(s) for n, s in refs.items()}
 for n in refs_all:

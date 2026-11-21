@@ -842,12 +842,14 @@ def select(m: Map, patch_text: str):
         if acc is ALL:
             return ALL
     # Tests sharing a class-level process pool: if one crashes a pool worker, the
-    # pool is broken for every user that runs after it, so add those (run order).
-    for g in m.pool_groups:
-        hit = acc & g
-        if hit:
-            first = min(hit)
-            acc |= {t for t in g if t > first}
+    # pool is broken for the others (run order is not guaranteed), so add the class's
+    # whole pool group.
+    # A worker crash needs a change to sqlglot's code: data and test edits only change
+    # the input that unchanged, pinned code processes.
+    if any((f.get("new") or f.get("old") or "").startswith("sqlglot/") for f in files):
+        for g in m.pool_groups:
+            if acc & g:
+                acc |= g
     return acc
 
 
