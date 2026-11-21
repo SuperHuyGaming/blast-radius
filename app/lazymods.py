@@ -22,7 +22,12 @@ import sys
 import types
 
 NAMES = ("numpy", "pandas")
-_STATE = {"installed": False}
+_STATE = {"installed": False, "assert": None}
+_TRACE = bool(__import__("os").environ.get("BR_LAZY_TRACE"))  # debugging: say where a module really loads
+_AFTER = {}  # module name -> function called with the module right after its real code ran
+# duckreplay.frame_hook while the DuckDB answer replay is installed: it sees the arguments of
+# every assert_frame_equal call first (the replay's results are stand-ins for frames)
+FRAME_HOOK = None
 
 
 class _LazyModule(types.ModuleType):
@@ -35,6 +40,10 @@ def _run(module):
     if type(module) is not _LazyModule:
         return
     spec = module.__dict__["__spec__"]
+    if _TRACE:
+        import traceback
+
+        sys.stderr.write("lazymods: %s loads here\n%s" % (spec.name, "".join(traceback.format_stack(limit=12))))
     module.__class__ = types.ModuleType
     if spec.submodule_search_locations is not None:
         module.__path__ = spec.submodule_search_locations
@@ -45,9 +54,18 @@ def _run(module):
         spec.loader.exec_module(module)
     finally:
         spec._initializing = False
+    after = _AFTER.get(spec.name)
+    if after is not None:
+        after(module)
     if spec.name == "pandas":
         real = sys.modules.get("pandas.testing")
         if real is not None and not isinstance(real, _TestingStandIn):
+            _STATE["assert"] = real.assert_frame_equal
+            if FRAME_HOOK is not None:
+                # the stand-in stays where the test modules bound it, and a test module that
+                # is imported from now on binds it too: it must see the replay's results first
+                real.assert_frame_equal = assert_frame_equal
+                return
             for mod in list(sys.modules.values()):
                 d = getattr(mod, "__dict__", None)
                 if type(d) is dict and d.get("assert_frame_equal") is assert_frame_equal and mod is not _SELF:
@@ -60,7 +78,17 @@ def _real_testing():
 
 
 def assert_frame_equal(*args, **kwargs):
-    return _real_testing().assert_frame_equal(*args, **kwargs)
+    hook = FRAME_HOOK
+    if hook is not None:
+        got = hook(args, kwargs)
+        if got is None:
+            return None  # known to pass (see duckreplay.py)
+        args, kwargs = got
+    real = _STATE["assert"]
+    if real is None:
+        load()
+        real = _STATE["assert"] or sys.modules["pandas.testing"].assert_frame_equal
+    return real(*args, **kwargs)
 
 
 class _TestingStandIn(types.ModuleType):
@@ -94,6 +122,33 @@ def install() -> bool:
     sys.modules["pandas.testing"] = testing
     _STATE["installed"] = True
     return True
+
+
+def install_one(name, attrs, after=None) -> bool:
+    """A stand-in for one more module. attrs: attributes that it has from the start (reading
+    them does not run the module; the real code replaces them when it runs). after: called
+    with the module right after its real code ran. False when the module is loaded already or
+    cannot be found."""
+    if name in sys.modules:
+        return False
+    spec = importlib.machinery.PathFinder.find_spec(name)
+    if spec is None or spec.loader is None or not hasattr(spec.loader, "exec_module"):
+        return False
+    module = importlib.util.module_from_spec(spec)
+    module.__dict__.pop("__path__", None)
+    module.__dict__.update(attrs)
+    module.__class__ = _LazyModule
+    if after is not None:
+        _AFTER[name] = after
+    sys.modules[name] = module
+    return True
+
+
+def load_one(name) -> None:
+    """Runs the real module now (no-op when it has run or has no stand-in)."""
+    m = sys.modules.get(name)
+    if type(m) is _LazyModule:
+        _run(m)
 
 
 def loaded(name) -> bool:

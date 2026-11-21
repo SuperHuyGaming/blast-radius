@@ -82,6 +82,7 @@ PRE_PATH = None  # sys.path before the parent imported the test modules' librari
 REGISTRY_CLEAR_AT = None  # first test after tests/test_dialect_entry_points.py (see registry_clear_at)
 REGISTRY_START = None  # dialect names registered when a full run starts (build_registry_start.py)
 PANDAS_USERS = frozenset()  # tests that load numpy or pandas (maps/pandas_tests.json), when they are lazy (lazymods.py)
+NO_DUCK_REPLAY = os.environ.get("BR_NO_DUCK_REPLAY") == "1"  # validation: every DuckDB query of the tests runs
 NO_DIFF = os.environ.get("BR_NO_DIFF")  # validation: no import-state diff
 CLASS_FILTER = os.environ.get("BR_CLASS_FILTER") == "1"  # off: the instantiation trace does not see every reader
 FRESH_REDUCE = os.environ.get("BR_FRESH_REDUCE", "1") == "1"
@@ -110,11 +111,46 @@ MANY_FAILURES = 8  # with this many failing tests, a long test on the same code 
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
+# Per-test CPU guard: a test whose run has cost more CPU than selecting it unrun can cost is
+# stopped and selected (see prepare_plan and run_child). The limit of test n is
+#   max(GUARD_MIN, GUARD_FACTOR * estimate + GUARD_ADD, (recorded seconds + 2) / GUARD_PRICE)
+# CPU seconds: never inside the range of a normal run, and never before the run has cost what
+# the selection of the test costs at most (its seconds and one more worker). The guard only
+# ever shortens the time that a test may take (TEST_TIMEOUT and 25 times its usual time): a
+# test with a small estimate keeps that limit as it is.
+GUARD = os.environ.get("BR_NO_GUARD") != "1"
+GUARD_MIN = float(os.environ.get("BR_GUARD_MIN", "4.0"))  # (= TEST_TIMEOUT)
+GUARD_FACTOR = float(os.environ.get("BR_GUARD_FACTOR", "6.0"))
+GUARD_ADD = float(os.environ.get("BR_GUARD_ADD", "1.5"))
+GUARD_PRICE = float(os.environ.get("BR_GUARD_PRICE", "1.0"))  # charged seconds per CPU second of a run
+GUARD_RESTARTS = 3  # new children per commit after stopped tests; then the rest is selected unrun
+CPU_GUARD = {}  # in a child: test -> CPU seconds that its run may cost (the parent's plan.guard)
+# CPU seconds of a new child before its first test, by kind of commit (measured on the pinned tree)
+RESTART_SECONDS = {"hot": 0.05, "fresh_cone": 0.5, "fresh": 1.5, "fresh_purge": 1.5}
+# The price of a run: charged seconds per estimated CPU second. The estimates (cost.bin) are in
+# the unit of the recorded seconds of tests.json (build_costs.py scales them so), and the CPU
+# seconds of a run on the scoring machine are about as long: the price is near 1. It is set a
+# little lower, so that a test is held only when that also pays on a machine that charges less.
+CPU_PRICE = float(os.environ.get("BR_CPU_PRICE", "0.8"))
+# Hold rule by packed cost (marginal_holds in run): a test that would run is held when the
+# CPU of the runs costs more than the selection of the tests costs inside the answer.
+MARGINAL = os.environ.get("BR_MARGINAL") == "1"
+# Names of interpreter-wide settings (the ones that _interpreter_settings compares after each
+# test). A run is what shows that a test leaves such a setting changed for the later tests. So
+# marginal_holds holds no test of a commit whose added lines name one, and no test whose own
+# test file names one.
+SETTINGS_WORDS = (
+    "os.chdir", "os.environ", "os.putenv", "setrecursionlimit", "setswitchinterval", "sys.path", "getcontext",
+    "localcontext", "setcontext", "gc.", "logging.", "getLogger", "sys.stdout", "sys.stderr", "excepthook",
+    "settrace", "setprofile",
+)
+# cost.bin corrections from runs of the pinned commit in today's set-up (build_cost_fix.py)
+COST_FIX = os.environ.get("BR_NO_COST_FIX") != "1"
 # One child serves all the commits of the batch that change nothing but entries of .sql fixture
 # files (see fixture_only in run() and fixture_batch_child); BR_NO_FIXTURE_BATCH=1 gives each of
 # them its own child again (validation: the answers must be the same).
 FIXTURE_BATCH = os.environ.get("BR_NO_FIXTURE_BATCH") != "1"
-FIXTURE_BATCH_MIN = 3  # commits: the checks of the shared child cost about as much as one fork
+FIXTURE_BATCH_MIN = 2  # commits in one shared child at least
 WALL_LIMIT = float(os.environ.get("BR_WALL", "150"))  # the batch must end well inside 3 minutes
 
 
@@ -130,7 +166,7 @@ class Maps:
     def __init__(self, path):
         self.path = path
         with open(os.path.join(path, "meta.bin"), "rb") as f:
-            self.meta = marshal.load(f)
+            self.meta = marshal.loads(f.read())  # much faster than marshal.load(f)
         with open(os.path.join(path, "sets.idx"), "rb") as f:
             self.offsets = array("I")
             self.offsets.frombytes(f.read())
@@ -147,9 +183,16 @@ class Maps:
         self._tight = None
         try:
             with open(os.path.join(path, "cost.bin"), "rb") as f:
-                self.cost = marshal.load(f)
+                self.cost = marshal.loads(f.read())
         except OSError:
             self.cost = None
+        if self.cost and COST_FIX:
+            try:
+                with open(os.path.join(path, "cost_fix.json")) as f:
+                    for n, value in json.load(f)["cost"].items():
+                        self.cost[int(n)] = float(value)
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                pass
 
     def file(self, rel):
         rec = self.file_cache.get(rel)
@@ -293,7 +336,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings")
 
     def __init__(self, commit):
         self.commit = commit
@@ -334,6 +377,12 @@ class Plan:
         self.watched = None  # the statefp keys of the containers that the child watched (None: not reported)
         self.leaks = []  # (test, statefp key, changed entries or None): a watched container changed
         self.cone = None  # import-time commit: the modules to import again (cone.py), or None
+        self.guard = {}  # test -> CPU seconds after which its run is stopped and the test selected
+        self.prep = None  # (allowed, skip, cap, cost) of prepare_plan, for a second child
+        self.suspects = set()  # tests without a verdict that count like failing ones (stopped runs)
+        self.body = {}  # test -> CPU seconds of the test alone, without class set-up (for logs)
+        self.econ = set()  # tests held because their runs cost more than their selection (marginal_holds)
+        self.settings = False  # a line that the patch adds names an interpreter-wide setting (SETTINGS_WORDS)
 
 
 CODING_RE = re.compile(r"coding[:=]\s*[-\w.]+")
@@ -377,6 +426,34 @@ def _blank_or_comment(lines):
 
 def _indent(s):
     return len(s) - len(s.lstrip())
+
+
+def _lead(s):
+    return s[: len(s) - len(s.lstrip())]
+
+
+def _indentation_changed(fp):
+    """True when an edit can change how the file's blocks nest: a changed line whose leading
+    whitespace differs from the line it replaces, or added lines (other than blank or
+    comment lines) without a matching removed line."""
+    for g in fp.groups:
+        removed, added = g[4], g[5]
+        if len(removed) != len(added):
+            if not _blank_or_comment(added):
+                return True
+            continue
+        for x, y in zip(removed, added):
+            if y.strip() and not y.lstrip().startswith("#") and _lead(x) != _lead(y):
+                return True
+    return False
+
+
+def _file_compiles(text, filename, flags):
+    try:
+        compile(text, filename, "exec", flags=flags, dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return False
+    return True
 
 
 _KIND_FLAGS = 0x20 | 0x80 | 0x100 | 0x200  # generator, coroutine, iterable coroutine, async generator
@@ -469,7 +546,7 @@ def _old_type_checking_spans(rel, old_text):
         for d in (MAPS, HERE):
             try:
                 with open(os.path.join(d, "tc_spans.bin"), "rb") as f:
-                    _TC_SPANS = marshal.load(f)
+                    _TC_SPANS = marshal.loads(f.read())
                 break
             except (OSError, ValueError, EOFError, TypeError):
                 pass
@@ -512,6 +589,14 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
     rel = fp.old_path
     rec = maps.file(rel)
     if rec is None:
+        return True
+    if _indentation_changed(fp) and not _file_compiles(fp.new_text, os.path.join(ROOT, rel), rec[1]):
+        # The units below compile one at a time, each inside one-line class wrappers. An
+        # edit that only moves the indentation of a line (a def line, for instance) can
+        # compile there and look like a layout-only edit, while the whole file no longer
+        # compiles (IndentationError, TabError). Then importing the module fails, so the
+        # child must import the patched tree.
+        plan.note.append("file does not compile")
         return True
     inert = type_checking_groups(fp, old_text)
     if inert:
@@ -743,6 +828,9 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
 INFECT = os.environ.get("BR_NO_INFECT") != "1"  # operand outcome map, see infect.py
 INFECT2 = os.environ.get("BR_NO_INFECT2") != "1"  # its phase 2 (and/or trees, literal operands)
 INFECT_FRESH = os.environ.get("BR_NO_INFECT_FRESH") != "1"  # the same for functions that also run at import
+INFECT_UNSEEN = os.environ.get("BR_NO_INFECT_UNSEEN") != "1"  # tests without a record at a site that they run
+INFECT_STMT = os.environ.get("BR_NO_INFECT_STMT") != "1"  # ... unless the maps show that they ran its statement
+INFECT_HIDDEN = os.environ.get("BR_NO_INFECT_HIDDEN") != "1"  # ... replaced by the recorded cache-hidden tests of the site
 
 
 def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: list):
@@ -754,6 +842,11 @@ def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: lis
     evaluation outside single tests (import time, collection), takes the normal path."""
     rec = maps.file(fp.old_path)
     res = None
+    if rec is not None and _indentation_changed(fp) and not _file_compiles(
+        fp.new_text, os.path.join(ROOT, fp.old_path), rec[1]
+    ):
+        # the patched file does not compile as a whole: no map applies (see plan_python_file)
+        return plan_python_file(plan, fp, maps, old_text)
     if rec is not None:
         import infect
 
@@ -772,27 +865,78 @@ def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: lis
             # the other result still runs differently: held, it is selected (see finish).
             plan.sure_infected.update(res.sure)
         return plan_python_file(plan, fp, maps, old_text)
+    # The operand map comes from runs of the whole suite in one process. Code that runs once
+    # per process and whose result sqlglot then keeps in a cache (generator._build_dispatch
+    # fills _DISPATCH_CACHE for the first user of each generator class) shows its evaluations
+    # only in the first test that needed it, while the patched result reaches every later
+    # reader of the cache. Such a reader is not covered by the operand map: it counts as a
+    # test with a changed evaluation. Only when some recorded evaluation does change: the
+    # work that the first test did is the work that each other test repeats in a process of
+    # its own, so with no changed evaluation in any test or phase no test can differ.
+    #
+    # Which tests a cache hides at a site is recorded (maps/infect_hidden.bin, see
+    # infect.hidden_tests and build_hidden.py): the tests that get to the site's statement
+    # (or start the site's expression) more often when they run alone in a fresh process
+    # than in their own phases of the whole-suite runs. Every other test does at the site
+    # in the whole-suite runs all that it does alone, and each of those evaluations has a
+    # record in the operand map.
+    eff = res.tests
+    hidden = None
+    if res.tests and INFECT_UNSEEN and INFECT_HIDDEN:
+        hidden = infect.hidden_tests(os.path.join(maps.path, "infect_hidden.bin"), fp.old_path, res.site[1:5])
+        if hidden:
+            eff = res.tests | hidden
+            plan.note.append("infect: %d tests behind a cache at the site" % len(hidden - res.tests))
+    if res.tests and INFECT_UNSEEN and hidden is None:
+        # No reach record for this site: the wider rule. The line coverage map runs every
+        # test in a process of its own; a test that runs a line of the site there but has no
+        # recorded evaluation of the site counts as hidden.
+        #
+        # The line map is kept per statement, so a test also "runs the site" when its statement
+        # stops before the comparison (an "and" whose first operand is false). A test that the
+        # operand map shows running the statement in the whole-suite runs (it has a record at
+        # another site of the statement or of a later statement of the block, see
+        # infect.statement_runners) did not skip the code there: it ran the statement and did not
+        # evaluate the comparison, so it is covered by the map.
+        stmt_set = rec[3]
+        unseen = set()
+        for ln in range(res.site[1], res.site[3] + 1):
+            if 0 <= ln < len(stmt_set) and stmt_set[ln]:
+                unseen.update(maps.tests(stmt_set[ln]))
+        if res.seen is not None:
+            unseen.difference_update(res.seen)
+        if unseen and INFECT_STMT:
+            ran = infect.statement_runners(
+                fp.old_path, old_lines, rec[0], tuple(res.site[1:5]),
+                os.path.join(maps.path, "infect.bin"), os.path.join(maps.path, "infect2.bin"),
+            )
+            if ran:
+                plan.note.append("infect: %d of %d tests without a record ran the statement" % (len(unseen & ran), len(unseen)))
+                unseen.difference_update(ran)
+        if unseen:
+            eff = res.tests | unseen
+            plan.note.append("infect: %d tests run the site without a record" % len(unseen))
     used.append(fp.old_path)
-    if not res.tests:
+    if not eff:
         plan.note.append("infect: no evaluation changes")
-        plan.infect_files.append((res.tests, "hot"))
+        plan.infect_files.append((eff, "hot"))
         return False
     before = set(plan.cands)
     n_pairs = len(plan.fpairs)
     fresh = plan_python_file(plan, fp, maps, old_text)
     if not fresh:
         added = plan.cands - before
-        plan.cands = before | (added & res.tests)
-        plan.note.append("infect: %d of %d candidates" % (len(added & res.tests), len(added)))
-        plan.infect_files.append((res.tests, "hot"))
+        plan.cands = before | (added & eff)
+        plan.note.append("infect: %d of %d candidates" % (len(added & eff), len(added)))
+        plan.infect_files.append((eff, "hot"))
     elif plan.cands == before and len(plan.fpairs) > n_pairs:
         # The function also runs at import, so the child imports the patched tree. No
         # evaluation at import time changes its result (global_phase is false). When the
         # child then finds the import state equal to the pinned one, only the tests with a
         # changed evaluation can differ, as above (see make_plan and refine_with_diff).
-        plan.infect_files.append((res.tests, "import"))
+        plan.infect_files.append((eff, "import"))
     else:
-        plan.infect_files.append((res.tests, "other"))
+        plan.infect_files.append((eff, "other"))
     return fresh
 
 
@@ -1046,6 +1190,10 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
     infect_used = []  # files planned with the operand outcome map
     marks = []  # what the plan held before each file
     fps = engine.parse_patch(text)
+    plan.settings = any(
+        line.startswith("+") and not line.startswith("+++") and any(word in line for word in SETTINGS_WORDS)
+        for line in text.splitlines()
+    )
     if not fps:
         if text.strip():
             # text that holds no file section this parser knows (another diff format): the
@@ -1809,10 +1957,14 @@ def child_reporters(wfd):
     watches = []  # shared containers that the patched code may leave changed (plan.watch)
 
     last = [time.process_time()]
+    mark = [last[0], None]  # CPU time at the start of the test that runs now, and that test
 
     import pool as pool_module
 
     def emit(number, failed):
+        if armed[0]:
+            armed[0] = False
+            signal.setitimer(signal.ITIMER_PROF, 0)  # the test ended inside its CPU limit
         now = time.process_time()
         code = 2 if failed is None else (1 if failed else 0)  # 2 = not run
         if settings[0] is not None and not settings[1] and _interpreter_settings() != settings[0]:
@@ -1825,7 +1977,11 @@ def child_reporters(wfd):
             # run every later test that reads it sees that content (see finish)
             for key, entries in check_watches(watches):
                 os.write(wfd, b"W %d %s\n" % (number, json.dumps([key, entries]).encode()))
-        os.write(wfd, b"%d %d %d\n" % (number, code, int((now - last[0]) * 1e6)))
+        if DEBUG:
+            alone = now - mark[0] if mark[1] == number else 0.0  # (a test that cannot be loaded never starts)
+            os.write(wfd, b"%d %d %d %d\n" % (number, code, int((now - last[0]) * 1e6), int(alone * 1e6)))
+        else:
+            os.write(wfd, b"%d %d %d\n" % (number, code, int((now - last[0]) * 1e6)))
         last[0] = now
         if pool_module.InlinePool.broke_any:
             # the class's shared process pool died in this test: in a full run every later
@@ -1836,6 +1992,7 @@ def child_reporters(wfd):
 
     cleared = [False]
     started_once = []
+    armed = [False]
 
     def begin():
         settings[0], settings[1], settings[2] = None, False, False
@@ -1864,6 +2021,15 @@ def child_reporters(wfd):
             except Exception:  # noqa: BLE001  (sqlglot does not import: the tests report that)
                 pass
         os.write(wfd, b"S %d\n" % number)
+        mark[0], mark[1] = time.process_time(), number
+        limit = CPU_GUARD.get(number)
+        if limit is not None:
+            # The CPU guard (see GUARD): the kernel counts the CPU time of this process, all
+            # threads, from here. At the limit it sends SIGPROF, which ends the process (no
+            # handler is installed). The parent reads the signal from the wait status and
+            # selects the test.
+            armed[0] = True
+            signal.setitimer(signal.ITIMER_PROF, limit)
 
     return emit, started, settings, watches, begin
 
@@ -1874,6 +2040,9 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
     emit, started, settings, watches, _ = child_reporters(wfd)
 
     try:
+        signal.signal(signal.SIGPROF, signal.SIG_DFL)  # the CPU guard ends this process with it
+        CPU_GUARD.clear()
+        CPU_GUARD.update(plan.guard)
         if ANSWER_FD is not None:
             os.close(ANSWER_FD)
         devnull = os.open(os.devnull, os.O_WRONLY)
@@ -1889,6 +2058,11 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
 
             faulthandler.dump_traceback_later(float(os.environ["BR_FAULT"]), file=sys.stderr)
         t_child = time.process_time()
+        duckreplay = sys.modules.get("duckreplay")
+        if duckreplay is not None and duckreplay.ACTIVE and not duckreplay.patch_ok(plan.files):
+            # the patch changes test code or data: the recorded DuckDB answers are not valid
+            # for it, so every query of this child runs on a real connection
+            duckreplay.disable()
         py_files = {p: t for p, t in plan.files.items() if p.endswith(".py")}
         if any(not (p.startswith("sqlglot/") or (p.startswith("tests/fixtures/") and p.endswith(".sql")))
                for p in plan.files):
@@ -2008,6 +2182,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     os.write(wfd, b"END\n")
                     os._exit(0)
                 order = todo["order"]
+                CPU_GUARD.update(todo.get("guard") or {})
                 skip_after_fail = todo["skip"]
                 plan.enders = todo["enders"]
                 plan.keeps = todo["keeps"]
@@ -2023,7 +2198,9 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             for full, pairs in plan.work:
                 swaps = engine.plan_swaps(pairs, index)
                 if swaps is None:
-                    os.write(wfd, b"REDO\n")
+                    # "REDOC": only the cells of a live closure do not fit the new code; the
+                    # line map of the changed lines still gives the candidates
+                    os.write(wfd, b"REDOC\n" if engine.SWAP_FAIL == "cells" else b"REDO\n")
                     os._exit(0)
                 for f, code in swaps:
                     f.__code__ = code
@@ -2095,6 +2272,12 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             run_added_tests(plan.added, wfd)
         if DEBUG:
             sys.stderr.write("child %s setup %.3f run %.3f\n" % (plan.commit, t_setup - t_child, time.process_time() - t_setup))
+            if "lazymods" in sys.modules:
+                import lazymods
+
+                sys.stderr.write("child %s libs numpy=%d pandas=%d duckdb=%d replay=%s\n" % (
+                    plan.commit, lazymods.loaded("numpy"), lazymods.loaded("pandas"), lazymods.loaded("duckdb"),
+                    json.dumps([duckreplay.ACTIVE, duckreplay.STATS]) if duckreplay is not None else "off"))
         os.write(wfd, b"END\n")
     except BaseException as e:  # noqa: BLE001
         try:
@@ -2128,26 +2311,72 @@ def _same_value(a, b):
     return a is b or (type(a) is type(b) and type(a) in _PRIMITIVE and a == b)
 
 
+def shared_state_picture():
+    """For a child that serves several commits: [(object, copy of its attribute dict)] for the
+    loaded modules of sqlglot and of the tests, and for the classes that sqlglot's modules
+    define (with the classes nested in them). The copies hold the same objects, so
+    shared_state_change compares at the speed of a dict comparison (_shared_marks walks the
+    same objects in Python, which costs about 30 ms a picture)."""
+    out = []
+    seen = set()
+
+    def add_class(c):
+        if id(c) in seen:
+            return
+        seen.add(id(c))
+        d = dict(vars(c))
+        out.append((c, d))
+        mod = c.__module__
+        for v in d.values():
+            if isinstance(v, type) and v.__module__ == mod:
+                add_class(v)
+
+    for name, m in list(sys.modules.items()):
+        if m is None or not (name == "sqlglot" or name.startswith(("sqlglot.", "tests."))):
+            continue
+        d = dict(vars(m))
+        out.append((m, d))
+        if name.startswith("sqlglot"):
+            for v in d.values():
+                if isinstance(v, type) and v.__module__ == name:
+                    add_class(v)
+    return out
+
+
+def shared_state_change(picture):
+    """None when every module and class of the picture holds what it held: the same names,
+    each bound to the same object (or to an equal one). Else the first name that differs.
+    Like _shared_marks, this does not look into the dicts, lists and objects that the names
+    are bound to."""
+    for obj, saved in picture:
+        try:
+            if vars(obj) == saved:
+                continue
+        except Exception:  # noqa: BLE001  (a value that cannot be compared is a new value)
+            pass
+        now = vars(obj)
+        names = [k for k in now if k not in saved] + [k for k, v in saved.items() if now.get(k, _MISSING) is not v]
+        if names == ["__slotnames__"]:
+            # copyreg caches the slot names of a class there when an instance is first pickled
+            # or copied: a value that follows from the class alone
+            saved["__slotnames__"] = now["__slotnames__"]
+            continue
+        return "%s.%s" % (getattr(obj, "__qualname__", None) or getattr(obj, "__name__", "?"), names[0] if names else "?")
+    return None
+
+
 def picture_of_tests(test_ids):
-    """For a child that serves several commits: what the classes and modules of these tests
-    hold now. Classes (each test class and its bases below unittest.TestCase): every class
-    attribute, the items of the lists, dicts and sets among them, and the flags of a process
-    pool stand-in (pool.py). Modules (the test modules, tests.helpers, the sqlglot package):
-    every global. None when a class is not loaded."""
+    """For a child that serves several commits: what the classes of these tests hold now. For
+    each test class and its bases below unittest.TestCase: every class attribute, the items of
+    the lists, dicts and sets among them, and the flags of a process pool stand-in (pool.py).
+    None when a class is not loaded."""
     import pool as pool_module
 
-    classes, modules = [], []
+    classes = []
     seen = set()
     keys = sorted({(tid.split("::")[0][:-3].replace("/", "."), tid.split("::")[1]) for tid in test_ids})
-    for mod_name in [m for m, _ in keys] + ["tests.helpers", "sqlglot"]:
-        mod = sys.modules.get(mod_name)
-        if mod is None:
-            return None
-        if id(mod) not in seen:
-            seen.add(id(mod))
-            modules.append((mod, dict(vars(mod))))
     for mod_name, cls_name in keys:
-        cls = getattr(sys.modules[mod_name], cls_name, None)
+        cls = getattr(sys.modules.get(mod_name), cls_name, None)
         if not isinstance(cls, type):
             return None
         for c in cls.__mro__:
@@ -2162,18 +2391,17 @@ def picture_of_tests(test_ids):
                 elif isinstance(v, pool_module.InlinePool):
                     items[k] = dict(vars(v))
             classes.append((c, attrs, items))
-    return classes, modules
+    return classes
 
 
 def restore_tests(picture, graveyard):
-    """Puts the classes back as picture_of_tests saw them, and compares the modules. Returns
-    the names of what differed, without the class state that every run changes (see
-    _ROUTINE_CLASS_STATE): an empty list means that the tests left these classes and modules
-    as a new child would find them. Objects that leave a class go to 'graveyard', so that no
-    finalizer runs here (a database connection, for instance)."""
-    classes, modules = picture
+    """Puts the classes back as picture_of_tests saw them. Returns the names of what differed,
+    without the class state that every run changes (see _ROUTINE_CLASS_STATE): an empty list
+    means that the tests left these classes as a new child would find them. Objects that
+    leave a class go to 'graveyard', so that no finalizer runs here (a database connection,
+    for instance)."""
     odd = []
-    for c, attrs, items in classes:
+    for c, attrs, items in picture:
         now = vars(c)
         for k in [k for k in now if k not in attrs]:
             graveyard.append(now[k])
@@ -2204,10 +2432,6 @@ def restore_tests(picture, graveyard):
                         odd.append("%s.%s pool" % (c.__name__, k))
                     flags.clear()
                     flags.update(copy)
-    for m, globs in modules:
-        now = vars(m)
-        if len(now) != len(globs) or any(not _same_value(now.get(k, _MISSING), v) for k, v in globs.items()):
-            odd.append("globals of %s" % m.__name__)
     return odd
 
 
@@ -2223,14 +2447,13 @@ def fixture_batch_child(batch, tests, wfd):
     registry (each commit starts with the registry that this process had at its fork, as its
     own child would), and the attributes of the test classes (class fixture lists, the class
     cleanups that unittest ran, the flags of the class's pool). Then the checks: the
-    interpreter settings are the ones before the first commit, the test classes and modules
-    hold what they held (but for the state named above), no thread or module stand-in changed,
-    no pool died, no class setup failed. When a check fails, or the commit cannot be compared
-    entry by entry ("N i"), the commit gets no "E i": the parent gives it a child of its own.
-    A failed check ("X i") also ends this child, so the commits after it get their own child
-    too. At the end, the picture of the shared state of sqlglot and the test modules
-    (_shared_marks) must equal the one before the first commit ("Z ok"); the parent uses the
-    results of this child only then."""
+    interpreter settings are the ones before the first commit, the test classes hold what they
+    held (but for the state named above), no thread or module stand-in changed, no pool died,
+    no class setup failed, and the modules of sqlglot and of the tests and the classes of
+    sqlglot are bound to the objects that they were bound to before the first commit
+    (shared_state_picture). When a check fails, or the commit cannot be compared entry by
+    entry ("N i"), the commit gets no "E i": the parent gives it a child of its own. A failed
+    check ("X i") also ends this child, so the commits after it get their own child too."""
     import builtins
     import io
     import threading
@@ -2260,7 +2483,8 @@ def fixture_batch_child(batch, tests, wfd):
             raise RuntimeError("fixture batch: tests or loaders are not as expected")
         registry = dialect.Dialect._classes
         registry_start = dict(registry)
-        marks = _shared_marks()
+        shared = shared_state_picture()
+        t_shared = time.process_time() - t_child
         io_names = (builtins.open, io.open, io.open_code, os.listdir)
         filters = list(warnings.filters)
         threads = threading.active_count()
@@ -2338,13 +2562,18 @@ def fixture_batch_child(batch, tests, wfd):
                 odd.append("threads")
             if len(warnings.filters) != len(filters) or any(a is not b for a, b in zip(warnings.filters, filters)):
                 odd.append("warning filters")
+            t_same = time.process_time()
+            change = shared_state_change(shared)
+            if change is not None:
+                odd.append("shared state: " + change)
+            t_shared += time.process_time() - t_same
             if odd:
                 os.write(wfd, ("X %d %s\n" % (i, "; ".join(odd)[:300])).encode())
                 break
             os.write(wfd, b"%s %d\n" % (b"E" if ran else b"N", i))
-        os.write(wfd, b"Z ok\n" if _shared_marks() == marks else b"Z bad\n")
         if DEBUG:
-            sys.stderr.write("fixture batch child: %d commits, cpu %.3f\n" % (len(batch), time.process_time() - t_child))
+            sys.stderr.write("fixture batch child: %d commits, cpu %.3f (of that, the picture of the shared state and its checks: %.3f)\n"
+                             % (len(batch), time.process_time() - t_child, t_shared))
         os.write(wfd, b"END\n")
     except BaseException as e:  # noqa: BLE001
         try:
@@ -2359,11 +2588,12 @@ def run_fixture_batch_child(batch, tests, time_left):
     """Runs the tests of several fixture-only commits in one forked child (fixture_batch_child).
     batch: [(plan, tests to run, allowed seconds per test, skip_after_fail, cap)], as run_child
     takes them for one commit. Returns {position in batch: (verdicts, tests not run after a
-    failure, CPU seconds per test)} for the commits whose runs ended with every check passed.
-    Empty when the child did not end by itself with its last check passed (a test that hangs,
-    runs past the limits of run_child, or kills the process; shared state that differs at the
-    end): every commit then runs in its own child, as without this function."""
+    failure, CPU seconds per test)} for the commits whose runs ended with every check passed
+    ("E i"). A test that hangs, runs past the limits of run_child or kills the process ends
+    the child: that commit and the ones after it have no result here, and each runs in its
+    own child, as without this function."""
     r, w = os.pipe()
+    release_pin_if_slow()
     pid = os.fork()
     if pid == 0:
         os.close(r)
@@ -2377,7 +2607,6 @@ def run_fixture_batch_child(batch, tests, time_left):
     done = {}
     record = None  # (verdicts, skipped, times) of the commit whose tests run now
     status = "DIED"
-    confirmed = False
     buf = b""
     t_end = time.monotonic() + time_left
     t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN  # time for the child's own setup
@@ -2420,8 +2649,6 @@ def run_fixture_batch_child(batch, tests, time_left):
                     record, t_cap = None, None
                     log("fixture batch ends:", batch[int(line.split()[1])][0].commit, line.decode(errors="replace"))
                     t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
-                elif line.startswith(b"Z "):
-                    confirmed = line == b"Z ok"
                 elif line.startswith(b"S "):
                     if t_cap is None and cap is not None:
                         t_cap = time.monotonic() + cap
@@ -2457,16 +2684,16 @@ def run_fixture_batch_child(batch, tests, time_left):
                 pass
         except ChildProcessError:
             pass
-    if status != "END" or not confirmed:
-        log("fixture batch: no result (status %s, last check %s), %d commits run one by one" % (status, confirmed, len(batch)))
-        return {}
+    if status != "END":
+        log("fixture batch: child ended with status %s after %d of %d commits" % (status, len(done), len(batch)))
     return done
 
 
 def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(), on_diff=None, cap=None):
     """Runs the tests in a forked child. Returns (verdicts, status, hung test or None).
 
-    status: END, REDO, ERR, TIMEOUT, DIED, OVER. allowed[n] = seconds that test n may take.
+    status: END, REDO, ERR, TIMEOUT, DIED, OVER, COST (the CPU guard stopped the returned
+    test, see plan.guard). allowed[n] = seconds that test n may take.
     cap: seconds that all the tests together may take from the start of the first one.
     on_diff: for a commit that changes import-time code. The child first reports which
     import-time values differ from the pinned tree; on_diff(names) then decides what to run."""
@@ -2474,6 +2701,7 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     plan_r = plan_w = None
     if on_diff is not None:
         plan_r, plan_w = os.pipe()
+    release_pin_if_slow()
     pid = os.fork()
     if pid == 0:
         os.close(r)
@@ -2520,7 +2748,7 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
             buf += chunk
             *lines, buf = buf.split(b"\n")
             for line in lines:
-                if line in (b"END", b"REDO"):
+                if line in (b"END", b"REDO", b"REDOC"):
                     status = line.decode()
                 elif line.startswith(b"ERR"):
                     status = "ERR"
@@ -2579,6 +2807,8 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                         verdicts[int(parts[0])] = parts[1] == b"1"
                     if len(parts) > 2:
                         plan.times[int(parts[0])] = int(parts[2]) / 1e6
+                    if len(parts) > 3:
+                        plan.body[int(parts[0])] = int(parts[3]) / 1e6
                     current = None
                     t_test = time.monotonic() + 30.0
     finally:
@@ -2606,7 +2836,14 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     if added_open is not None:
         plan.global_leak = added_open if plan.global_leak is None else min(plan.global_leak, added_open)
         plan.note.append("added test did not end")
-    if status == "DIED":
+    if status == "DIED" and current is not None and os.WIFSIGNALED(wstatus) and os.WTERMSIG(wstatus) == signal.SIGPROF \
+            and current in plan.guard:
+        # the CPU guard stopped this test (see child_reporters): it has no verdict, and the
+        # caller selects it
+        status = "COST"
+        hung = current
+        log(plan.commit, "test", current, "stopped after", round(plan.guard[current], 2), "CPU seconds")
+    elif status == "DIED":
         log(plan.commit, "child died, wait status", wstatus, "after", len(verdicts), "tests")
         if current is not None:
             hung = current  # the test that killed the process fails in a full run too
@@ -2689,6 +2926,53 @@ def _changes_def_header(plan: Plan):
     return False
 
 
+_GETATTR_SPANS = {}
+
+
+def _module_getattr_span(rel):
+    """First and last line of the module-level "def __getattr__" of a pinned file, or None."""
+    if rel not in _GETATTR_SPANS:
+        span = None
+        text = patchrules.source(rel)
+        if "def __getattr__" in text:
+            import ast
+
+            try:
+                for node in ast.parse(text).body:
+                    if isinstance(node, ast.FunctionDef) and node.name == "__getattr__":
+                        span = (node.lineno, node.end_lineno)
+            except (SyntaxError, ValueError):
+                pass
+        _GETATTR_SPANS[rel] = span
+    return _GETATTR_SPANS[rel]
+
+
+def _lazy_attr_users(maps: Maps, rel):
+    """Tests that can hold a name bound through the module __getattr__ of 'rel': the tests of
+    the test files whose source imports from that module ("from m import x", "from parent
+    import m", "import m")."""
+    import re
+
+    mod = rel[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    parent, _, last = mod.rpartition(".")
+    pats = [r"^\s*from\s+%s\s+import\b" % re.escape(mod), r"^\s*import\s+%s\b" % re.escape(mod)]
+    if parent:
+        pats.append(r"^\s*from\s+%s\s+import\s+[^\n]*\b%s\b" % (re.escape(parent), re.escape(last)))
+    pat = re.compile("|".join(pats), re.M)
+    out = set()
+    for trel, numbers in patchrules.test_files(maps).items():
+        if pat.search(patchrules.source(trel)):
+            out.update(numbers)
+    # A sqlglot module that binds a lazy name at its own import (sqlglot/lineage.py, "from
+    # sqlglot.optimizer import qualify") hands it to the tests that call it; those tests load
+    # it from test files that import the same package in the cases seen so far. The importer
+    # sets of sqlglot modules hold nearly every test (the parent imports everything), so they
+    # are not used here: an open risk, see the report.
+    return out
+
+
 def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
     """Uses the import-state diff of a commit that changes import-time code.
 
@@ -2749,6 +3033,17 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
             break
         for path, ln in rs:
             lines.setdefault(path, set()).add(ln)
+            span = _module_getattr_span(path)
+            if span and span[0] <= ln <= span[1]:
+                # A changed name that the module __getattr__ reads (lazy attributes, PEP 562)
+                # changes what "from module import x" binds. Those imports run at the import
+                # of test modules and of other sqlglot modules, and the result is stored in the
+                # module globals, so the line maps show only the first lookup: every test that
+                # loads the module is a candidate, and it runs whole.
+                added = _lazy_attr_users(maps, path)
+                plan.cands.update(added)
+                plan.note.append("lazy __getattr__ reads %s: %d tests" % (name, len(added)))
+                whole = True
     if whole or not FRESH_REDUCE:
         plan.note.append("import state: no reduced runs")
         plan.lines = {"?": None}
@@ -2839,6 +3134,23 @@ def pack(numbers, seconds):
     return best[1]
 
 
+def packed_bound(total, longest):
+    """The least that a selection can cost: with k workers the largest load is at least the
+    longest test and at least total / k. For many short tests pack() comes close to it, and
+    it needs no list of tests (marginal_holds asks it once per candidate)."""
+    if total <= 0.0:
+        return 0.0
+    return min(max(longest, total / k) + WORKER_COST * k for k in range(1, 9))
+
+
+def packed_seconds(numbers, seconds):
+    """What a selection costs: the largest worker load of pack() plus 2 s per worker."""
+    bins = pack(sorted(numbers), seconds)
+    if not bins:
+        return 0.0
+    return max(sum(seconds[n] for n in b) for b in bins) + WORKER_COST * len(bins)
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -2904,7 +3216,46 @@ def run_order(cands, tests):
     return sorted(cands)
 
 
+_PIN = None  # (wall clock at the pin, CPU seconds at the pin, the CPUs allowed before it) while pinned
+
+
+def pin_to_one_cpu():
+    """Keeps this process and its children on the CPU that it runs on now. They work one after
+    the other, so one CPU is enough, and moves between CPUs cost cache and CPU time
+    (measured: about 10% less CPU for a batch). BR_PIN=0 turns it off."""
+    global _PIN
+    if os.environ.get("BR_PIN", "1") == "0":
+        return
+    try:
+        with open("/proc/self/stat") as f:
+            cpu = int(f.read().rsplit(")", 1)[1].split()[36])
+        allowed = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, {cpu} if cpu in allowed else {min(allowed)})
+        _PIN = (time.monotonic(), sum(os.times()[:4]), allowed)
+    except (OSError, ValueError, IndexError, AttributeError):
+        pass
+
+
+def release_pin_if_slow():
+    """Called before each child starts. On one CPU the wall time of the batch is about its CPU
+    time. When the wall time runs away from it, another program holds this CPU: then all CPUs
+    are allowed again, so that the batch cannot run out of wall time."""
+    global _PIN
+    if _PIN is None:
+        return
+    wall = time.monotonic() - _PIN[0]
+    cpu = sum(os.times()[:4]) - _PIN[1]
+    if wall > 2.0 * cpu + 2.0:
+        try:
+            os.sched_setaffinity(0, _PIN[2])
+        except OSError:
+            pass
+        log("pin released: wall", round(wall, 2), "cpu", round(cpu, 2))
+        _PIN = None
+
+
 def main():
+    pin_to_one_cpu()
     t_start = time.monotonic()
     deadline = t_start + WALL_LIMIT
     # Only the answers may reach stdout. Everything else that writes to fd 1 goes to stderr.
@@ -3082,6 +3433,7 @@ def run(t_start, deadline, state):
         try:
             with open(os.path.join(DATA, "commits", c + ".patch"), encoding="utf-8", errors="surrogateescape") as f:
                 text = f.read()
+            release_pin_if_slow()
             plans[c] = make_plan(c, text, maps)
             plans[c].keeps = compute_keeps(plans[c], maps, tests)
         except Exception as e:  # noqa: BLE001
@@ -3092,8 +3444,9 @@ def run(t_start, deadline, state):
 
     if os.environ.get("BR_PLAN_ONLY"):
         with open(os.environ["BR_PLAN_ONLY"], "w") as f:
-            json.dump({c: {"mode": p.mode, "cands": sorted(p.cands), "note": p.note,
-                           "files": sorted(p.files)} for c, p in plans.items()}, f)
+            json.dump({c: {"mode": p.mode, "cands": sorted(p.cands), "note": p.note, "files": sorted(p.files),
+                           "infect_fresh": None if p.infect_fresh is None else sorted(p.infect_fresh)}
+                       for c, p in plans.items()}, f)
         return
 
     import preload
@@ -3117,12 +3470,31 @@ def run(t_start, deadline, state):
             fixture_readers.setdefault(-1, set())
         return fixture_readers.get(n) or frozenset()
 
+    def long_by_evidence(evidence, held, more=0):
+        """The long held tests that the tests in evidence (failing tests) select: those of the
+        same test class or the same .sql fixture file, or all of them with many failures.
+        more: failing tests that may exist unseen (see marginal_holds)."""
+        class_of = lambda n: tests[n]["id"].rsplit("::", 1)[0]
+        fail_classes = {class_of(n) for n in evidence}
+        fail_fixtures = set()
+        for n in evidence:
+            fail_fixtures.update(fixtures_of(n))
+        return {
+            n for n in held if seconds[n] > QUIET_HOLD_SECONDS and (
+                class_of(n) in fail_classes or fail_fixtures & fixtures_of(n) or len(evidence) + more >= MANY_FAILURES)
+        }
+
     def finish(c, plan, verdicts, status, ran, held, blind=()):
         failing = {n for n, bad in verdicts.items() if bad}
+        # tests that the CPU guard stopped (and tests left unrun after that) have no verdict:
+        # they are selected, and for every rule below they count like failing tests
+        suspects = set(plan.suspects)
         selected = set(failing)
+        selected.update(suspects)
+        failing = failing | suspects
         selected.update(blind)
         selected.update(plan.blind)
-        unknown = [n for n in ran if n not in verdicts and n not in set(blind)]
+        unknown = [n for n in ran if n not in verdicts and n not in set(blind) and n not in suspects]
         if unknown:
             selected.update(unknown)  # the child ended early: nothing is known about these
         if plan.all_fail:
@@ -3138,18 +3510,11 @@ def run(t_start, deadline, state):
             # On labeled mutants, a long test fails together with another test of its class
             # (or of its fixture file) in nearly every case, and almost never without one.
             # The tests of its class did run (see protect below), so their verdicts decide.
-            class_of = lambda n: tests[n]["id"].rsplit("::", 1)[0]
-            fail_classes = {class_of(n) for n in failing}
-            fail_fixtures = set()
-            for n in failing:
-                fail_fixtures.update(fixtures_of(n))
-            for n in held:
-                if seconds[n] <= QUIET_HOLD_SECONDS:
-                    selected.add(n)
-                elif class_of(n) in fail_classes or fail_fixtures & fixtures_of(n):
-                    selected.add(n)
-                elif len(failing) >= MANY_FAILURES:
-                    selected.add(n)  # a commit that breaks this much can break any test
+            selected.update(n for n in held if seconds[n] <= QUIET_HOLD_SECONDS)
+            # (with many failures: a commit that breaks this much can break any test)
+            # (one more failure is counted when marginal_holds held tests: the first failing
+            # test of the runs before that rule may be one of them)
+            selected.update(long_by_evidence(failing, held, 1 if plan.econ else 0))
         # held tests that read changed test data directly (see test_data_candidates), or whose
         # token streams changed (run_tokcheck)
         selected.update(n for n in held if n in plan.must)
@@ -3163,7 +3528,12 @@ def run(t_start, deadline, state):
         if plan.global_leak is not None:
             # a run left the interpreter with other settings: every later test of a full run
             # (the order of tests.json) sees them
-            selected.update(range(plan.global_leak, len(tests)))
+            # A test that marginal_holds held ran before that rule, unless a test before it
+            # had failed (see marginal_holds). When such a test comes before the first test
+            # that was seen to change the settings, it may have changed them too.
+            first_failure = min((n for n, bad in verdicts.items() if bad), default=len(tests))
+            first = min([plan.global_leak] + [n for n in plan.econ if n < plan.global_leak and n < first_failure])
+            selected.update(range(first, len(tests)))
             plan.note.append("shared state or interpreter settings changed in test %d" % plan.global_leak)
         for n in plan.pool_died:
             cls_id = tests[n]["id"].rsplit("::", 1)[0]
@@ -3181,6 +3551,9 @@ def run(t_start, deadline, state):
                 "reduced": sorted(plan.keeps), "held": sorted(held), "ran": len(ran), "diff": plan.diff,
                 "must": sorted(plan.must), "sure": sorted(plan.sure_infected.intersection(held)), "tokcheck": plan.tokcheck,
                 "times": {str(k): round(v, 4) for k, v in plan.times.items()},
+                "body": {str(k): round(v, 4) for k, v in plan.body.items()},
+                "suspects": sorted(plan.suspects), "skipped": sorted(plan.skipped), "protect": sorted(plan.protect),
+                "guard": len(plan.guard), "blind": sorted(plan.blind), "econ": sorted(plan.econ),
                 "costs": {str(n): round(estimate_cost(n, plan, maps, seconds), 4) for n in ran},
                 "est": round(sum(estimate_cost(n, plan, maps, seconds) for n in ran), 3),
                 "cone": len(plan.cone) if plan.mode == "fresh_cone" else ("redo" if plan.cone == [] else None),
@@ -3249,7 +3622,101 @@ def run(t_start, deadline, state):
                 keep_set.add(n)
             held += [n for n in ran if n not in keep_set]
             ran = [n for n in ran if n in keep_set]
+        plan.econ = set()
+        if MARGINAL and not plan.watch and not plan.settings and "import state unchanged" not in plan.note:
+            # (with "import state unchanged", finish() drops the held tests when the runs pass:
+            # there a held test costs nothing, and the runs are the evidence)
+            plan.econ = marginal_holds(plan, ran, held, cost)
+            if plan.econ:
+                held += [n for n in ran if n in plan.econ]
+                ran = [n for n in ran if n not in plan.econ]
+                plan.note.append("%d tests held beside the selection" % len(plan.econ))
         return ran, held, cost
+
+    settings_files = {}
+    pool_users = set()  # tests that use a class-level process pool (filled at the first use)
+
+    def names_settings(rel):
+        """True when the test file (of the pinned commit) names an interpreter-wide setting."""
+        known = settings_files.get(rel)
+        if known is None:
+            try:
+                with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                    text = f.read()
+                known = any(word in text for word in SETTINGS_WORDS)
+            except (OSError, UnicodeDecodeError):
+                known = True
+            settings_files[rel] = known
+        return known
+
+    def marginal_holds(plan, ran, held, cost):
+        """The tests of 'ran' that are held after all, because their runs cost more CPU than
+        their selection costs inside the answer of this commit.
+
+        The rule above prices each test alone: a run against its seconds and one more worker.
+        But the answer is packed (see pack), and it holds tests in any case: plan.blind and
+        the held tests that finish() selects. Beside those, one more test costs less than
+        alone, and nothing in the free time next to a longer test. So the candidates are
+        taken in the order of CPU per recorded second, the worst first, and the cut that
+        makes (CPU_PRICE * CPU of the runs + packed seconds of the selection) smallest is
+        taken, for the case that every run passes.
+
+        Only tests that today's rules already leave unrun after a first failure qualify (the
+        'skip' set of prepare_plan: cost above half the recorded seconds, not in
+        plan.protect). So after its first failure, a child still runs every test that it
+        ran before this rule, and finish() sees the same failing tests, except one: the
+        first failing test itself may now be a held one. finish() counts one more failure
+        for that (see long_by_evidence). Not held by this rule: a test longer than
+        QUIET_HOLD_SECONDS (finish() selects those by evidence only), a test with a
+        small-scale variant, a test that shares a class or a .sql fixture with a long held
+        test (its verdict is evidence for that test), and a test that uses a class-level
+        process pool (its run shows whether the pool dies), and a test whose test file names an
+        interpreter-wide setting (its run shows whether it leaves the setting changed)."""
+        free = [
+            n for n in ran
+            if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
+            and seconds[n] <= QUIET_HOLD_SECONDS and tests[n]["id"] not in SCALED_IDS
+        ]
+        if not free:
+            return set()
+        long_held = [n for n in held if seconds[n] > QUIET_HOLD_SECONDS]
+        long_fixtures = set()
+        for n in long_held:
+            long_fixtures.update(fixtures_of(n))
+        if not pool_users:
+            pool_users.update(maps.tests(maps.meta.get("pool_users", 0)))
+            pool_users.add(-1)
+        free = [
+            n for n in free
+            if n not in pool_users and not (long_fixtures and long_fixtures & fixtures_of(n))
+            and not names_settings(tests[n]["file"])
+        ]
+        if not free:
+            return set()
+        # what the answer holds in any case (a long held test only when it is sure to be selected)
+        base = set(plan.blind)
+        base.update(
+            n for n in held
+            if seconds[n] <= QUIET_HOLD_SECONDS or n in plan.must or n in plan.sure_infected or tests[n]["id"] in SCALED_IDS
+        )
+        total = sum(seconds[n] for n in base)
+        longest = max((seconds[n] for n in base), default=0.0)
+        free.sort(key=lambda n: (-(cost[n] + 1e-4) / (seconds[n] + 1e-3), n))
+        run_cost = sum(cost[n] for n in ran)
+        best, cut = CPU_PRICE * run_cost + packed_bound(total, longest), 0
+        for i, n in enumerate(free):
+            total += seconds[n]
+            longest = max(longest, seconds[n])
+            run_cost -= cost[n]
+            value = CPU_PRICE * run_cost + packed_bound(total, longest)
+            if value < best - 1e-9:
+                best, cut = value, i + 1
+        if cut == len(ran):
+            # One test always runs. Without any verdict, finish() selects every held test, the
+            # long ones too. And a run is what shows a change of interpreter-wide settings
+            # that the patched statement makes in every test that reaches it (see finish).
+            cut -= 1
+        return set(free[:cut])
 
     shared_info = []
     attr_reads = {}
@@ -3309,6 +3776,20 @@ def run(t_start, deadline, state):
                 plan.note.append("watch: token stream check not run, %s selected" % plan.tokcheck)
                 plan.tokcheck = []
         allowed = {n: max(TEST_TIMEOUT, 25.0 * cost[n]) * SLOWDOWN for n in ran}
+        # The CPU guard (see GUARD). A stopped test is selected and counts like a failing test
+        # in finish(), so for a test whose verdict decides about long held tests (protect) the
+        # limit also covers the seconds of the longest of those. With a watch, a test without
+        # a run selects every later reader of the watched containers: no guard there.
+        plan.guard = {}
+        if GUARD and not RUN_ALL and not plan.watch:
+            long_secs = [seconds[t] for t in held if seconds[t] > QUIET_HOLD_SECONDS]
+            for n in ran:
+                stake = seconds[n] + WORKER_COST
+                if n in plan.protect and long_secs:
+                    stake += max(long_secs)
+                limit = max(GUARD_MIN, GUARD_FACTOR * cost[n] + GUARD_ADD, stake / GUARD_PRICE)
+                if limit < allowed[n] / SLOWDOWN:
+                    plan.guard[n] = limit
         # Once a test has failed, the commit is known to break something. A further
         # verdict then only saves the recorded seconds of a passing test, so only runs
         # that are cheap next to those seconds go on; the others are selected as they are.
@@ -3341,6 +3822,7 @@ def run(t_start, deadline, state):
         cap = None
         if ran and not RUN_ALL:
             cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
+        plan.prep = (allowed, skip, cap, cost)
         return ran, held, allowed, skip, cap
 
     def execute(c, plan, index):
@@ -3374,7 +3856,7 @@ def run(t_start, deadline, state):
                 refine_with_diff(plan, keys, maps, tests)
                 ran, allowed, skip, cap = prepare()
                 return {"order": ran, "keeps": plan.keeps, "skip": skip, "allowed": allowed, "cap": cap, "enders": plan.enders,
-                        "tokcheck": plan.tokcheck}
+                        "tokcheck": plan.tokcheck, "guard": plan.guard}
 
             verdicts, status, hung = run_child(plan, None, tests, index, {}, left - 2.0, (), on_diff)
             if status == "REDO" and "ran" not in box:
@@ -3408,8 +3890,8 @@ def run(t_start, deadline, state):
                 finish(c, plan, {}, "END", ran, box["held"])
                 return
             verdicts, status, hung = run_child(plan, ran, tests, index, allowed, left - 2.0, skip, None, cap)
-            if status == "REDO":
-                return "REDO"
+            if status in ("REDO", "REDOC"):
+                return status
             if status in ("TIMEOUT", "DIED") and hung is None and not verdicts and plan.mode != "hot":
                 for p in plan.files:
                     if p.endswith(".py"):
@@ -3417,21 +3899,97 @@ def run(t_start, deadline, state):
                 plan.note.append("import does not end")
         conclude(c, plan, verdicts, status, hung, box["ran"], box["held"], index)
 
+    def rest_after_stop(plan, verdicts, todo, held):
+        """After the CPU guard stopped a test, the child is gone. Returns what a new child
+        runs: (tests, the tests among them that do not run after a failure, enders). The
+        tests that the first child would not have run any more after its verdicts are selected
+        as they are (plan.skipped), as that child would have done. The others run in a new
+        child when that costs less than their selection; otherwise they are selected and
+        count like failing tests (plan.suspects), because nothing is known about them."""
+        _, skip, _, cost = plan.prep
+        bad = {n for n, failed in verdicts.items() if failed}
+        if bad:
+            plan.skipped.update(n for n in todo if n in skip)
+            todo = [n for n in todo if n not in skip]
+        enders = plan.enders
+        if enders:
+            # the state of runner.Verdicts after the verdicts so far (a stopped test selects
+            # the long held tests of its class like a failing one)
+            undecided = set(enders.get("held", ()))
+            for n in sorted(bad | plan.suspects):
+                decides = enders.get(n)
+                if decides:
+                    undecided -= decides[0]
+                    if not undecided and decides[1]:
+                        plan.skipped.update(todo)
+                        return [], set(), enders
+            enders = dict(enders)
+            enders["held"] = undecided
+        if not todo:
+            return [], set(), enders
+        evidence = bad | plan.suspects
+        base = evidence | plan.blind | (plan.skipped & set(cost)) | {n for n in held if seconds[n] <= QUIET_HOLD_SECONDS}
+        base |= long_by_evidence(evidence, held)
+        unrun = base | set(todo) | long_by_evidence(evidence | set(todo), held)
+        run_cost = RESTART_SECONDS.get(plan.mode, 1.5) + sum(cost.get(n, 0.0) for n in todo)
+        if CPU_PRICE * run_cost >= packed_seconds(unrun, seconds) - packed_seconds(base, seconds):
+            plan.suspects.update(todo)
+            plan.note.append("%d tests selected unrun after a stopped test" % len(todo))
+            return [], set(), enders
+        return todo, skip.intersection(todo), enders
+
     def conclude(c, plan, verdicts, status, hung, ran, held, index):
         """The answer of a commit from the verdicts that its child reported."""
         if status == "OVER":
             plan.note.append("over the time cap")
         # a test that does not end is a timeout in the full run; the tests after it run again
-        for attempt in range(2):
-            if hung is None:
-                break
-            verdicts[hung] = True
-            todo = [n for n in ran if n not in verdicts and n not in plan.skipped]
+        hangs = restarts = 0
+        pool_users = None
+        while hung is not None:
+            if status == "COST":
+                # The CPU guard stopped this test: it is selected, and it has no verdict. In
+                # finish() it counts like a failing test (plan.suspects).
+                plan.suspects.add(hung)
+                plan.note.append("test %d stopped by the CPU guard" % hung)
+            elif hangs >= 2:
+                break  # (the third test that does not end stays without a verdict)
+            else:
+                verdicts[hung] = True
+                hangs += 1
+            if pool_users is None:
+                pool_users = set(maps.tests(maps.meta.get("pool_users", 0)))
+            if hung in pool_users:
+                # A pool task that does not end keeps a worker of the class-level process pool
+                # busy (and spinning) for the rest of the full run: the later tests of the class
+                # wait for it or run starved, and time out too. The direct runs here use an
+                # in-process pool, so they cannot show that: those tests are selected unrun.
+                # A test that the CPU guard stopped may be such a test, so the rule holds for it too.
+                cls_id = tests[hung]["id"].rsplit("::", 1)[0]
+                plan.blind.update(
+                    n for n in range(hung + 1, len(tests)) if tests[n]["id"].rsplit("::", 1)[0] == cls_id
+                )
+            hung = None
+            todo = [n for n in ran if n not in verdicts and n not in plan.skipped and n not in plan.suspects]
             left = deadline - time.monotonic()
             if not todo or left < 3.0:
                 break
-            cost_allowed = {n: TEST_TIMEOUT * SLOWDOWN for n in todo}
-            v, status, hung = run_child(plan, todo, tests, index, cost_allowed, left - 2.0, set(todo))
+            if status == "COST":
+                if restarts >= GUARD_RESTARTS or plan.prep is None:
+                    break
+                restarts += 1
+                todo, skip, enders = rest_after_stop(plan, verdicts, todo, held)
+                if not todo:
+                    break
+                allowed, _, cap, _ = plan.prep
+                saved_enders = plan.enders
+                plan.enders = enders
+                try:
+                    v, status, hung = run_child(plan, todo, tests, index, allowed, left - 2.0, skip, None, cap)
+                finally:
+                    plan.enders = saved_enders
+            else:
+                cost_allowed = {n: TEST_TIMEOUT * SLOWDOWN for n in todo}
+                v, status, hung = run_child(plan, todo, tests, index, cost_allowed, left - 2.0, set(todo))
             verdicts.update(v)
         blind = [n for n in ran if n in plan.skipped and n not in verdicts]
         if plan.pool_died:
@@ -3480,9 +4038,8 @@ def run(t_start, deadline, state):
     )
     global PANDAS_USERS
     lazy_pandas = False
+    duck_replay = False
     if need_heavy:
-        import duckdb  # noqa: F401
-
         users = None
         if not os.environ.get("BR_NO_LAZY_PANDAS"):
             try:
@@ -3491,11 +4048,31 @@ def run(t_start, deadline, state):
                 users = frozenset(n for n, t in enumerate(tests) if t["id"] in ids)
             except (OSError, ValueError, KeyError, TypeError):
                 users = None
+        recording = None
+        if users is not None and not NO_DUCK_REPLAY:
+            # The DuckDB queries of the optimizer tests are answered from a recording of the
+            # pinned run (duckreplay.py, made by build_duck_replay.py at image build time).
+            import duckreplay
+
+            recording = duckreplay.read_file(duckreplay.default_path())
+        if recording is None:
+            import duckdb  # noqa: F401
         if users is not None:
             import lazymods
 
             lazy_pandas = lazymods.install()
-        if lazy_pandas:
+        if recording is not None:
+            duck_replay = lazy_pandas and duckreplay.install(recording)
+            if not duck_replay:
+                import duckdb  # noqa: F401
+        if duck_replay:
+            # duckdb is now lazy like numpy and pandas, and the optimizer tests need none of the
+            # three unless a query really has to run. The few other users (the TPC tests of the
+            # executor, mostly held back; one test with numpy values) load what they touch in
+            # their own child: this process never loads the libraries. (Measured on the labeled
+            # sets: about one such child in a batch of 60 commits.)
+            pass
+        elif lazy_pandas:
             # numpy and pandas load when a commit that runs one of their users comes (see
             # pandas_turn below), or never
             PANDAS_USERS = users
@@ -3748,12 +4325,13 @@ def run(t_start, deadline, state):
                 log("fixture batch failed", repr(e))
             if c in answered:
                 continue
-        if execute_safe(c, plans[c], index) == "REDO":
+        redo = execute_safe(c, plans[c], index)
+        if redo in ("REDO", "REDOC"):
             fresh.append(c)
             plan = plans[c]
-            plan.note.append("redo")
+            plan.note.append("redo" if redo == "REDO" else "redo: closure cells")
             plan.diffable = False
-            for p in plan.files:
+            for p in (plan.files if redo == "REDO" else ()):
                 rec = maps.file(p)
                 if rec is not None:
                     plan.cands.update(maps.tests(rec[7]))

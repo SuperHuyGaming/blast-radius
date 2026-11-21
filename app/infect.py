@@ -33,11 +33,13 @@ _SETS = {}  # map path -> list of test-set bytes
 
 
 class Result:
-    __slots__ = ("tests", "global_phase", "site", "old_op", "new_op", "sure")
+    __slots__ = ("tests", "global_phase", "site", "old_op", "new_op", "sure", "seen")
 
-    def __init__(self, tests, global_phase, site, old_op, new_op, sure=frozenset()):
+    def __init__(self, tests, global_phase, site, old_op, new_op, sure=frozenset(), seen=None):
         self.tests = tests  # frozenset of test numbers with an infected evaluation
         self.sure = sure  # the tests with an evaluation whose result is known to change
+        # every test with at least one recorded evaluation of the site, infected or not
+        self.seen = seen
         self.global_phase = global_phase  # an infected evaluation outside any single test
         self.site = site
         self.old_op = old_op
@@ -81,6 +83,17 @@ def _set(map_path, m, sid):
     a = array("H")
     a.frombytes(sets[sid])
     return a
+
+
+def _seen(map_path, m, set_ids, tests):
+    """The tests of the given record sets: every test with a recorded evaluation of a site.
+    Only worked out when some evaluation changes (tests is not empty); None otherwise."""
+    if not tests:
+        return None
+    seen = set()
+    for sid in set_ids:
+        seen.update(_set(map_path, m, sid))
+    return frozenset(seen)
 
 
 def is_infected(sig, old, new):
@@ -206,9 +219,12 @@ def infected_tests(path, old_lines, new_lines, groups, units, map_path):
         return None
     tests = set()
     sure = set()
+    seen = set()
     glob = False
     for i in range(0, len(records), 3):
         sig, sid, g = records[i], records[i + 1], records[i + 2]
+        if sid:
+            seen.add(sid)
         if is_infected(sig, oi, ni):
             if sid:
                 found = _set(map_path, m, sid)
@@ -219,7 +235,7 @@ def infected_tests(path, old_lines, new_lines, groups, units, map_path):
                         sure.update(found)
             if g:
                 glob = True
-    return Result(frozenset(tests), glob, (path,) + key, old, new, frozenset(sure))
+    return Result(frozenset(tests), glob, (path,) + key, old, new, frozenset(sure), _seen(map_path, m, seen, tests))
 
 
 
@@ -534,6 +550,7 @@ def infected_tests2(path, old_lines, new_lines, groups, units, map_path):
         return None
     kind, key = edit[0], edit[1]
     tests = set()
+    seen = set()
     glob = False
     if kind == "bool":
         rows = _rows2(map_path, m, "bfiles", path)
@@ -548,12 +565,14 @@ def infected_tests2(path, old_lines, new_lines, groups, units, map_path):
         vctx = ctx == "V"
         for i in range(0, len(recs), 3):
             sig, sid, g = recs[i], recs[i + 1], recs[i + 2]
+            if sid:
+                seen.add(sid)
             if _bool_changed(sig, n, desc, new, vctx):
                 if sid:
                     tests.update(_set(map_path, m, sid))
                 if g:
                     glob = True
-        return Result(frozenset(tests), glob, (path,) + key, "and/or", "and/or")
+        return Result(frozenset(tests), glob, (path,) + key, "and/or", "and/or", seen=_seen(map_path, m, seen, tests))
     op, side, old, new = edit[2], edit[3], edit[4], edit[5]
     if old is None or new is None or type(old) not in (int, float, str, bool):
         return None
@@ -564,13 +583,146 @@ def infected_tests2(path, old_lines, new_lines, groups, units, map_path):
     recs = row[1]
     for i in range(0, len(recs), 3):
         code, sid, g = recs[i], recs[i + 1], recs[i + 2]
+        if sid:
+            seen.add(sid)
         if _const_changed(code, op, side, old, new):
             if sid:
                 tests.update(_set(map_path, m, sid))
             if g:
                 glob = True
-    return Result(frozenset(tests), glob, (path,) + key, repr(old), repr(new))
+    return Result(frozenset(tests), glob, (path,) + key, repr(old), repr(new), seen=_seen(map_path, m, seen, tests))
 
 
 def _count(desc):
     return sum(_count(c) if isinstance(c, tuple) else 1 for c in desc[1:])
+
+
+# === which tests ran a statement in the whole-suite runs ======================================
+
+
+def _records_tests(map_path, m, recs, out):
+    for i in range(1, len(recs), 3):
+        if recs[i]:
+            out.update(_set(map_path, m, recs[i]))
+
+
+_DEFERRED = (ast.Lambda, ast.GeneratorExp, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _sites_in(node, out):
+    """The positions of the comparisons and and/or trees that run as part of the statement
+    `node` itself or of the statements nested in it (not the code of a lambda, a generator
+    expression or a nested definition, which can run later without the statement)."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _DEFERRED):
+            continue
+        if isinstance(child, (ast.Compare, ast.BoolOp)):
+            out.append((child.lineno, child.col_offset, child.end_lineno, child.end_col_offset))
+        _sites_in(child, out)
+
+
+def statement_runners(path, old_lines, units, key, map_path, map_path2):
+    """Tests that are known to have run the statement holding the site `key` (line, column,
+    end line, end column in the pinned file) when the maps were recorded, or None when the
+    site is in a lambda (its code runs when the lambda is called, not with the statement).
+
+    A test with a record at any mapped site that is part of the statement, of a statement
+    nested in it, or of a later statement of the same block has run the statement: control
+    reaches those places only through it. The set can be smaller than the truth (a test that
+    ran the statement and left no record there is not in it), never larger."""
+    unit = None
+    for u in units:
+        if u[0] <= key[0] and key[2] <= u[1] and (unit is None or u[1] - u[0] < unit[1] - unit[0]):
+            unit = u
+    if unit is None:
+        return None
+    tree = _parse_unit(old_lines, unit[0], unit[1], unit[2])
+    if tree is None:
+        return None
+    # the chain of nodes from the tree down to the site
+    chain = []
+
+    def descend(node):
+        chain.append(node)
+        if isinstance(node, (ast.Compare, ast.BoolOp)) and (
+            node.lineno, node.col_offset, node.end_lineno, node.end_col_offset
+        ) == key:
+            return True
+        for child in ast.iter_child_nodes(node):
+            if descend(child):
+                return True
+        chain.pop()
+        return False
+
+    if not descend(tree):
+        return None
+    at = max((i for i, n in enumerate(chain) if isinstance(n, ast.stmt)), default=None)
+    if at is None or at == 0:
+        return None
+    stmt = chain[at]
+    if isinstance(stmt, _DEFERRED) or any(isinstance(n, ast.Lambda) for n in chain[at:]):
+        return None
+    block = None  # the list of statements that holds stmt
+    for name, value in ast.iter_fields(chain[at - 1]):
+        if isinstance(value, list) and any(v is stmt for v in value):
+            block = value
+    if block is None:
+        return None
+    keys = []
+    for later in block[next(i for i, v in enumerate(block) if v is stmt):]:
+        if not isinstance(later, _DEFERRED):
+            _sites_in(later, keys)
+    out = set()
+    m = _load(map_path)
+    sites = _file_sites(map_path, m, path) if m is not None and path in m["files"] else None
+    m2 = _load2(map_path2)
+    brows = _rows2(map_path2, m2, "bfiles", path) if m2 is not None else None
+    krows = _rows2(map_path2, m2, "kfiles", path) if m2 is not None else None
+    for k in keys:
+        if sites and k in sites:
+            _records_tests(map_path, m, sites[k][1], out)
+        if brows and k in brows:
+            _records_tests(map_path2, m2, brows[k][2], out)
+        if krows and k in krows:
+            _records_tests(map_path2, m2, krows[k][1], out)
+    return out
+
+
+# === tests that a cache hides from the outcome maps ==========================================
+# maps/infect_hidden.bin (built by build_hidden.py from runs of the pinned commit's own suite
+# with reach probes; no patches involved). The outcome maps come from runs of the whole suite
+# in one process. Code that runs once per process and whose result sqlglot keeps shows its
+# evaluations only in the first test that needed it. For every mapped site the file lists the
+# tests that depend on such a kept result: alone in a fresh process they get to the site's
+# statement (or start the site's expression) more often than in their own phases of the
+# whole-suite run.
+
+_HIDDEN = {}  # map path -> {file: blob or decoded {site key: test-number bytes}} (or None)
+
+
+def hidden_tests(map_path, rel, key):
+    """The tests that a cache hides at the site `key` (line, column, end line, end column in
+    the pinned file) of file `rel`: a frozenset, empty for most sites. None when the map has
+    no reach record for the site (no map file, or the records differed between the runs)."""
+    m = _HIDDEN.get(map_path, 0)
+    if m == 0:
+        try:
+            with open(map_path, "rb") as f:
+                m = marshal.loads(f.read())
+            m = dict(m["files"]) if m.get("version") == 1 else None
+        except (OSError, ValueError, EOFError, KeyError, TypeError, AttributeError):
+            m = None
+        _HIDDEN[map_path] = m
+    if m is None:
+        return None
+    rows = m.get(rel)
+    if rows is None:
+        return None
+    if isinstance(rows, bytes):
+        rows = m[rel] = {tuple(row[:4]): row[4] for row in marshal.loads(zlib.decompress(rows))}
+    raw = rows.get(tuple(key))
+    if raw is None:
+        return None
+    a = array("H")
+    a.frombytes(raw)
+    return frozenset(a)

@@ -1,70 +1,98 @@
-# Blast Radius starter
+# nap-time: Blast Radius entry of team 67
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+This repository is an entry for the RWX Blast Radius track of the Builders Buildathon 2026.
+For each code change to sqlglot (commit `eb11aec`), the program prints the tests that fail on it and a split across workers.
 
-## The problem
+## Method in one paragraph
 
-Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.
+The program applies each patch in memory, runs the tests that can be affected, and selects the tests that fail. The tests run directly with `unittest`. Maps of the pinned commit say which tests can be affected. When a map proves that a patch cannot change any test, the program selects nothing and runs nothing.
 
-| | |
-| --- | --- |
-| `/data/commits/<id>.patch` | One unified diff against the pinned commit. Each stands alone: none builds on another. |
-| `/data/tests.json` | Every test, numbered, with its file and the seconds it took us to run. |
-| stdout | One JSON line a commit: `{"commit": "k7q2", "workers": [[12, 845, 901], [3, 77]]}` |
+## How one batch runs
 
-Each inner list is one worker's test numbers. `"workers": []` runs nothing, which is the right answer for a change that breaks nothing.
+1. **Plan** (`app/selector.py`, `make_plan`). The program parses the patch (`app/engine.py`, `parse_patch`). Each changed file gets candidate tests from the maps. Edits in function bodies use line coverage. Edits of import-time code use the def-time map. Fixture edits use the readers of the data file. Comment-only edits compile to the same code and get no candidates.
+2. **Prove what the maps can prove without a run.**
+   - Operand outcome maps (`app/infect.py`). The program uses them when the edit changes one comparison operator, one and/or operator, or one literal operand. The maps say in which tests the new code gives another result on a recorded evaluation. No such test means that nothing can change (`plan_python_file_infect`).
+   - Cache-hidden tests (`infect.hidden_tests`). The outcome maps come from whole-suite runs in one process. A cache such as `_DISPATCH_CACHE` shows an evaluation only in the first test that needs it. `app/maps/infect_hidden.bin` lists the later tests that depend on the kept result. Those tests are added back as candidates.
+   - Table entries (`app/keymap.py`, the class attribute map). An import-time edit can change only some entries of class-level tables or class constants. Then only the tests that read those entries or attributes stay.
+   - Long tests (`plan_python_file`, `app/tokcheck.py`). A few long tests have exact line sets (`tight_lines.bin`). Such a test stays a candidate only when it runs a line with a changed instruction (`engine.changed_lines`). After a tokenizer edit, `tokcheck.changed` tokenizes the recorded inputs of those tests again. A test whose token stream differs is selected when it is too costly to run.
+3. **Run** (`app/runner.py`, `app/reduce.py`, `app/pool.py`). One parent process imports sqlglot and the test modules once. It forks one child per patch.
+   - Edit in a function body. The child swaps the code objects of the live functions (`engine.plan_swaps`).
+   - Edit of import-time code. The child imports the patched tree again and compares the import state with the pinned one (`app/statefp.py`).
+   - Importer cone (`app/cone.py`, `selector.cone_plan`). An import-time edit can touch only modules that `app/maps/cone.json` lists. Then the child imports again only the patched module and its importers (`cone.reimport`). The map lists a module only when this gave the same import state as a full import on the pinned tree. The child checks the patched code again and falls back to the full import when a check fails.
+   - Fixture-only commits. Some commits change only entries of `.sql` fixture files (`fixture_only` in `run`). One shared child serves all of them in turn (`fixture_batch_child`). After each commit it restores the state and checks it (`shared_state_change`). A failed check ends the shared child, and the rest get their own children.
+   - A test runs whole, or reduced to the statements, fixture entries and pool tasks that reach the changed code.
+4. **Select.** The program selects the failing tests. It packs the answer over up to 8 workers.
 
-## Scoring
+## Cost controls
 
-Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
+- **CPU guard** (`selector.py`, `GUARD`). Each test gets a CPU limit. The limit is never below what selecting the test unrun can cost. A test that passes its limit is stopped. Its run status is `COST`, and the test is selected without a verdict.
+- **One CPU** (`pin_to_one_cpu`). The process and its children stay on one CPU, since they work one after the other. `release_pin_if_slow` allows all CPUs again when wall time runs far ahead of CPU time.
+- **DuckDB answer replay** (`app/duckreplay.py`, `app/build_duck_replay.py`). A database state is the connect arguments plus the ordered statements that changed the database. A recorded SELECT text on a recorded state gets the recorded answer. Any other text, parameter or method opens a real DuckDB connection, replays the state, and runs there. The image build records the answers from the pinned tests and checks them with a rehearsal. The rehearsal runs the tests with the replay on and needs every verdict to match the pinned run. If it fails, every query runs in DuckDB.
+- **Lazy executor tables** (`app/preload.py`, `app/build_exec_cache.py`). The image build packs the TPC-H and TPC-DS rows of `TestExecutor.setUpClass`, one table at a time. `_LazyTables` unpacks a table at its first read by name. Any other use of the dict unpacks all tables first. The build checks the cache against the real `setUpClass` and drops it on a mismatch.
+- **Lazy numpy, pandas and duckdb** (`app/lazymods.py`). They load only when a test really needs them.
+- **Saved base state** (`app/build_base_state.py`). The image build saves the import-state fingerprint of the pinned tree. The selector checks the seed and Python version before it uses the file.
 
-- A commit costs the recorded seconds of its busiest worker, plus 2 seconds for every worker.
-- A commit where you left out a test that fails adds 300 seconds.
-- The CPU seconds your program uses are added. Running sqlglot's tests while you decide is allowed, and you pay for the time.
-- Your image runs 3 times and the middle total counts.
+## Rules for unusual patches
 
-"Fails" means pytest reports a failure, an error or a timeout for the test, or the test's file cannot be imported. A test with subtests is one test: one failing subtest fails it.
+`app/patchrules.py` holds the rules for new files, renames, pytest configuration, removed names and test files that cannot be imported. Other safety rules are in `app/selector.py` and `app/engine.py`.
 
-## Try it
+- **Closures** (`engine.plan_swaps`). New code can read free variables with other names than the pinned code. A live closure keeps the old cells, so the child does a fresh import instead of a code swap.
+- **Indentation-only edits** (`_indentation_changed`, `_file_compiles`). An edit can move only the indentation of a line and still break the file. Then the child imports the patched tree, as a full run would.
+- **Hung tests and pool tasks** (`conclude` in `run`). A test that does not end counts as a failure. A hung pool task blocks a worker of the class pool in a real run. Thus the later tests of that class are selected unrun.
+- **Lazy module `__getattr__`** (`_module_getattr_span`, `_lazy_attr_users`). A changed module `__getattr__` can fail every lazy lookup. Every test that loads the module becomes a candidate, and no reduced run applies.
+- **`if TYPE_CHECKING:` bodies** (`type_checking_groups`). Such code never runs, so an edit there changes no code that runs.
 
-You need Docker, make and Python 3.9 or newer. The kit unpacks into the folder you are in, so unpack it into an empty one.
+## The interpreter
 
-```sh
-make sample   # build, run once on the 30 sample commits under the scorer's limits, and score
-make check    # the output's format only
-```
+Dockerfile step 0 adds a python-build-standalone build of the same CPython version (3.13.18). `build/fetch_python.py` downloads one file from a GitHub release at a fixed tag and checks its sha256. `build/sitecustomize.py` makes its `sqlite3` module load the pinned image's own SQLite extension. `build/check_python.py` compares the two interpreters at build time. It checks the version, bytecode magic, hashes, limits, float output and SQLite behavior. On any failure, the image keeps its own interpreter.
 
-`make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
+## The maps
 
-`sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
+Every map in `app/maps` comes from the pinned commit only. Each comes from its source or from runs of its own unchanged test suite. No map holds anything computed from a patch, a kind of edit, or test results on changed code. Builders are in `app/tools/`.
 
-## Submit
+| Map | Content | Builder |
+|---|---|---|
+| `f/`, `sets.bin`, `sets.idx`, `meta.bin`, `readers.bin` | line coverage per test, statement spans, importers, files that tests open, readers of class constants | `trace_tests.py`, `build_agg.py`, `build_maps.py` |
+| `t/`, `u/`, `classes.bin` | lines that each part of a test runs, classes that it creates | `trace_units.py`, `run_units.py`, `build_unitmap.py` |
+| def-time sets in `f/` | for each line of import-time code, the tests that use what the line defines | `build_defmap.py` |
+| `cost.bin` | CPU cost of each test in our runner | `time_all.py`, `build_costs.py` |
+| `infect.bin` | for each comparison, the operand relations that each test produced | `build_infect.py`, `instrument.py`, `plugin/` |
+| `infect2.bin` | for each and/or tree, the leaf outcomes per test, and the value classes of the other operand at each comparison with a literal | `infect2/build_infect.py` (`all2`), `infect2/instrument.py`, `infect2/plugin/` |
+| `infect_hidden.bin` | for each mapped site, the tests that reach it more often alone than in the whole-suite run | `infect_hidden/build_hidden.py`, `instrument_reach.py`, `build_hidden.sh`, `cold_all.sh` |
+| `classmap.bin` | which test reads which attribute through which class | `classtrace.py`, `build_classmap.py` |
+| `keymap.bin` | which test reads which key of which class-level table | `keytrace.py`, `build_keymap.py` |
+| `cone.json` | modules whose importer cone imports alone to the same state, each cone in import order | `build_cone.py` |
+| `tight_lines.bin` | every sqlglot line that each of a few long tests runs, from exact traces | `tight/xmon.py`, `tight/xrun.py`, `build_tight_lines.py` |
+| `tok_inputs.bin` | tokenizer inputs of those long tests, with token-stream digests on the pinned tree | `tight/tokrec.py`, `tight/xtplugin.py`, `build_tok_inputs.py` |
+| `registry_spans.json` | line spans of the registry lookup methods in `dialect.py` | `build_registry_spans.py` |
+| `tc_spans.bin` | spans of `if TYPE_CHECKING:` bodies in each pinned file | `build_tc_spans.py` |
+| `pandas_tests.json` | tests that load numpy, pandas or duckdb | `build_pandas_tests.py` |
+| `class_attr_reads.json`, `test_readers.json`, `registry_start.json` | fixture lists that a test reads, helper data that a test references, dialects registered at the start of a run | `build_attr_reads.py`, `build_test_readers.py`, `build_registry_start.py` |
+| `faithful.json` | test methods that compile alone to the pinned code | `build_faithful.py` |
 
-Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
+The span maps (`registry_spans.json`, `tc_spans.bin`) store the length and checksum of each file. The selector uses an entry only when the file text matches. Otherwise it computes the spans.
 
-## Rules
+The image build also writes the executor row cache, the DuckDB answer recording and the saved base state to `/app/cache`. Each comes from the pinned tree.
 
-- Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
-- No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
-- Only the final counts. The practice board carries no prize.
+## What is not in the repository
 
-## How your image runs
+- No table from patches, or from kinds of edit, to tests.
+- No answer recorded for a patch. Every map and recording comes from the pinned commit's source or from runs of its own unchanged test suite.
+- No labeled practice patches. We made such patches to test the selector. They are not in the image, and the program does not read them at run time.
 
-- The build has the network, 4 cores, 8 GB of memory and 10 minutes. It may clone sqlglot at the pinned commit, install it and run its tests to make coverage or import maps.
-- Your repository may hold 20 MB. Git submodules and Git LFS files are not fetched: clone sqlglot in the `Dockerfile` and commit maps as plain files.
-- The run has no network, 2 cores, 4 GB of memory and 3 minutes for the whole batch (4.5 in the final, which has about one and a half times as many commits).
-- The disk is read-only. `/tmp` holds 64 MB and is empty at the start of every run.
-- The container runs as user `nobody`, with `HOME=/tmp` and at most 256 processes.
-- stdout may hold 2 MB. More rejects the run.
+## Layout
 
-## Things that will catch you
+| Path | Content |
+|---|---|
+| `Dockerfile` | the image: pinned Python image, interpreter step, PyPI packages, sqlglot at the pinned commit, bytecode, program |
+| `requirements.txt` | exact PyPI versions from the kit's lock file |
+| `build/` | build steps: `fetch_python.py`, `sitecustomize.py`, `check_python.py`, `fetch_sqlglot.py` |
+| `app/main.py`, `app/selector.py` | entry point and the selector |
+| `app/*.py` | run-time modules (`engine`, `patchrules`, `infect`, `keymap`, `cone`, `statefp`, `stmtmap`, `reduce`, `runner`, `pool`, `preload`, `lazymods`, `duckreplay`, `tokcheck`) and build-time scripts (`build_exec_cache.py`, `build_duck_replay.py`, `build_base_state.py`) |
+| `app/maps/` | the maps |
+| `app/tools/` | the scripts that built the maps, with `infect2/`, `infect_hidden/`, `tight/` and `plugin/` |
+| `sample/`, `score.py`, `Makefile`, `SCORING.md` | the kit of the organizers, unchanged. `make sample` builds the image, runs it on the 30 sample commits, and scores the output |
 
-- Logs go to stderr. Any line on stdout that is not an answer rejects the run.
-- `score.py` names a broken rule by its code, as in `Rejected: not_json on line 1`. The table in SCORING.md says what each code means.
-- Files your program needs must be readable by `nobody`. A map written by `root` during the build with mode 600 is not.
-- pytest 9 prints a test as `PASSED` beside `SUBFAILED` lines when one of its subtests fails. That test failed.
-- sqlglot skips its executor tests unless `SKIP_INTEGRATION=0` is set. We labeled with it set, so those tests can fail.
-- `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
-- The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
-- A change that only adds a comment is not promised to be harmless.
+## License
+
+MIT. See `LICENSE`.

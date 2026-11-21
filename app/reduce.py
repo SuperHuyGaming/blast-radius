@@ -316,6 +316,53 @@ def live_function(cls, method, old_code):
     return None
 
 
+# Off unless BR_KEEP_SHARED=1: the rule costs CPU (it parses each reduced method, and methods
+# whose statements all read one local, a schema for instance, are no longer reduced).
+KEEP_SHARED = __import__("os").environ.get("BR_KEEP_SHARED") == "1"  # see keep_shared_state
+
+
+def keep_shared_state(file_lines, shape, keep):
+    """Adds to keep the droppable statements that share an object with a kept statement.
+
+    A droppable statement binds no name that a later statement reads, but it can still act
+    on an object that a kept statement uses: a call that mutates it (schema.add_table(...),
+    hash(expr) filling a cache) or an assertion that reads its state afterwards
+    (self.assertEqual(len(schema._find_cache), 1)). Such a statement runs no patched line
+    itself, so the unit map does not choose it; dropping it can remove the state that leads
+    the kept part to the patched code, or the only check that sees the patched behaviour.
+    The test then passes falsely. Two statements share an object when both read the same
+    local variable of the method (self excepted: every validate_* statement reads it; module
+    names such as parse_one are not local). Returns a new set, or None when the method source
+    cannot be parsed (then every statement stays)."""
+    first, last, stmts = shape
+    try:
+        # the method keeps its indentation under a wrapper line (dedenting the text would
+        # fail on a multi-line string that has text at column 0)
+        fn = ast.parse("if 1:\n" + "\n".join(file_lines[first - 1:last]) + "\n").body[0].body[0]
+    except (SyntaxError, IndexError, ValueError, AttributeError):
+        return None
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or len(fn.body) != len(stmts):
+        return None
+    local = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    for s in fn.body:
+        local |= _binds(s)
+    local.discard("self")
+    reads = [(_names(s, ast.Load) | _names(s, ast.Del)) & local for s in fn.body]
+    out = set(keep)
+    changed = True
+    while changed:
+        changed = False
+        live = set()
+        for i in out:
+            if 0 <= i < len(reads):
+                live |= reads[i]
+        for j, (_, _, droppable) in enumerate(stmts):
+            if droppable and j not in out and reads[j] & live:
+                out.add(j)
+                changed = True
+    return out
+
+
 def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled, pinned=None):
     """Replaces the code of a test method by its reduced and/or small-scale form.
 
@@ -327,6 +374,8 @@ def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_na
     _, class_name, method = test_id.split("::")
     first = shape[0]
     old_lines = file_lines[first - 1:shape[1]]
+    if keep_stmts is not None and KEEP_SHARED:
+        keep_stmts = keep_shared_state(file_lines, shape, keep_stmts)
     new_lines = old_lines if keep_stmts is None else reduced_lines(file_lines, shape, keep_stmts)
     if scaled:
         new_lines = scale_lines(test_id, new_lines, keep_stmts is not None)

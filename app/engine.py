@@ -485,8 +485,13 @@ class FunctionIndex:
         return self.idx.get((code.co_filename, code.co_firstlineno, code.co_name), ())
 
 
+SWAP_FAIL = None  # why the last plan_swaps call returned None: "cells" (see below) or "other"
+
+
 def plan_swaps(pairs, index: FunctionIndex):
     """Returns the list of (function, new_code) or None when a safe swap is not possible."""
+    global SWAP_FAIL
+    SWAP_FAIL = "other"
     swaps = []
     stack = list(pairs)
     while stack:
@@ -497,7 +502,12 @@ def plan_swaps(pairs, index: FunctionIndex):
         live = [f for f in cands if f.__code__ == x]
         if len(live) != len(cands):
             return None  # a function sits there with code we cannot reproduce
-        if live and len(x.co_freevars) != len(y.co_freevars):
+        if live and x.co_freevars != y.co_freevars:
+            if len(x.co_freevars) == len(y.co_freevars):
+                SWAP_FAIL = "cells"
+            # A live closure keeps the cells of the pinned code's free variables, in the order
+            # of their names. New code that reads other free variables (same count, other
+            # names) would read the wrong cells: only a fresh import builds the right closure.
             return None
         for f in live:
             swaps.append((f, y))

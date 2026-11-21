@@ -29,15 +29,18 @@ def _single_thread_duckdb() -> None:
         return
     real = duckdb.connect
     if getattr(real, "_br", False):
-        return
+        return  # done already, or the replaying connect of duckreplay.py (which calls the function below)
+    duckdb.connect = single_thread_connect(real)
 
+
+def single_thread_connect(real):
     def connect(*args, **kwargs):
         config = dict(kwargs.pop("config", None) or {})
         config.setdefault("threads", 1)
         return real(*args, config=config, **kwargs)
 
     connect._br = True
-    duckdb.connect = connect
+    return connect
 
 
 def install_environment(root: str) -> None:
@@ -170,7 +173,9 @@ def _exec_cached_rows(mod, which):
     path = os.path.join(EXEC_CACHE, "exec_%s.marshal" % which)
     try:
         with open(path, "rb") as f:
-            sizes, data = marshal.load(f)
+            # loads(read()), not load(f): load() asks the file object for every single value,
+            # which is about 9 times slower on these files (1.9 s against 0.2 s for TPC-DS)
+            sizes, data = marshal.loads(f.read())
     except (OSError, ValueError, EOFError, TypeError):
         return None
     schema, directory = _exec_schema(mod, which)
@@ -185,6 +190,16 @@ def _exec_cached_rows(mod, which):
     return data
 
 
+def exec_view_sql(file_name, table, columns) -> str:
+    """The statement with which TestExecutor.setUpClass makes the duckdb view of one table
+    (the same text, character by character: build_duck_replay.py records under it)."""
+    return f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+
+
 def _exec_build(cls, name):
     mod = sys.modules[cls.__module__]
     which = name.split("_", 1)[0]
@@ -192,14 +207,7 @@ def _exec_build(cls, name):
     if name.endswith("_conn"):
         conn = mod.duckdb.connect()
         for table, columns in schema.items():
-            file_name = f"{directory}{table}.csv.gz"
-            conn.execute(
-                f"""
-                CREATE VIEW {table} AS
-                SELECT *
-                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
-                """
-            )
+            conn.execute(exec_view_sql(f"{directory}{table}.csv.gz", table, columns))
         return conn
     if name.endswith("_tables"):
         import marshal
