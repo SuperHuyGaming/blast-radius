@@ -734,12 +734,20 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 p[:-3].replace("/", ".").removesuffix(".__init__") for p in py_files
                 if p.startswith("tests/") and os.path.basename(p) != "conftest.py"
             ]
-            # and every test file: one that cannot be imported any more fails all its tests
-            # (pytest imports every test file before the first test runs)
-            test_mods += sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests} - set(test_mods))
             bad = preload.broken_modules(test_mods)
             for name in bad:
                 os.write(wfd, b"B %s\n" % name.encode())
+
+            def import_all_tests():
+                # Every test file: one that cannot be imported any more fails all its tests
+                # (pytest imports every test file before the first test runs). This comes
+                # after the import-state comparison, because test modules change that state.
+                names = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests} - set(test_mods))
+                for name in preload.broken_test_modules(names):
+                    os.write(wfd, b"B %s\n" % name.encode())
+
+            if plan_fd is None:
+                import_all_tests()
             if preload.exec_fresh_ok(plan.files):
                 runner.ON_IMPORT[preload.EXEC_KEY[0]] = preload.exec_fresh_hook
             if plan_fd is not None:
@@ -765,6 +773,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 else:
                     rows = [[list(k), k in fpr.function_keys or k in BASE_FUNCTION_KEYS] for k in changed]
                     os.write(wfd, b"D " + json.dumps(rows).encode() + b"\n")
+                import_all_tests()
                 chunks = []
                 while True:
                     chunk = os.read(plan_fd, 1 << 16)

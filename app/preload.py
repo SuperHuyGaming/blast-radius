@@ -85,9 +85,17 @@ def broken_modules(test_modules=()) -> list:
             if isinstance(e, KeyboardInterrupt):
                 raise
             bad.append(info.name)
+    bad.extend(broken_test_modules(test_modules))
+    return sorted(set(bad))
+
+
+def broken_test_modules(names) -> list:
+    """Imports the given test modules; returns the names of those that raise. A test file
+    that cannot be imported fails all of its tests."""
     import unittest
 
-    for name in test_modules:
+    bad = []
+    for name in names:
         try:
             importlib.import_module(name)
         except unittest.SkipTest:
@@ -96,7 +104,7 @@ def broken_modules(test_modules=()) -> list:
             if isinstance(e, KeyboardInterrupt):
                 raise
             bad.append(name)
-    return sorted(set(bad))
+    return bad
 
 
 def import_tests(modules) -> None:
