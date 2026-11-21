@@ -41,12 +41,17 @@ REGISTRY_CLEAR_AT = None  # first test after tests/test_dialect_entry_points.py 
 NO_DIFF = os.environ.get("BR_NO_DIFF")  # validation: no import-state diff
 CLASS_FILTER = os.environ.get("BR_CLASS_FILTER") == "1"  # off: the instantiation trace does not see every reader
 FRESH_REDUCE = os.environ.get("BR_FRESH_REDUCE", "1") == "1"
+NO_CLASSMAP = os.environ.get("BR_NO_CLASSMAP") == "1"  # validation: no cut by the class attribute map
 
 WORKER_COST = 2.0
 HOLD_SECONDS = float(os.environ.get("BR_HOLD", "1.5"))  # test runs below this CPU cost always start
 COMMIT_SECONDS = float(os.environ.get("BR_COMMIT", "8.0"))  # CPU limit of the test runs of one commit
 FRESH_SECONDS = float(os.environ.get("BR_FRESH", "3.0"))  # the same for a commit that needs a new import
 INERT_SECONDS = 1.0  # the same when the import state did not change at all
+# CPU seconds of the class fixtures that a child must build again after a fresh import (the
+# parent builds them only once, for the commits that run in the parent's import). Shared by
+# the candidates of the class.
+CLASS_SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0} if os.environ.get("BR_CLASS_SETUP", "1") == "1" else {}
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "2.0"))
 UNSEEN_CLASS = 10  # more tests of one class without a verdict than this: the class is not verified
@@ -83,6 +88,7 @@ class Maps:
         self._paths = None
         self._readers = None
         self._class_users = None
+        self._classmap = None
         try:
             with open(os.path.join(path, "cost.bin"), "rb") as f:
                 self.cost = marshal.load(f)
@@ -159,6 +165,24 @@ class Maps:
             except OSError:
                 self._class_users = {}
         return self._class_users.get(name)
+
+    def classmap(self):
+        """The class attribute read map (build_classmap.py), or None when there is none."""
+        if self._classmap is None:
+            try:
+                with open(os.path.join(self.path, "classmap.bin"), "rb") as f:
+                    cm = marshal.loads(zlib.decompress(f.read()))
+                hooked = array("I")
+                hooked.frombytes(cm["hooked"])
+                unknown = array("H")
+                unknown.frombytes(cm["unknown"])
+                cm["hooked"] = {cm["classes"][i] for i in hooked}
+                cm["unknown"] = set(unknown)
+                cm["fnames"] = set(cm["fnames"])
+                self._classmap = cm
+            except (OSError, ValueError, KeyError, EOFError, zlib.error):
+                self._classmap = False
+        return self._classmap or None
 
     def paths(self):
         if self._paths is None:
@@ -1061,6 +1085,82 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     return verdicts, status, hung
 
 
+def classmap_readers(keys, maps: Maps):
+    """The tests that can read a changed value, by the class attribute map, or None when the
+    map cannot tell.
+
+    It can tell when every changed key is a class attribute that is not a function, of a class
+    of the traced trees (tokenizers, parsers, generators, dialects), or an attribute of an
+    object that such a class attribute holds. A test can then see the change only by reading
+    that attribute through an object or class object whose class inherits from the changed
+    class; the trace of the pinned tree lists those reads for every test. The keys are those
+    of the import-state diff, so values that the metaclass or __init_subclass__ derive from
+    the edited one are keys of their own."""
+    cm = maps.classmap()
+    if cm is None or not keys:
+        return None
+    classes = cm["classes"]
+    out = set(cm["unknown"])  # tests whose reads are not known
+    receivers = None
+    for key, is_function in keys:
+        if is_function:
+            return None
+        if key[0] == "A" and len(key) == 4:
+            owner, name = "%s:%s" % (key[1], key[2]), key[3]
+        elif key[0] == "O" and len(key) == 5:
+            owner, name = "%s:%s" % (key[1], key[2]), key[3]
+        else:
+            return None  # a module global, or deeper
+        if not isinstance(name, str) or name[:2] == "__" or name in cm["fnames"]:
+            return None
+        if owner not in cm["hooked"]:
+            return None
+        if receivers is None:
+            receivers = []
+            for raw in cm["receivers"]:
+                arr = array("I")
+                arr.frombytes(raw)
+                receivers.append({classes[i] for i in arr})
+        raw = cm["names"].get(name)
+        if not raw:
+            continue  # no test reads this name on any class of the trees
+        arr = array("I")
+        arr.frombytes(raw)
+        for i in range(0, len(arr), 2):
+            if owner in receivers[arr[i]]:
+                s = array("H")
+                s.frombytes(cm["sets"][arr[i + 1]])
+                out.update(s)
+    return out
+
+
+def classmap_cut(plan: Plan, keys, maps: Maps):
+    """The tests that can see the commit's import-time change, or None (no cut). Only for a
+    commit whose edits change nothing but values that the import-state diff names: no function
+    body that runs at import (fpairs), no function header, no removed name, no edit that the
+    parent applies in memory."""
+    if (not keys or NO_CLASSMAP or plan.fpairs or plan.stmt_lines or plan.gone or plan.work
+            or _changes_def_header(plan)):
+        return None
+    return classmap_readers(keys, maps)
+
+
+def _changes_def_header(plan: Plan):
+    """True when an edited multi-line statement at module or class level is a function or
+    class definition (its header: defaults, decorators). Other multi-line statements (a
+    constant written over several lines) run only at import."""
+    for path, lines in plan.def_units.items():
+        try:
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                src = f.read().split("\n")
+        except OSError:
+            return True
+        for ln in lines:
+            if 0 < ln <= len(src) and src[ln - 1].lstrip().startswith(("def ", "async def ", "@", "class ")):
+                return True
+    return False
+
+
 def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
     """Uses the import-state diff of a commit that changes import-time code.
 
@@ -1089,6 +1189,14 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         else:
             names.add(name)
     plan.diff = sorted(names)
+    if not whole:
+        # Only class constants changed: the candidates that cannot read any of them drop out.
+        # Tests that read a changed file as data stay.
+        readers = classmap_cut(plan, keys, maps)
+        if readers is not None:
+            before = len(plan.cands)
+            plan.cands &= readers | plan.data_cands
+            plan.note.append("class map: %d -> %d" % (before, len(plan.cands)))
     if not keys and not plan.fpairs:
         # Nothing that the import leaves behind differs. The edit very likely does nothing;
         # the cheapest candidates still run as a check, and nothing is selected unrun.
@@ -1371,6 +1479,11 @@ def run(t_start, deadline, state):
         """Splits the candidates into tests to run and tests that are held (not run)."""
         cands = sorted(plan.cands - plan.blind)
         cost = {n: estimate_cost(n, plan, maps, seconds) for n in cands}
+        if plan.mode != "hot" and "import state unchanged" not in plan.note:
+            for cls_id, setup in CLASS_SETUP_SECONDS.items():
+                members = [n for n in cands if tests[n]["id"].startswith(cls_id + "::")]
+                for n in members:
+                    cost[n] += setup / len(members)
         if RUN_ALL:
             return [n for n in cands if cost[n] <= 60 or RUN_SLOW], [], cost
         # a test is held (not run, selected as it is) when a run costs more CPU than

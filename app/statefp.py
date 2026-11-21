@@ -160,6 +160,75 @@ SKIP_ATTRS = frozenset(("__module__", "__qualname__", "__doc__", "__dict__", "__
                         "__spec__", "__name__", "__package__", "__path__", "__annotate__"))
 
 
+# The class trees whose attribute reads the build-time trace records (see classtrace.py).
+ROOT_CLASSES = (("sqlglot.tokens", "_TokenizerBase"), ("sqlglot.parser", "Parser"),
+                ("sqlglot.generator", "Generator"), ("sqlglot.dialects.dialect", "Dialect"))
+# Dialect attributes that hold a tokenizer, parser or generator class. The dialect metaclass
+# creates a class with type("Tokenizer", ...) for a dialect without its own tokenizer; such a
+# class is not a module global, so it is named after the dialect attribute that holds it.
+OWNER_ATTRS = ("tokenizer_class", "jsonpath_tokenizer_class", "parser_class", "generator_class")
+
+
+def _resolves(cls):
+    """True when module.qualname leads to this very class (module and class dicts only)."""
+    m = sys.modules.get(cls.__module__)
+    if m is None:
+        return False
+    obj = vars(m)
+    found = None
+    for part in cls.__qualname__.split("."):
+        found = obj.get(part)
+        if not isinstance(found, type):
+            return False
+        obj = found.__dict__
+    return found is cls
+
+
+def root_classes():
+    out = []
+    for mod, name in ROOT_CLASSES:
+        m = sys.modules.get(mod)
+        c = vars(m).get(name) if m is not None else None
+        if isinstance(c, type):
+            out.append(c)
+    return out
+
+
+def tree_classes(roots=None):
+    """Every class of the hooked trees, in creation order below each root."""
+    out, seen = [], set()
+    stack = list(reversed(roots if roots is not None else root_classes()))
+    while stack:
+        c = stack.pop()
+        if id(c) in seen:
+            continue
+        seen.add(id(c))
+        out.append(c)
+        stack.extend(reversed(type.__subclasses__(c)))
+    return out
+
+
+def class_paths():
+    """{id(class): (class, module, path)} for the classes of the hooked trees. The path is the
+    qualified name, or for a class that the dialect metaclass created, the dialect's name plus
+    the attribute that holds it (e.g. "Athena.tokenizer_class")."""
+    classes = tree_classes()
+    paths = {}
+    for c in classes:
+        if _resolves(c):
+            paths[id(c)] = (c, c.__module__, c.__qualname__)
+    owners = sorted((p[1], p[2], p[0]) for p in paths.values() if hasattr(p[0], "tokenizer_class"))
+    for mod, path, d in owners:
+        for attr in OWNER_ATTRS:
+            c = d.__dict__.get(attr)
+            if isinstance(c, type) and id(c) not in paths:
+                paths[id(c)] = (c, mod, path + "." + attr)
+    # The other classes have no stable name. They are the classes that the metaclass makes and
+    # then drops (the default of klass.__dict__.get is built even when the dialect has its own
+    # Tokenizer), which nothing can reach, and classes made at run time.
+    return paths
+
+
 def snapshot(code_alias=None):
     """{key: fingerprint} for the loaded sqlglot modules.
 
@@ -184,18 +253,20 @@ def snapshot(code_alias=None):
                 return
         out[key] = f.fp(v)
 
-    def add_class(cls):
+    def add_class(cls, mod=None, path=None):
         if cls in seen_classes:
             return
         seen_classes.add(cls)
+        mod = mod or cls.__module__
+        path = path or cls.__qualname__
         for name, v in list(cls.__dict__.items()):
             if name in SKIP_ATTRS:
                 continue
             if isinstance(v, type) and v.__module__ == cls.__module__ and v.__qualname__.startswith(cls.__qualname__ + "."):
                 add_class(v)
                 continue
-            add_value(("A", cls.__module__, cls.__qualname__, name), v)
-        out[("A", cls.__module__, cls.__qualname__, "__bases__")] = f.fp(cls.__bases__)
+            add_value(("A", mod, path, name), v)
+        out[("A", mod, path, "__bases__")] = f.fp(cls.__bases__)
 
     for mod_name, m in sorted(sys.modules.items()):
         if m is None or not (mod_name == "sqlglot" or mod_name.startswith("sqlglot.")):
@@ -213,6 +284,11 @@ def snapshot(code_alias=None):
                 out[("G", mod_name, name)] = ("M", v.__name__)
                 continue
             add_value(("G", mod_name, name), v)
+    # classes of the hooked trees that no module global names (the dialect metaclass makes
+    # them): their attributes are compared too, under the name of the dialect attribute
+    for c, mod, path in class_paths().values():
+        if c not in seen_classes:
+            add_class(c, mod, path)
     return out, f
 
 
