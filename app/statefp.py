@@ -83,7 +83,8 @@ class Fingerprinter:
         if t in _MARSHAL_OK:
             try:
                 # plain data: fast path. Version 2 writes no object references, so the bytes
-                # do not depend on how many references an object happens to have
+                # do not depend on how many references an object happens to have (the code
+                # cache and cone.py's record add some)
                 return ("m", t.__name__, marshal.dumps(v, 2))
             except ValueError:
                 pass
@@ -296,12 +297,14 @@ def class_paths():
     return paths
 
 
-def snapshot(code_alias=None, base_codes=None):
+def snapshot(code_alias=None, base_codes=None, only=None):
     """{key: fingerprint} for the loaded sqlglot modules.
 
     Keys: ("G", module, name) for a module global, ("A", module, class, name) for a class attribute,
     ("O", module, class-or-global path, attribute, name) for the attributes of an object that
-    such a key holds (one level down, so that a changed setting is named by its own attribute)."""
+    such a key holds (one level down, so that a changed setting is named by its own attribute).
+    only: the keys of these modules only (cone.py: the other modules are known to be unchanged),
+    in the order of a full snapshot."""
     f = Fingerprinter(code_alias, base_codes)
     out = {}
     # the dict, set and frozenset values themselves, by key: keymap.py compares two of them
@@ -343,6 +346,8 @@ def snapshot(code_alias=None, base_codes=None):
     for mod_name, m in sorted(sys.modules.items()):
         if m is None or not (mod_name == "sqlglot" or mod_name.startswith("sqlglot.")):
             continue
+        if only is not None and mod_name not in only:
+            continue
         for name, v in list(vars(m).items()):
             if name in SKIP_ATTRS:
                 continue
@@ -359,6 +364,8 @@ def snapshot(code_alias=None, base_codes=None):
     # classes of the hooked trees that no module global names (the dialect metaclass makes
     # them): their attributes are compared too, under the name of the dialect attribute
     for c, mod, path in class_paths().values():
+        if only is not None and mod not in only:
+            continue
         if c not in seen_classes:
             add_class(c, mod, path)
     return out, f
@@ -368,6 +375,14 @@ def diff(base, new):
     """Keys whose value differs, or that exist on one side only."""
     changed = [k for k, v in new.items() if base.get(k, _MISSING) != v]
     changed += [k for k in base if k not in new]
+    return changed
+
+
+def diff_only(base, new, only):
+    """diff() when new holds the keys of the modules in only (snapshot(only=...)) and the other
+    modules are known to be as they were: the same keys, in the same order, as diff() gives."""
+    changed = [k for k, v in new.items() if base.get(k, _MISSING) != v]
+    changed += [k for k in base if k[1] in only and k not in new]
     return changed
 
 

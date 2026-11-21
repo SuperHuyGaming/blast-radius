@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import marshal
 import os
 import re
 import sys
@@ -14,66 +15,94 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 class FilePatch:
-    __slots__ = ("old_path", "new_path", "status", "hunks", "groups", "new_text", "binary", "ok")
+    __slots__ = ("old_path", "new_path", "status", "hunks", "groups", "new_text", "binary", "ok", "why")
 
     def __init__(self):
         self.old_path = None
         self.new_path = None
-        self.status = "modify"  # modify | add | delete | rename
+        self.status = "modify"  # modify | add | delete | rename | copy
         self.hunks = []  # (old_start, [lines with prefix])
         self.groups = []  # (old_line, n_removed, new_line, n_added, removed_lines, added_lines)
         self.new_text = None
         self.binary = False
         self.ok = True
+        self.why = None  # what the parser did not understand (then ok is False)
+
+    def fail(self, why):
+        if self.ok:
+            self.ok = False
+            self.why = why
+
+
+# Header lines of a git diff section that the parser understands. Every other line between
+# "diff --git" and the first hunk makes the section unknown: the plan is then "all".
+_MODES = ("100644", "100755")  # regular files; a symlink (120000) or a submodule (160000) is unknown
+
+
+def _strip_prefix(p):
+    """git apply's default -p1: the first path component goes (a/, b/, or any other)."""
+    k = p.find("/")
+    return p[k + 1:] if k > 0 else None
+
+
+def _header_path(p, sec):
+    """The path of a ---/+++ line, or "" for /dev/null, or None when it is not understood."""
+    if "\t" in p:
+        p = p.split("\t", 1)[0]  # git adds a tab after a name with spaces; diff -u a time stamp
+    if p.endswith("\r") or p.startswith('"') or not p:
+        sec.fail("path form %r" % p[:80])
+        return None
+    if p == "/dev/null":
+        return ""
+    q = _strip_prefix(p)
+    if q is None:
+        sec.fail("path without a prefix %r" % p[:80])
+    return q
 
 
 def parse_patch(text: str) -> list[FilePatch]:
+    """The file sections of a unified diff: git sections ("diff --git") and plain ones (only
+    ---/+++ lines, as diff -u writes them). A section with anything this parser does not
+    fully understand gets ok False (see FilePatch.why), and the commit is then planned "all":
+    quoted paths, CR line ends in headers, symlinks or submodules, binary data, hunks whose
+    line counts do not add up, header lines it does not know, or one path in two sections."""
     files: list[FilePatch] = []
     cur = None
+    state = None  # "head": git header lines; "body": after ---/+++; "hunks": after a hunk; "tail": mail signature
+    info = {}  # per section: names from the diff --git line, the ---/+++ lines, rename/copy lines
     lines = text.split("\n")
     i = 0
     n = len(lines)
     while i < n:
-        line = lines[i]
+        # header lines may end with CR (a patch saved with CRLF line ends): git apply reads
+        # them without it; hunk lines keep it (they are consumed below, in the hunk loop)
+        line = lines[i][:-1] if lines[i].endswith("\r") else lines[i]
         if line.startswith("diff --git "):
             cur = FilePatch()
             files.append(cur)
-            m = re.match(r"diff --git a/(.*) b/(.*)$", line)
-            if m:
-                cur.old_path, cur.new_path = m.group(1), m.group(2)
+            info[id(cur)] = {"git": line[len("diff --git "):]}
+            state = "head"
             i += 1
             continue
-        if cur is None:
-            i += 1
+        if line.startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ "):
+            if cur is None or state != "head" or "minus" in info[id(cur)]:
+                # a plain section: no diff --git line before it
+                cur = FilePatch()
+                files.append(cur)
+                info[id(cur)] = {}
+            d = info[id(cur)]
+            d["minus"] = _header_path(line[4:], cur)
+            d["plus"] = _header_path(lines[i + 1][4:].removesuffix("\r"), cur)
+            state = "body"
+            i += 2
             continue
-        if line.startswith("new file mode"):
-            cur.status = "add"
-        elif line.startswith("deleted file mode"):
-            cur.status = "delete"
-        elif line.startswith("rename from "):
-            cur.status = "rename"
-            cur.old_path = line[len("rename from "):]
-        elif line.startswith("rename to "):
-            cur.status = "rename"
-            cur.new_path = line[len("rename to "):]
-        elif line.startswith("GIT binary patch") or line.startswith("Binary files "):
-            cur.binary = True
-        elif line.startswith("--- "):
-            p = line[4:]
-            if p == "/dev/null":
-                cur.status = "add"
-            elif p.startswith("a/"):
-                cur.old_path = p[2:]
-        elif line.startswith("+++ "):
-            p = line[4:]
-            if p == "/dev/null":
-                cur.status = "delete"
-            elif p.startswith("b/"):
-                cur.new_path = p[2:]
-        elif line.startswith("@@"):
+        if cur is None or state == "tail":
+            i += 1  # text before the first section (a commit message) or after the signature
+            continue
+        if line.startswith("@@"):
             m = HUNK_RE.match(line)
-            if not m:
-                cur.ok = False
+            if not m or state not in ("body", "hunks"):
+                cur.fail("hunk header %r" % line[:60])
                 i += 1
                 continue
             old_start = int(m.group(1))
@@ -100,12 +129,104 @@ def parse_patch(text: str) -> list[FilePatch]:
                 else:
                     break
                 i += 1
+            if seen_old != old_count or seen_new != new_count:
+                cur.fail("hunk line counts")
             if i < n and lines[i].startswith("\\"):
                 body.append(lines[i])
                 i += 1
             cur.hunks.append((old_start, old_count, body))
+            state = "hunks"
             continue
+        if state == "head":
+            d = info[id(cur)]
+            if line.startswith("index "):
+                pass
+            elif line.startswith(("old mode ", "new mode ")):
+                d["mode"] = True
+                if line.split()[-1] not in _MODES:
+                    cur.fail("file mode %r" % line)
+            elif line.startswith("new file mode "):
+                cur.status = "add"
+                if line.split()[-1] not in _MODES:
+                    cur.fail("file mode %r" % line)
+            elif line.startswith("deleted file mode "):
+                cur.status = "delete"
+                if line.split()[-1] not in _MODES:
+                    cur.fail("file mode %r" % line)
+            elif line.startswith(("similarity index ", "dissimilarity index ")):
+                pass
+            elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+                kind, side, p = line.split(" ", 2)
+                if p.startswith('"') or p.endswith("\r") or not p:
+                    cur.fail("path form %r" % p[:80])
+                d[side] = p
+                cur.status = kind
+            elif line.startswith("GIT binary patch") or line.startswith("Binary files "):
+                cur.binary = True
+                cur.fail("binary")
+            elif line == "":
+                pass
+            else:
+                cur.fail("header line %r" % line[:60])
+        elif line == "-- ":
+            state = "tail"  # git format-patch: the mail signature after the last section
+        elif line[:1] in ("+", "-", " ") or line.startswith("GIT binary patch") or line.startswith("Binary files "):
+            cur.fail("line outside a hunk %r" % line[:60])
         i += 1
+    seen = {}
+    for fp in files:
+        d = info[id(fp)]
+        minus, plus = d.get("minus"), d.get("plus")
+        if "git" in d:
+            g = d["git"]
+            same = None
+            half = (len(g) - 1) // 2
+            if len(g) % 2 == 1 and g[half] == " ":
+                a, b = _strip_prefix(g[:half]), _strip_prefix(g[half + 1:])
+                if a is not None and a == b:
+                    same = a
+            if g.startswith('"') or g.endswith('"'):
+                fp.fail("quoted path")
+        else:
+            same = None
+            if not fp.hunks:
+                fp.fail("plain section without hunks")
+        if minus == "" and plus == "":
+            fp.fail("both sides /dev/null")
+        if minus == "":
+            if fp.status not in ("modify", "add"):
+                fp.fail("status")
+            fp.status = "add"
+        if plus == "":
+            if fp.status not in ("modify", "delete"):
+                fp.fail("status")
+            fp.status = "delete"
+        if fp.status in ("rename", "copy"):
+            fp.old_path, fp.new_path = d.get("from"), d.get("to")
+            if not fp.old_path or not fp.new_path or fp.old_path == fp.new_path:
+                fp.fail("rename/copy names")
+            if minus and minus != fp.old_path or plus and plus != fp.new_path:
+                fp.fail("rename/copy names differ from ---/+++")
+        else:
+            name = plus or minus or same
+            if not name or (minus and plus and minus != plus) or (same and name != same) or (
+                "git" in d and same is None
+            ):
+                fp.fail("file names")
+            fp.old_path = fp.new_path = name
+        if not fp.hunks and not fp.binary:
+            # a section without hunks changes no content: a mode change, a rename or copy at
+            # 100% similarity, an empty new file, a deletion written without its lines (-D)
+            if "minus" in d or (fp.status == "modify" and not d.get("mode")):
+                fp.fail("section without hunks")
+        # the paths the section writes (a copy only reads its source, from the pinned tree)
+        for p in {fp.new_path} if fp.status in ("copy", "add") else {fp.old_path, fp.new_path}:
+            if p is None:
+                continue
+            if p in seen and seen[p] is not fp:
+                fp.fail("path in two sections")
+                seen[p].fail("path in two sections")
+            seen[p] = fp
     return files
 
 
@@ -210,6 +331,77 @@ def func_code_equal(x: types.CodeType, y: types.CodeType) -> bool:
         elif not _const_equal(a, b):
             return False
     return True
+
+
+def changed_lines(x: types.CodeType, y: types.CodeType):
+    """The line numbers of the instructions that differ between two versions x (pinned) and y
+    (patched) of one function, or None when that cannot be told.
+
+    It can be told when both have the same instructions in the same places except for some
+    operations or arguments (same count, same exception table, same names of arguments and
+    cells), so that the instructions pair up one to one. A run of x that executes none of
+    the returned lines (no LINE event there) executes none of the differing instructions, so
+    it runs the same instructions as y would, in the same order."""
+    import dis
+
+    if (
+        x.co_varnames != y.co_varnames
+        or x.co_freevars != y.co_freevars
+        or x.co_cellvars != y.co_cellvars
+        or x.co_argcount != y.co_argcount
+        or x.co_posonlyargcount != y.co_posonlyargcount
+        or x.co_kwonlyargcount != y.co_kwonlyargcount
+        or x.co_flags != y.co_flags
+        or x.co_exceptiontable != y.co_exceptiontable
+        or x.co_name != y.co_name
+        or x.co_qualname != y.co_qualname
+        or len(x.co_consts) != len(y.co_consts)
+        or len(x.co_code) != len(y.co_code)
+    ):
+        return None
+    ix = list(dis.get_instructions(x))
+    iy = list(dis.get_instructions(y))
+    if len(ix) != len(iy):
+        return None
+    out = set()
+    used = set()
+    for a, b in zip(ix, iy):
+        if a.offset != b.offset:
+            return None
+        if a.opcode in dis.hasconst:
+            used.add(a.arg)
+        same = a.opname == b.opname
+        if same:
+            if isinstance(a.argval, types.CodeType) or isinstance(b.argval, types.CodeType):
+                if not (isinstance(a.argval, types.CodeType) and isinstance(b.argval, types.CodeType)):
+                    same = False
+                else:
+                    inner = changed_lines(a.argval, b.argval)
+                    if inner is None:
+                        return None
+                    out |= inner
+            elif a.opcode in dis.hasconst:
+                same = _const_equal(a.argval, b.argval)
+            elif a.opcode in dis.hasname:
+                # the low bits of these arguments are flags (method call, NULL push)
+                same = _const_equal(a.argval, b.argval) and (a.arg & 3) == (b.arg & 3)
+            elif a.opcode in dis.haslocal or a.opcode in dis.hasfree:
+                same = _const_equal(a.argval, b.argval)
+            elif a.opcode in dis.hasjump:
+                same = a.argval == b.argval
+            else:
+                same = a.arg == b.arg
+        if not same:
+            la, lb = a.positions.lineno, b.positions.lineno
+            if la is None or lb is None:
+                return None
+            out.add(la)
+            out.add(lb)
+    # constants that no instruction loads (a docstring) count as a change of the whole function
+    for i, (a, b) in enumerate(zip(x.co_consts, y.co_consts)):
+        if i not in used and not isinstance(a, types.CodeType) and not _const_equal(a, b):
+            return None
+    return out
 
 
 def deftime_equal(a: types.CodeType, b: types.CodeType, pairs: list) -> bool:
@@ -379,7 +571,16 @@ class _MemLoader:
         return None
 
     def exec_module(self, module):
-        code = compile(self.text, self.path, "exec", dont_inherit=True)
+        # Python compiles a source file from its bytes: the coding declaration of line 1 or 2
+        # (PEP 263) decides how they decode, a byte order mark is dropped, and an unknown or
+        # wrong encoding is a SyntaxError at import. The patch was read as UTF-8 with
+        # surrogateescape, so this gives back the exact bytes of the patched file.
+        code = compile(self.text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
+        # Built the way a code object from a .pyc is (the pinned modules come from pycs): a
+        # frozenset constant that marshal loads iterates in another order than the one that
+        # compile() made, and a table built by iterating it (parsers/clickhouse.py
+        # _AGG_FUNC_MAPPING) would then differ from the pinned table in its order alone.
+        code = marshal.loads(marshal.dumps(code))
         if KEEP_CODE:
             self.code = code
         exec(code, module.__dict__)
@@ -442,9 +643,18 @@ def install_open_overlay(root: str, files: dict):
             if "w" in mode or "a" in mode or "+" in mode or "x" in mode:
                 return real_open(file, mode, *args, **kwargs)
             if "b" in mode:
-                return io.BytesIO(text.encode("utf-8"))
+                return io.BytesIO(text.encode("utf-8", "surrogateescape"))
             newline = kwargs.get("newline")
-            return io.StringIO(text, newline=newline)
+            encoding = kwargs.get("encoding", args[1] if len(args) > 1 else None)
+            if (encoding or "utf-8").lower().replace("_", "-") in ("utf-8", "utf8") and text.isascii():
+                return io.StringIO(text, newline=newline)
+            # other encodings, or bytes that are not plain ASCII: decode the file's bytes the
+            # way open() does (a byte that is not valid UTF-8 raises there too)
+            errors = kwargs.get("errors", args[2] if len(args) > 2 else None)
+            return io.TextIOWrapper(
+                io.BytesIO(text.encode("utf-8", "surrogateescape")),
+                encoding=encoding or "utf-8", errors=errors, newline=newline,
+            )
         return real_open(file, mode, *args, **kwargs)
 
     builtins.open = patched_open
@@ -462,7 +672,7 @@ def install_open_overlay(root: str, files: dict):
             text = table[key]
             if text is None:
                 raise FileNotFoundError(2, "No such file or directory", str(path))
-            return io.BytesIO(text.encode("utf-8"))
+            return io.BytesIO(text.encode("utf-8", "surrogateescape"))
         return real_open_code(path)
 
     io.open_code = patched_open_code
