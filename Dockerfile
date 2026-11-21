@@ -29,9 +29,13 @@ RUN python /tmp/fetch_sqlglot.py /repo b5e23dd1faff7c2a14ef374d02be8bab60c9343d6
 RUN python -m compileall -f -q -j 0 --invalidation-mode unchecked-hash /usr/local/lib/python3.13 /repo \
     && chmod -R a+rX /repo /usr/local/lib/python3.13
 
-# 4. our program and maps (last, so that a code change rebuilds only this)
+# 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
+#    cache (preload.py) is built from the pinned csv files and checked against the real
+#    setUpClass; if the check fails, the cache is removed and the selector runs setUpClass as before.
 COPY app /app
-RUN python -m compileall -f -q --invalidation-mode unchecked-hash /app \
+RUN (python /app/build_exec_cache.py /repo /app/cache --check \
+     || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
+    && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app
 
 WORKDIR /repo

@@ -6,6 +6,7 @@ that fail. Logs go to stderr; only the answers go to stdout.
 """
 from __future__ import annotations
 
+import collections
 import gc
 import json
 import marshal
@@ -22,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import engine  # noqa: E402
+import patchrules  # noqa: E402
 
 ROOT = os.environ.get("BR_ROOT", "/repo")
 DATA = os.environ.get("BR_DATA", "/data")
@@ -34,6 +36,7 @@ MAPS_OBJ = None
 ANSWER_FD = None
 BASE_STATE = None
 BASE_FUNCTION_KEYS = frozenset()
+REGISTRY_CLEAR_AT = None  # first test after tests/test_dialect_entry_points.py (see registry_clear_at)
 NO_DIFF = os.environ.get("BR_NO_DIFF")  # validation: no import-state diff
 CLASS_FILTER = os.environ.get("BR_CLASS_FILTER") == "1"  # off: the instantiation trace does not see every reader
 FRESH_REDUCE = os.environ.get("BR_FRESH_REDUCE", "1") == "1"
@@ -179,7 +182,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users")
 
     def __init__(self, commit):
         self.commit = commit
@@ -206,6 +209,9 @@ class Plan:
         self.plain_lines = set()  # (path, line) of changed code itself: no class filter there
         self.unaffected = set()  # candidates that cannot read the changed value at all
         self.protect = set()  # tests whose verdicts decide about long held tests
+        self.enders = {}  # tests whose failure can end the runs of the commit (see execute)
+        self.fixture_users = set()  # tests that walk a class fixture list of which few entries changed
+        self.gone = set()  # module or class names that the patch removes (no reduced runs then)
 
 
 CODING_RE = re.compile(r"coding[:=]\s*[-\w.]+")
@@ -270,9 +276,20 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             return True
         pairs = []
         if not engine.deftime_equal(a, b, pairs):
-            return True
+            pairs = []
+            if patchrules.tests_read_docs(maps) or not patchrules.equal_but_doc(a, b, pairs):
+                return True
+            plan.note.append("docstring only")
         if all(engine.func_code_equal(x, y) for x, y in pairs):
             continue  # comments or layout only
+        if not class_path and any(line.startswith("def __getattr__(") for line in old_lines[s - 1:e]):
+            # A module __getattr__ answers the lookups of names that the module does not hold
+            # yet (lazy imports), and the result is stored. So the pinned run shows only the
+            # first lookup of each name, but a changed __getattr__ can fail every lookup:
+            # every test that loads the module is a candidate, and no reduced run applies.
+            plan.cands.update(maps.tests(importers))
+            plan.gone.add("__getattr__")
+            plan.note.append("module __getattr__")
         simple = True
         for g in groups:
             o, nr, nl, na, removed, added = g
@@ -379,21 +396,53 @@ def make_plan(commit, text, maps: Maps) -> Plan:
         plan.files[path] = fp.new_text
         is_py = path.endswith(".py")
         in_tree = path.startswith(("sqlglot/", "tests/"))
+        scope = patchrules.pytest_scope(maps, fp, path, old_text)
+        if scope is not None:
+            # pytest itself reads this file (conftest.py, its options); the direct runs do not
+            plan.blind.update(scope)
+            plan.note.append("pytest file %s: %d tests" % (path, len(scope)))
+            continue
+        if fp.status in ("add", "rename") and patchrules.shadows_module(path):
+            plan.blind.update(range(len(maps.meta["test_ids"])))
+            plan.note.append("shadows a module")
         if is_py and in_tree:
-            if fp.status != "modify":
+            refs = None
+            if fp.status == "add":
+                # a new module is loaded only by its name: the tests that can reach that name
+                base = os.path.basename(path)[:-3]
+                word = os.path.basename(os.path.dirname(path)) if base == "__init__" else base
+                refs = patchrules.referencing_tests(maps, word)
+                if refs is not None:
+                    plan.cands.update(refs)
+                    plan.note.append("new module, %d referencing tests" % len(refs))
+                    if refs:
+                        fresh = True
+                        plan.lines["?"] = None
+            if fp.status != "modify" and refs is None:
                 fresh = True
                 plan.lines["?"] = None
                 rec = maps.file(fp.old_path) if fp.old_path else None
                 if rec is not None:
                     plan.cands.update(maps.tests(rec[7]))
                     plan.cands.update(maps.tests(rec[8]))
-            elif plan_python_file(plan, fp, maps, old_text):
+            elif fp.status == "modify" and plan_python_file(plan, fp, maps, old_text):
                 fresh = True
                 plan.lines.pop(fp.old_path, None)
-                hot_lines = any(v for v in plan.lines.values())
                 rec = maps.file(fp.old_path)
                 if rec is not None:
                     add_import_time_candidates(plan, fp, rec, maps)
+                # a name that the patch removes or renames fails every line that uses it
+                gone, extra = patchrules.gone_name_tests(maps, fp, old_text)
+                if gone:
+                    plan.gone.update(gone)
+                    plan.cands.update(extra)
+                    plan.lines["?"] = None
+                    plan.note.append("names gone %s: %d tests" % (sorted(gone)[:3], len(extra)))
+            if os.path.basename(path) == "__init__.py" and path.startswith("tests/"):
+                # pytest imports the package of every test file below it; the coverage maps do
+                # not list the package __init__ files as imported
+                plan.cands.update(patchrules.tests_under(maps, os.path.dirname(path)))
+                plan.lines["?"] = None
         # every test that reads the file as data can change
         for key in {fp.old_path, path}:
             if key:
@@ -405,15 +454,83 @@ def make_plan(commit, text, maps: Maps) -> Plan:
             d = os.path.dirname(path)
             sid = maps.meta["listed"].get(d)
             if sid:
-                plan.cands.update(maps.tests(sid))
-                plan.data_cands.update(maps.tests(sid))
+                # The 'listed' map also holds the listings that the import system makes for
+                # itself. Only tests whose file calls a listing function can see the file set.
+                listers = patchrules.listing_tests(maps)
+                for n in maps.tests(sid):
+                    if listers is None or n in listers:
+                        # os.listdir shows the patch in the child (install_listing_overlay);
+                        # other ways of listing do not: those tests are selected unrun
+                        rel = maps.meta["test_ids"][n].split("::")[0]
+                        scans = listers is not None and patchrules.SCAN_RE.search(patchrules.source(rel))
+                        (plan.blind if scans else plan.cands).add(n)
+                        plan.data_cands.add(n)
         if is_py and not (path.startswith("sqlglot/") and fp.status == "modify"):
             plan.diffable = False
+    add_registry_candidates(plan, fps, maps)
     if fresh:
         plan.mode = "fresh"
-    elif plan.work or plan.cands:
+    elif plan.work or plan.cands - plan.blind:
         plan.mode = "hot"
+    elif plan.blind:
+        plan.mode = "blind"
     return plan
+
+
+def registry_clear_at(test_ids):
+    """The first test after tests/test_dialect_entry_points.py. Its setUp and tearDown clear
+    Dialect._classes, so in the full run every later test finds an empty dialect registry and
+    registers each dialect again through _Dialect._try_load (dialect.py, the dir(module) scan)."""
+    last = None
+    for i, tid in enumerate(test_ids):
+        if tid.startswith("tests/test_dialect_entry_points.py::"):
+            last = i
+    return None if last is None else last + 1
+
+
+REGISTRY_METHODS = ("classes", "_try_load", "__getitem__", "get", "get_or_raise")
+
+
+def add_registry_candidates(plan: Plan, fps, maps: Maps):
+    """An edit of the registry lookup code reaches, through the registry state, every test
+    after the clear that looks a dialect up by name, not only the tests that ran the line."""
+    import ast
+
+    clear_at = registry_clear_at(maps.meta["test_ids"])
+    if clear_at is None:
+        return
+    for fp in fps:
+        if fp.old_path != "sqlglot/dialects/dialect.py" or fp.status != "modify":
+            continue
+        try:
+            with open(os.path.join(ROOT, fp.old_path), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except (OSError, SyntaxError, ValueError):
+            return
+        spans = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name in REGISTRY_METHODS:
+                        start = min([item.lineno] + [d.lineno for d in item.decorator_list])
+                        spans.append((start, item.end_lineno))
+        hit = False
+        for o, nr, nl, na, removed, added in fp.groups:
+            a, b = o, o + max(nr, 1) - 1
+            if any(s <= b and a <= e for s, e in spans):
+                hit = True
+        if not hit:
+            continue
+        rec = maps.file(fp.old_path)
+        if rec is None:
+            return
+        extra = set()
+        for s, e in spans:
+            for ln in range(s, e + 1):
+                if ln < len(rec[3]):
+                    extra.update(n for n in maps.tests(rec[3][ln]) if n >= clear_at)
+        plan.cands.update(extra)
+        plan.note.append("registry: %d tests after the clear" % len(extra))
 
 
 BASE_PATTERN = 0xFFFF
@@ -574,7 +691,16 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             pool_module.InlinePool.broke_any = False
             os.write(wfd, b"P %d\n" % number)
 
+    cleared = [False]
+
     def started(number):
+        if not cleared[0] and REGISTRY_CLEAR_AT is not None and number >= REGISTRY_CLEAR_AT:
+            # the full run reaches this test with an empty dialect registry (see registry_clear_at)
+            cleared[0] = True
+            try:
+                sys.modules["sqlglot.dialects.dialect"].Dialect._classes.clear()
+            except Exception:  # noqa: BLE001  (sqlglot does not import: the tests report that)
+                pass
         os.write(wfd, b"S %d\n" % number)
 
     try:
@@ -602,8 +728,20 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             # a module that cannot be imported any more fails every test that loads it
             import preload
 
-            for name in preload.broken_modules():
+            # the patched test modules too: a test package or helper module that raises fails
+            # every test file that imports it
+            test_mods = [
+                p[:-3].replace("/", ".").removesuffix(".__init__") for p in py_files
+                if p.startswith("tests/") and os.path.basename(p) != "conftest.py"
+            ]
+            # and every test file: one that cannot be imported any more fails all its tests
+            # (pytest imports every test file before the first test runs)
+            test_mods += sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests} - set(test_mods))
+            bad = preload.broken_modules(test_mods)
+            for name in bad:
                 os.write(wfd, b"B %s\n" % name.encode())
+            if preload.exec_fresh_ok(plan.files):
+                runner.ON_IMPORT[preload.EXEC_KEY[0]] = preload.exec_fresh_hook
             if plan_fd is not None:
                 # What did the import leave behind, compared with the pinned tree? The parent
                 # turns the changed names into the tests (and test parts) that read them.
@@ -640,7 +778,16 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     os._exit(0)
                 order = todo["order"]
                 skip_after_fail = todo["skip"]
+                plan.enders = todo["enders"]
                 plan.keeps = todo["keeps"]
+            if bad:
+                # a test that loads a module that cannot be imported fails (the parent selects
+                # it anyway): running it would only repeat the failing import
+                dead = patchrules.importer_tests(MAPS_OBJ, bad)
+                for n in order:
+                    if n in dead:
+                        emit(n, True)
+                order = [n for n in order if n not in dead]
         else:
             for full, pairs in plan.work:
                 swaps = engine.plan_swaps(pairs, index)
@@ -650,6 +797,14 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 for f, code in swaps:
                     f.__code__ = code
         read_old = engine.install_open_overlay(ROOT, plan.files)
+        patchrules.install_listing_overlay(ROOT, plan.files)
+        if plan.mode == "hot":
+            import preload
+
+            # the parent built the shared class fixtures from the pinned files
+            for mod_name, failed in preload.refresh_class_fixtures(ROOT, plan.files):
+                if failed:  # setUpClass raises in the full run: every test of the class fails
+                    os.write(wfd, b"B %s\n" % mod_name.encode())
         import reduce
 
         keeps = None
@@ -666,10 +821,14 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             if changed:
                 reduce.STATE.keep_changed = changed
                 reduce.STATE.changed_only = not plan.work
+                if not plan.work:
+                    import preload
+
+                    preload.reduce_class_fixtures(changed)
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
         t_setup = time.process_time()
-        runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail)
+        runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
         if DEBUG:
             sys.stderr.write("child %s setup %.3f run %.3f\n" % (plan.commit, t_setup - t_child, time.process_time() - t_setup))
         os.write(wfd, b"END\n")
@@ -682,10 +841,11 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         os._exit(0)
 
 
-def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(), on_diff=None):
+def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(), on_diff=None, cap=None):
     """Runs the tests in a forked child. Returns (verdicts, status, hung test or None).
 
-    status: END, REDO, ERR, TIMEOUT, DIED. allowed[n] = seconds that test n may take.
+    status: END, REDO, ERR, TIMEOUT, DIED, OVER. allowed[n] = seconds that test n may take.
+    cap: seconds that all the tests together may take from the start of the first one.
     on_diff: for a commit that changes import-time code. The child first reports which
     import-time values differ from the pinned tree; on_diff(names) then decides what to run."""
     r, w = os.pipe()
@@ -714,68 +874,78 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     t_end = time.monotonic() + time_left
     current = None
     t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN  # time for the child's own setup (imports)
-    while True:
-        now = time.monotonic()
-        if now >= t_end:
-            status = "TIMEOUT"
-            break
-        if now >= t_test:
-            status = "TIMEOUT"
-            hung = current
-            break
-        ready, _, _ = select.select([r], [], [], max(0.01, min(t_end, t_test) - now))
-        if not ready:
-            continue
-        chunk = os.read(r, 65536)
-        if not chunk:
-            break
-        buf += chunk
-        *lines, buf = buf.split(b"\n")
-        for line in lines:
-            if line in (b"END", b"REDO"):
-                status = line.decode()
-            elif line.startswith(b"ERR"):
-                status = "ERR"
-                log(plan.commit, line.decode(errors="replace"))
-            elif line.startswith(b"S "):
-                current = int(line[2:])
-                t_test = time.monotonic() + allowed.get(current, 30.0)
-            elif line.startswith(b"B "):
-                broken.append(line[2:].decode())
-            elif line.startswith(b"P "):
-                plan.pool_died.append(int(line[2:]))
-            elif line.startswith(b"D "):
-                keys = None if line == b"D many" else json.loads(line[2:])
-                todo = on_diff(keys)
-                allowed = todo.pop("allowed")
-                data = marshal.dumps(todo)
-                while data:
-                    data = data[os.write(plan_w, data):]
-                os.close(plan_w)
-                plan_w = None
-                t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
-            else:
-                parts = line.split()
-                if parts[1] == b"2":
-                    plan.skipped.add(int(parts[0]))
+    t_cap = None
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= t_end:
+                status = "TIMEOUT"
+                break
+            if t_cap is not None and now >= t_cap:
+                status = "OVER"  # the runs cost far more than planned: the rest is selected unrun
+                break
+            if now >= t_test:
+                status = "TIMEOUT"
+                hung = current
+                break
+            ready, _, _ = select.select([r], [], [], max(0.01, min(t_end, t_test, t_cap or t_end) - now))
+            if not ready:
+                continue
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                if line in (b"END", b"REDO"):
+                    status = line.decode()
+                elif line.startswith(b"ERR"):
+                    status = "ERR"
+                    log(plan.commit, line.decode(errors="replace"))
+                elif line.startswith(b"S "):
+                    current = int(line[2:])
+                    if t_cap is None and cap is not None:
+                        t_cap = time.monotonic() + cap
+                    t_test = time.monotonic() + allowed.get(current, 30.0)
+                elif line.startswith(b"B "):
+                    broken.append(line[2:].decode())
+                elif line.startswith(b"P "):
+                    plan.pool_died.append(int(line[2:]))
+                elif line.startswith(b"D "):
+                    keys = None if line == b"D many" else json.loads(line[2:])
+                    todo = on_diff(keys)
+                    allowed = todo.pop("allowed")
+                    cap = todo.pop("cap")
+                    data = marshal.dumps(todo)
+                    while data:
+                        data = data[os.write(plan_w, data):]
+                    os.close(plan_w)
+                    plan_w = None
+                    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
                 else:
-                    verdicts[int(parts[0])] = parts[1] == b"1"
-                if len(parts) > 2:
-                    plan.times[int(parts[0])] = int(parts[2]) / 1e6
-                current = None
-                t_test = time.monotonic() + 30.0
-    os.close(r)
-    if plan_w is not None:
-        os.close(plan_w)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    _, wstatus = os.waitpid(pid, 0)
+                    parts = line.split()
+                    if parts[1] == b"2":
+                        plan.skipped.add(int(parts[0]))
+                    else:
+                        verdicts[int(parts[0])] = parts[1] == b"1"
+                    if len(parts) > 2:
+                        plan.times[int(parts[0])] = int(parts[2]) / 1e6
+                    current = None
+                    t_test = time.monotonic() + 30.0
+    finally:
+        # also when this process fails while it talks to the child: the child must not run on
+        os.close(r)
+        if plan_w is not None:
+            os.close(plan_w)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        _, wstatus = os.waitpid(pid, 0)
     if status == "DIED":
         log(plan.commit, "child died, wait status", wstatus, "after", len(verdicts), "tests")
         if current is not None:
@@ -795,7 +965,7 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         plan.lines = {"?": None}
         return
     names = set()
-    whole = False
+    whole = bool(plan.gone)  # a removed name can fail any line that mentions it
     owners = set()
     for key, is_function in keys:
         owners.add("%s.%s" % (key[1], key[2]) if key[0] == "A" else None)
@@ -867,6 +1037,10 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
 def estimate_cost(n, plan: Plan, maps: Maps, seconds):
     """Expected CPU seconds of running test n for this commit (whole or reduced)."""
     whole = maps.cost[n] if maps.cost else seconds[n] * 1.5
+    if n in plan.fixture_users:
+        # the test walks a list of fixture entries, and the run keeps only the changed
+        # entries (preload.reduce_class_fixtures): a typo changes one entry, or a few
+        return min(whole, 0.05 + 0.05 * whole)
     keep = plan.keeps.get(n)
     if keep is None:
         return whole
@@ -959,6 +1133,10 @@ def main():
     except OSError:
         pass
     log("done in", round(time.monotonic() - t_start, 2), "s wall; cpu", round(sum(os.times()[:4]), 2), cg)
+    # the answers are written (os.write): skip the interpreter teardown (module cleanup, duckdb
+    # and nanobind finalizers), which only costs CPU
+    sys.stderr.flush()
+    os._exit(0)
 
 
 def run(t_start, deadline, state):
@@ -968,8 +1146,9 @@ def run(t_start, deadline, state):
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     state["tests"] = tests
     state["commits"] = commits
-    global MAPS_OBJ
+    global MAPS_OBJ, REGISTRY_CLEAR_AT
     maps = MAPS_OBJ = Maps(MAPS)
+    REGISTRY_CLEAR_AT = registry_clear_at([t["id"] for t in tests])
     all_tests = list(range(len(tests)))
 
     plans = {}
@@ -996,6 +1175,9 @@ def run(t_start, deadline, state):
     preload.install_environment(ROOT)
     answers = state["answers"]
     debug_rows = {}
+    tests_of_file = {}
+    for t in tests:
+        tests_of_file.setdefault(t["file"], []).append(t["number"])
 
     fixture_readers = {}
 
@@ -1013,6 +1195,7 @@ def run(t_start, deadline, state):
         failing = {n for n, bad in verdicts.items() if bad}
         selected = set(failing)
         selected.update(blind)
+        selected.update(plan.blind)
         unknown = [n for n in ran if n not in verdicts and n not in set(blind)]
         if unknown:
             selected.update(unknown)  # the child ended early: nothing is known about these
@@ -1057,12 +1240,9 @@ def run(t_start, deadline, state):
             for t in maps.tests(maps.meta.get("pool_users", 0)):
                 if t > n and tests[t]["id"].rsplit("::", 1)[0] == cls_id:
                     selected.add(t)
-        for name in plan.broken:
-            rel = name.replace(".", "/")
-            for cand in (rel + ".py", rel + "/__init__.py"):
-                sid = maps.meta["importers"].get(cand)
-                if sid:
-                    selected.update(maps.tests(sid))
+        selected.update(patchrules.importer_tests(maps, plan.broken))
+        for name in plan.broken:  # a test file that cannot be imported: all its tests fail
+            selected.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
         answers[c] = pack(sorted(selected), seconds)
         if DEBUG:
             debug_rows[c] = {
@@ -1076,7 +1256,7 @@ def run(t_start, deadline, state):
 
     def choose(plan):
         """Splits the candidates into tests to run and tests that are held (not run)."""
-        cands = sorted(plan.cands)
+        cands = sorted(plan.cands - plan.blind)
         cost = {n: estimate_cost(n, plan, maps, seconds) for n in cands}
         if RUN_ALL:
             return [n for n in cands if cost[n] <= 60 or RUN_SLOW], [], cost
@@ -1114,8 +1294,49 @@ def run(t_start, deadline, state):
             ran = [n for n in ran if n in keep_set]
         return ran, held, cost
 
+    shared_info = []
+    attr_reads = {}
+
+    def class_fixture_rule(plan):
+        """A commit that changes only data files, one of them a .sql fixture whose entries a
+        shared class fixture holds in a list (TestExecutor: the TPC-H and TPC-DS queries).
+        setUpClass reads the file for every test of the class, but only the tests that read
+        that list can see the change: the others leave the candidates, and the readers run
+        with the changed entries only."""
+        changed = {rel for rel, text in plan.files.items() if rel.startswith("tests/fixtures/") and text is not None}
+        if not changed or len(changed) != sum(1 for rel in plan.files if rel.startswith("tests/fixtures/")):
+            return
+        if not shared_info:
+            shared_info.extend(preload.shared_class_info(ROOT) or [None])
+            try:
+                # which of those lists each test of the class reads (build_attr_reads.py)
+                with open(os.path.join(MAPS, "class_attr_reads.json")) as f:
+                    attr_reads.update(json.load(f))
+            except (OSError, ValueError):
+                pass
+        for info in shared_info:
+            if info is None:
+                continue
+            prefix, cls, by_file, other = info
+            hit = changed & set(by_file)
+            if not hit or changed & other:
+                continue
+            for n in sorted(plan.cands):
+                test_id = tests[n]["id"]
+                if not test_id.startswith(prefix):
+                    continue
+                read = attr_reads.get(test_id)
+                if read is None:
+                    continue  # not in the map: nothing is known about this test
+                if any(by_file[f] in read for f in hit):
+                    plan.fixture_users.add(n)
+                elif not (fixtures_of(n) & changed) - hit:
+                    plan.cands.discard(n)
+
     def execute(c, plan, index):
         box = {}
+        if plan.mode == "hot" and not plan.work and not RUN_ALL:
+            class_fixture_rule(plan)
 
         def prepare():
             ran, held, cost = choose(plan)
@@ -1127,10 +1348,39 @@ def run(t_start, deadline, state):
             skip = set() if RUN_ALL else {
                 n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
             }
-            return ran, allowed, skip
+            # A failing test of the class (or fixture) of a long held test selects that long
+            # test (see finish). When failures have selected every long held test, and the
+            # longest of them is longer than all tests that run together, the tests that are
+            # still to run fit beside it on one more worker, which costs 2 s at most. So when
+            # the runs that are left cost more CPU than that, they end there and the tests
+            # are selected as they are. The answer then holds every candidate without a pass.
+            plan.enders = {}
+            long_held = [t for t in held if seconds[t] > QUIET_HOLD_SECONDS]
+            if long_held and not RUN_ALL and max(seconds[t] for t in long_held) >= sum(seconds[n] for n in ran):
+                plan.enders["held"] = set(long_held)
+                left_cost = sum(cost[n] for n in ran)
+                for n in ran:
+                    left_cost -= cost[n]
+                    n_class, n_fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
+                    decides = {
+                        t for t in long_held
+                        if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & fixtures_of(t)
+                    }
+                    if decides:
+                        plan.enders[n] = (decides, left_cost > WORKER_COST)
+            # A guard against runs that cost many times their estimate (a patch that makes every
+            # test slow without hanging): past the cap, the tests without a verdict are selected.
+            # The longest per-test limit is added, so that one hung test still counts as a failure.
+            cap = None
+            if ran and not RUN_ALL:
+                cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
+            return ran, allowed, skip, cap
 
         left = deadline - time.monotonic()
         if left < 3.0:
+            if plan.mode != "hot" and any(p.endswith(".py") for p in plan.files):
+                # an import-time change that never ran: a broken import can fail any test
+                plan.all_fail = True
             ran, held, _ = choose(plan)
             finish(c, plan, {}, "DEADLINE", ran, held)
             return
@@ -1138,8 +1388,8 @@ def run(t_start, deadline, state):
         if use_diff:
             def on_diff(keys):
                 refine_with_diff(plan, keys, maps, tests)
-                ran, allowed, skip = prepare()
-                return {"order": ran, "keeps": plan.keeps, "skip": skip, "allowed": allowed}
+                ran, allowed, skip, cap = prepare()
+                return {"order": ran, "keeps": plan.keeps, "skip": skip, "allowed": allowed, "cap": cap, "enders": plan.enders}
 
             verdicts, status, hung = run_child(plan, None, tests, index, {}, left - 2.0, (), on_diff)
             if "ran" not in box:
@@ -1154,11 +1404,19 @@ def run(t_start, deadline, state):
                 return
 
         else:
-            ran, allowed, skip = prepare()
+            ran, allowed, skip, cap = prepare()
             if not ran:
+                if plan.mode != "hot" and any(p.endswith(".py") for p in plan.files):
+                    # No test to run, but the patched tree can still fail to import (a broken
+                    # import line, a name that is gone): the child reports the modules that
+                    # raise, and finish() selects the tests that load them.
+                    _, status, _ = run_child(plan, [], tests, index, {}, left - 2.0)
+                    if status in ("TIMEOUT", "DIED"):
+                        plan.broken.extend(p[:-3].replace("/", ".") for p in plan.files if p.endswith(".py"))
+                        plan.note.append("import does not end")
                 finish(c, plan, {}, "END", ran, box["held"])
                 return
-            verdicts, status, hung = run_child(plan, ran, tests, index, allowed, left - 2.0, skip)
+            verdicts, status, hung = run_child(plan, ran, tests, index, allowed, left - 2.0, skip, None, cap)
             if status == "REDO":
                 return "REDO"
             if status in ("TIMEOUT", "DIED") and hung is None and not verdicts and plan.mode != "hot":
@@ -1167,6 +1425,8 @@ def run(t_start, deadline, state):
                         plan.broken.append(p[:-3].replace("/", "."))
                 plan.note.append("import does not end")
         ran, held = box["ran"], box["held"]
+        if status == "OVER":
+            plan.note.append("over the time cap")
         # a test that does not end is a timeout in the full run; the tests after it run again
         for attempt in range(2):
             if hung is None:
@@ -1194,6 +1454,10 @@ def run(t_start, deadline, state):
         plan = plans[c]
         if plan.mode == "all":
             answers[c] = pack(all_tests, seconds)
+        elif plan.mode == "blind":
+            answers[c] = pack(sorted(plan.blind), seconds)
+            if DEBUG:
+                debug_rows[c] = {"mode": "blind", "cands": sorted(plan.blind), "verdicts": {}, "note": plan.note}
         elif plan.mode == "noop":
             answers[c] = []
             if DEBUG:
@@ -1217,6 +1481,26 @@ def run(t_start, deadline, state):
         import duckdb  # noqa: F401
         import pandas  # noqa: F401
         import numpy  # noqa: F401
+
+    def exec_prebuild(hot_commits):
+        """TestExecutor attributes that more than one child may read are built once here
+        (see preload.py); the rest is built by the child that reads it, if any."""
+        cls = getattr(sys.modules.get(preload.EXEC_KEY[0]), preload.EXEC_KEY[1], None)
+        users = preload.exec_attribute_users(cls) if cls is not None else {}
+        need = collections.Counter()
+        for c in hot_commits:
+            plan = plans[c]
+            names = set()
+            for n in plan.cands:
+                path, cls_name, meth = tests[n]["id"].split("::")
+                attrs = users.get(meth) if (path[:-3].replace("/", "."), cls_name) == preload.EXEC_KEY else None
+                if attrs and (RUN_ALL or estimate_cost(n, plan, maps, seconds) <= max(
+                        HOLD_SECONDS, HOLD_FACTOR * (WORKER_COST + seconds[n]))):
+                    names.update(attrs)
+            need.update(names)
+        out = ["tpch_sqls", "tpcds_sqls"]
+        out += [a for a in preload.EXEC_LAZY if a not in out and need[a] >= 2]
+        return out
 
     # 2. One parent process serves every commit. It imports sqlglot and the needed test
     #    modules once. Commits that only change function bodies run first (cheap: the child
@@ -1246,14 +1530,27 @@ def run(t_start, deadline, state):
                 for n in plans[c].cands:
                     path, cls_name, _ = tests[n]["id"].split("::")
                     wanted.add((path[:-3].replace("/", "."), cls_name))
-        shared = preload.build_class_fixtures(wanted)
+        shared = preload.build_class_fixtures(wanted, exec_lazy=True, exec_prebuild=exec_prebuild(hot))
         log("shared fixtures", shared)
         index = engine.FunctionIndex(ROOT)
         gc.collect()
         gc.freeze()
     purge = bool(hot) or want_diff
+    def execute_safe(c, plan, index):
+        """A failure on the parent side ends only this commit, with a safe answer: its
+        candidates, or every test when an import-time change was not seen to its end."""
+        try:
+            return execute(c, plan, index)
+        except Exception as e:  # noqa: BLE001
+            log(c, "execute failed", repr(e))
+            if plan.mode == "hot":
+                safe = plan.cands | plan.blind | patchrules.importer_tests(maps, plan.broken)
+            else:
+                safe = all_tests
+            answers[c] = pack(sorted(safe), seconds)
+
     for c in hot:
-        if execute(c, plans[c], index) == "REDO":
+        if execute_safe(c, plans[c], index) == "REDO":
             fresh.append(c)
             plan = plans[c]
             plan.note.append("redo")
@@ -1267,7 +1564,7 @@ def run(t_start, deadline, state):
     for c in fresh:
         plan = plans[c]
         plan.mode = "fresh_purge" if purge else "fresh"
-        execute(c, plan, None)
+        execute_safe(c, plan, None)
 
     if DEBUG:
         with open(DEBUG, "w") as f:

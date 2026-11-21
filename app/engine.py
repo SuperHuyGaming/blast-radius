@@ -440,6 +440,23 @@ def install_open_overlay(root: str, files: dict):
     builtins.open = patched_open
     io.open = patched_open
 
+    # runpy reads through io.open_code (test_sqlglotc runs sqlglotc/setup.py with runpy.run_path)
+    real_open_code = io.open_code
+
+    def patched_open_code(path):
+        try:
+            key = os.path.abspath(os.fspath(path))
+        except TypeError:
+            key = None
+        if active[0] and key is not None and key in table:
+            text = table[key]
+            if text is None:
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return io.BytesIO(text.encode("utf-8"))
+        return real_open_code(path)
+
+    io.open_code = patched_open_code
+
     @contextlib.contextmanager
     def read_old():
         active[0] = False
