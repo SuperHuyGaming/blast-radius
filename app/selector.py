@@ -42,6 +42,7 @@ QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
+SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
 WALL_LIMIT = float(os.environ.get("BR_WALL", "150"))  # the batch must end well inside 3 minutes
 
@@ -591,7 +592,7 @@ def run_child(plan, order, tests, index, stop_after_fail, allowed, time_left):
     buf = b""
     t_end = time.monotonic() + time_left
     current = None
-    t_test = time.monotonic() + 30.0  # time for the child's own setup
+    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN  # time for the child's own setup (imports)
     while True:
         now = time.monotonic()
         if now >= t_end:
@@ -885,6 +886,14 @@ def run(t_start, deadline, state):
             if status == "REDO":
                 return "REDO"
             verdicts.update(v)
+            if status in ("TIMEOUT", "DIED") and hung is None and not v and plan.mode != "hot":
+                # the import of the patched tree hangs or kills the process: every test that
+                # loads a patched module fails in a full run
+                for p in plan.files:
+                    if p.endswith(".py"):
+                        plan.broken.append(p[:-3].replace("/", "."))
+                plan.note.append("import does not end")
+                break
             if hung is not None:
                 verdicts[hung] = True  # a test that does not end is a timeout in the full run
             todo = [n for n in todo if n not in verdicts]
