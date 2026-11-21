@@ -14,6 +14,8 @@ RUN python -c "import io,tarfile,urllib.request;d=urllib.request.urlopen('https:
 
 COPY br /app/br
 COPY maps /app/maps
+COPY legacy /app/legacy
+RUN for d in /app/legacy/*/; do BLAST_APP=$d BLAST_SRC=/opt/sqlglot python $d/selector.py --import-baseline > $d/import_baseline.json; done
 RUN python -m compileall -q -j 4 /opt/sqlglot /app/br /usr/local/lib/python3.13 > /dev/null 2>&1; \
     (cd /app && SKIP_INTEGRATION=0 python -m br.buildstate /app/state.marshal /opt/sqlglot /app/maps 2>/dev/null \
      || echo "state snapshot failed: clean mode disabled"); \

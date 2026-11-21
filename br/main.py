@@ -40,6 +40,14 @@ def main() -> int:
 
     from . import pack, validate
 
+    legacy_procs = []
+    try:
+        from . import legacy
+
+        legacy_procs = legacy.start(data, root, log)
+    except Exception as exc:
+        log("legacy selectors unavailable:", repr(exc))
+
     answers: dict[str, list[int]] = {cid: every for cid in commits}
     statics: dict = {}
     maps = None
@@ -142,6 +150,17 @@ def main() -> int:
             )
         except Exception as exc:  # keep the static answers
             log("verification stage failed, keeping static answers:", repr(exc))
+
+    if legacy_procs:
+        try:
+            from . import legacy
+
+            for other in legacy.collect(legacy_procs, commits, started + 172.0, log):
+                for cid in commits:
+                    if cid in other:
+                        answers[cid] = sorted(set(answers[cid]) & other[cid])
+        except Exception as exc:  # keep this selector's answers
+            log("legacy intersection failed:", repr(exc))
 
     lines = []
     seen: set = set()
