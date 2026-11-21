@@ -186,7 +186,7 @@ def _sqlglot_defined(t, *names):
 def _blast_cmp(key, a, b, op):
     cmp_seen.add("isq|" + key)
     same = a is b
-    if same:
+    if same and not (isinstance(a, float) and a != a):  # NaN is the one object != itself
         agree, eq = True, None
     elif _sqlglot_defined(type(a), "__eq__") or _sqlglot_defined(type(b), "__eq__"):
         agree, eq = False, None  # not evaluated: counted as "may differ"
