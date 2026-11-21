@@ -258,7 +258,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added")
 
     def __init__(self, commit):
         self.commit = commit
@@ -276,7 +276,6 @@ class Plan:
         self.pool_died = []  # tests during which a class-level process pool died
         self.fpairs = []  # (old code, new code) of changed function bodies that also run at import
         self.stmt_lines = {}  # path -> lines of changed function statements (import-time commits)
-        self.infect_fresh = None  # tests with a changed evaluation, for a function that also runs at import
         self.diff = None  # names whose import-time value the patch changes (import-state diff)
         self.def_units = {}  # path -> lines of functions whose header (defaults, decorators) changed
         self.data_cands = set()  # tests that read a changed file as data
@@ -505,33 +504,24 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             o, nr, nl, na, removed, added = g
             if nr != na or any(_indent(x) != _indent(y) for x, y in zip(removed, added)):
                 simple = False
-            elif any(x.lstrip().startswith(("nonlocal ", "global ")) for x in removed + added):
-                # a scope declaration has no line of its own in the coverage map, and it
-                # changes what every use of the name in the function means
-                simple = False
         if simple and any(_kind_changed(x, y) for x, y in pairs):
             # generator <-> plain function: every call behaves differently, not only the
             # runs that reach the changed line, so the tests that run the unit are candidates
             simple = False
             plan.note.append("code kind changed")
         if simple:
-            hit_lines = [ln for g in groups for ln in range(g[0], g[0] + g[1])]
             for g in groups:
-                for i in range(g[1]):
-                    # an edit beside a lambda on its line: the lines of the statement around it
-                    around = patchrules.statement_around_lambda(old_lines, s, e, g[0] + i, g[4][i], g[5][i])
-                    if around:
-                        hit_lines.extend(l2 for l2 in range(around[0], around[1] + 1) if l2 not in hit_lines)
-            for ln in hit_lines:
-                if stmt_pex[ln]:
-                    # the function also runs at import: its body change is known here
-                    plan.fpairs.extend(pairs)
-                    sl = plan.stmt_lines.setdefault(rel, set())
-                    for l2 in hit_lines:
-                        sl.update(range(span_a[l2], span_b[l2] + 1) if span_a[l2] else (l2,))
-                    return True
-                plan.cands.update(maps.tests(stmt_set[ln]))
-                touched.update(range(span_a[ln], span_b[ln] + 1) if span_a[ln] else (ln,))
+                for ln in range(g[0], g[0] + g[1]):
+                    if stmt_pex[ln]:
+                        # the function also runs at import: its body change is known here
+                        plan.fpairs.extend(pairs)
+                        sl = plan.stmt_lines.setdefault(rel, set())
+                        for g2 in groups:
+                            for l2 in range(g2[0], g2[0] + g2[1]):
+                                sl.update(range(span_a[l2], span_b[l2] + 1) if span_a[l2] else (l2,))
+                        return True
+                    plan.cands.update(maps.tests(stmt_set[ln]))
+                    touched.update(range(span_a[ln], span_b[ln] + 1) if span_a[ln] else (ln,))
         else:
             if unit_pex[ui]:
                 return True
@@ -639,8 +629,6 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
 
 
 INFECT = os.environ.get("BR_NO_INFECT") != "1"  # operand outcome map, see infect.py
-INFECT2 = os.environ.get("BR_NO_INFECT2") != "1"  # its phase 2 (and/or trees, literal operands)
-INFECT_FRESH = os.environ.get("BR_NO_INFECT_FRESH") != "1"  # the same for functions that also run at import
 
 
 def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: list):
@@ -655,14 +643,10 @@ def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: lis
     if rec is not None:
         import infect
 
-        old_lines, new_lines = old_text.split("\n"), fp.new_text.split("\n")
         res = infect.infected_tests(
-            fp.old_path, old_lines, new_lines, fp.groups, rec[0], os.path.join(maps.path, "infect.bin"),
+            fp.old_path, old_text.split("\n"), fp.new_text.split("\n"), fp.groups, rec[0],
+            os.path.join(maps.path, "infect.bin"),
         )
-        if res is None and INFECT2:
-            res = infect.infected_tests2(
-                fp.old_path, old_lines, new_lines, fp.groups, rec[0], os.path.join(maps.path, "infect2.bin"),
-            )
     if res is None or res.global_phase:
         return plan_python_file(plan, fp, maps, old_text)
     used.append(fp.old_path)
@@ -675,12 +659,6 @@ def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: lis
         added = plan.cands - before
         plan.cands = before | (added & res.tests)
         plan.note.append("infect: %d of %d candidates" % (len(added & res.tests), len(added)))
-    elif plan.cands == before and plan.fpairs:
-        # The function also runs at import, so the child imports the patched tree. No
-        # evaluation at import time changes its result (global_phase is false). When the
-        # child then finds the import state equal to the pinned one, only the tests with a
-        # changed evaluation can differ, as above (see refine_with_diff).
-        plan.infect_fresh = set(res.tests)
     return fresh
 
 
@@ -1534,6 +1512,22 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         os._exit(0)
 
 
+# Diagnostic build: where does the CPU go on the scoring machine? The numbers below leave the
+# container through the answer of one commit that selects nothing (see probe_answer in main).
+PROBE = {"start": None, "fresh": 0.0, "flags": 0}
+
+
+def probe_tests(code_ms, seconds):
+    """Tests whose recorded seconds add up to exactly code_ms milliseconds (largest first)."""
+    left = code_ms
+    picked = []
+    for ms, n in sorted(((round(s * 1000), n) for n, s in enumerate(seconds)), reverse=True):
+        if 0 < ms <= left:
+            picked.append(n)
+            left -= ms
+    return picked if left == 0 else None
+
+
 def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(), on_diff=None, cap=None):
     """Runs the tests in a forked child. Returns (verdicts, status, hung test or None).
 
@@ -1545,6 +1539,8 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     plan_r = plan_w = None
     if on_diff is not None:
         plan_r, plan_w = os.pipe()
+    if PROBE["start"] is None:
+        PROBE["start"] = sum(os.times()[:2])  # CPU of this process before its first child
     pid = os.fork()
     if pid == 0:
         os.close(r)
@@ -1651,7 +1647,9 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _, wstatus = os.waitpid(pid, 0)
+        _, wstatus, usage = os.wait4(pid, 0)
+        if plan.mode != "hot":
+            PROBE["fresh"] += usage.ru_utime + usage.ru_stime  # children that import the tree again
     if added_open is not None:
         plan.global_leak = added_open if plan.global_leak is None else min(plan.global_leak, added_open)
         plan.note.append("added test did not end")
@@ -1830,12 +1828,6 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         plan.class_filter = wanted
     plan.lines = full
     plan.note.append("import state: %d names" % len(names))
-    if plan.infect_fresh is not None and not keys and not plan.gone and not plan.added and INFECT_FRESH:
-        # the import left nothing different, and the edit is one mapped comparison: the
-        # candidates shrink to the tests that saw an evaluation whose result changes
-        before = len(plan.cands)
-        plan.cands &= plan.infect_fresh | plan.data_cands
-        plan.note.append("infect after import: %d -> %d" % (before, len(plan.cands)))
     plan.keeps = compute_keeps(plan, maps, tests)
     if plan.unaffected:
         plan.cands -= plan.unaffected
@@ -1927,6 +1919,30 @@ def main():
     extra = state.get("extra") or []
     everything = None
     out = []
+    # the diagnostic numbers: one commit with an empty answer gets one worker whose recorded
+    # seconds are 2 + SS.FTT: SS = CPU of the re-import children in 0.1 s, F = 1 + (1: executor
+    # row cache present, 2: saved base state loaded, 4: huge pages allowed), TT = CPU before
+    # the first child in 0.05 s
+    try:
+        import preload
+
+        if os.path.exists(os.path.join(preload.EXEC_CACHE, "exec_tpcds.marshal")):
+            PROBE["flags"] |= 1
+        try:
+            with open("/sys/kernel/mm/transparent_hugepage/enabled") as f:
+                if "[never]" not in f.read():
+                    PROBE["flags"] |= 4
+        except OSError:
+            pass
+        code = (min(99, round(PROBE["fresh"] / 0.1)) * 1000 + (PROBE["flags"] + 1) * 100
+                + min(99, round((PROBE["start"] or 0.0) / 0.05)))
+        target = next((c for c in commits if state["answers"].get(c) == []), None)
+        picked = probe_tests(code, seconds)
+        log("probe", PROBE, "code", code, "commit", target, "tests", None if picked is None else len(picked))
+        if target is not None and picked:
+            state["answers"][target] = [picked]
+    except Exception as e:  # noqa: BLE001
+        log("probe failed", repr(e))
     for c in commits:
         workers = state["answers"].get(c)
         if workers is None:
@@ -2473,6 +2489,7 @@ def run(t_start, deadline, state):
         # taken before any test module is loaded, because tests change module state.
         saved = load_base_state()
         if saved is not None:
+            PROBE["flags"] |= 2
             BASE_STATE, BASE_FUNCTION_KEYS, BASE_OBJECTS = saved
         else:
             import statefp
