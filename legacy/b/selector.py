@@ -120,6 +120,21 @@ class Map:
             except Exception as e:  # noqa: BLE001
                 log(f"error scanning generator.py spans: {e!r}")
 
+        self.dialect_generator_span = (1378, 1381)
+        dia_file = SRC / "sqlglot/dialects/dialect.py"
+        if dia_file.is_file():
+            try:
+                gen_s = gen_e = None
+                for i, line in enumerate(dia_file.read_text(encoding="utf-8").splitlines(), 1):
+                    if line.startswith("    def generator("):
+                        gen_s = i
+                    elif gen_s and gen_e is None and line.startswith("    def "):
+                        gen_e = i - 1
+                if gen_s and gen_e:
+                    self.dialect_generator_span = (gen_s, gen_e)
+            except Exception as e:  # noqa: BLE001
+                log(f"error scanning dialect.py spans: {e!r}")
+
     def set_of(self, sid):
         return ALL if sid == -1 else set(self.sets[sid])
 
@@ -965,6 +980,12 @@ def select(m: Map, patch_text: str):
                     hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
                     if any("def generator" in l or "generator_class" in l or "Generator" in l for l in hunk_lines):
                         return True
+                    for old_start, _, lns in f.get("hunks", []):
+                        old_len = sum(1 for tag, _ in lns if tag in (" ", "-"))
+                        old_end = old_start + max(old_len - 1, 0)
+                        gen_span = getattr(m, "dialect_generator_span", (1375, 1385))
+                        if not (old_end < gen_span[0] or old_start > gen_span[1]):
+                            return True
                 elif path.startswith("sqlglot/dialects/"):
                     hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
                     if any("Generator" in l or "generator =" in l or "def __init__" in l or "__slots__" in l for l in hunk_lines):
