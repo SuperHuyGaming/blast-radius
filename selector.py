@@ -714,6 +714,43 @@ def probe_swaps(path, old_tree, new_text):
     return keys
 
 
+class _StripAnnotations(ast.NodeTransformer):
+    def _blank(self, node, field):
+        if getattr(node, field, None) is not None:
+            setattr(node, field, ast.Constant(None))
+
+    def visit_arg(self, node):
+        self._blank(node, "annotation")
+        return node
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        self._blank(node, "returns")
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        node.annotation = ast.Constant(None)
+        return node
+
+
+def annotation_only(old_text, new_text):
+    """True if, in a module using `from __future__ import annotations` (annotations are
+    stored as strings, never evaluated), the change only touches type annotations."""
+    try:
+        old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+    def future(tree):
+        return any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and
+                   any(a.name == "annotations" for a in n.names) for n in tree.body)
+    if not (future(old_tree) and future(new_tree)):
+        return False
+    return ast.dump(_StripAnnotations().visit(old_tree)) == ast.dump(_StripAnnotations().visit(new_tree))
+
+
 def select_file(m: Map, f) -> set | None:
     old_path, new_path = f["old"], f["new"]
     path = new_path or old_path
@@ -753,6 +790,8 @@ def select_file(m: Map, f) -> set | None:
     try:
         if code_tokens(old_text) == code_tokens(new_text):
             return set()
+        if path.startswith("sqlglot/") and annotation_only(old_text, new_text):
+            return set()  # sqlglot reads no annotations at run time (only parameter names)
     except (tokenize.TokenError, IndentationError, SyntaxError):
         return ALL
     pf = PyFile(m, path, old_text, new_text)
