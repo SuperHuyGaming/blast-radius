@@ -83,8 +83,5 @@ RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app
 
-# Measurement build: see probe_encode in app/selector.py (one commit that needs no test carries a number).
-ENV BR_PROBE=1
-
 WORKDIR /repo
 CMD ["python", "/app/main.py"]
