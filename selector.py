@@ -422,6 +422,7 @@ class PyFile:
         self.new_lines = new_text.split("\n")
         self.own_tests = m.by_file.get(path, set())
         self.added_new: set[int] = set()
+        self.new_funcs = None
 
     def narrow(self, stmt, users):
         """For a plain class attribute (not a def or class), keep only the class's users
@@ -524,7 +525,7 @@ class PyFile:
                 # as a string anywhere (getattr / registries), nothing can call it; in a
                 # class body it could be reached by dynamic dispatch (handled by class
                 # users before we get here), so stay safe.
-                at_module = not class_path(self.new_tree, stmt.lineno)
+                at_module = stmt in self.new_tree.body
                 unused = all(n not in m.str_names and n not in m.refs and n not in m.derive for n in names)
                 if at_module and unused and self.path.startswith("sqlglot/"):
                     return set()
@@ -563,12 +564,14 @@ class PyFile:
             return set()
         # Inside a function that is entirely new: its body only runs if the function is
         # called, which the rule for its `def` line decides.
-        for n in ast.walk(self.new_tree):
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body and                     n.body[0].lineno <= new_ln <= n.end_lineno:
-                lo = min([n.lineno] + [d.lineno for d in n.decorator_list])
-                if all(l in self.added_new or is_blank_or_comment(self.new_lines[l - 1])
-                       for l in range(lo, n.end_lineno + 1)):
-                    return set()
+        if self.new_funcs is None:
+            self.new_funcs = [(min([n.lineno] + [d.lineno for d in n.decorator_list]), n.body[0].lineno, n.end_lineno)
+                              for n in ast.walk(self.new_tree)
+                              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
+        for lo, body_lo, hi in self.new_funcs:
+            if body_lo <= new_ln <= hi and all(
+                    l in self.added_new or is_blank_or_comment(self.new_lines[l - 1]) for l in range(lo, hi + 1)):
+                return set()
         r = locate(self.new_tree, new_ln)
         if r is None:
             return set()
