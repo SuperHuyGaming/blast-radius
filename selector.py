@@ -682,6 +682,10 @@ def select_file(m: Map, f) -> set | None:
         return ALL
     if old_path is None or new_path is None:
         return ALL  # new or deleted module
+    if path.startswith("sqlglot/") and not m.lines.get(path) and path not in m.opens:
+        # The pinned run never executed a line of this module (e.g. the CLI in
+        # __main__.py): no test imports it, so no test can see the change.
+        return set()
     src = SRC / path
     if not src.is_file():
         return ALL
