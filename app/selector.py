@@ -490,7 +490,10 @@ def type_checking_groups(fp, old_text):
 
     # the old text decides first (from the map): the new text is parsed only for the hunks
     # whose removed lines all lie inside a block
-    maybe = [g for g in enumerate(fp.groups) if g[1][1] + g[1][3] and inside(g[1][0], g[1][1], old_spans)]
+    # (a hunk of comments or blank lines needs no answer here: plan_python_file finds that the
+    # code of its statement is the same, without a parse of the whole new text)
+    maybe = [g for g in enumerate(fp.groups) if g[1][1] + g[1][3] and inside(g[1][0], g[1][1], old_spans)
+             and not (_blank_or_comment(g[1][4]) and _blank_or_comment(g[1][5]))]
     if not maybe:
         return set()
     new_spans = _type_checking_spans(fp.new_text)
@@ -1298,6 +1301,15 @@ def _registry_spans(text):
 
     spans = _REGISTRY_SPANS.get(text)
     if spans is None:
+        # the spans of the pinned file come from the map that build_registry_spans.py made
+        try:
+            with open(os.path.join(MAPS, "registry_spans.json")) as f:
+                rec = json.load(f)
+            if rec["len"] == len(text) and rec["crc"] == zlib.crc32(text.encode("utf-8", "surrogateescape")):
+                spans = _REGISTRY_SPANS[text] = [tuple(s) for s in rec["spans"]]
+                return spans
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         tree = ast.parse(text)
         spans = []
         for node in ast.walk(tree):
