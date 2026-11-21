@@ -94,9 +94,35 @@ def main() -> int:
                 log(cid, "error, running everything:", repr(exc))
                 answers[cid] = every
 
+    # Intersect with the earlier selectors before refining, so the refining
+    # stages spend CPU only on tests that every selector still keeps.
+    legacy_sets = []
+    if legacy_procs:
+        try:
+            from . import legacy
+
+            legacy_sets = legacy.collect(legacy_procs, commits, started + 60.0, log)
+            for other in legacy_sets:
+                for cid in commits:
+                    if cid in other:
+                        answers[cid] = sorted(set(answers[cid]) & other[cid])
+        except Exception as exc:  # keep this selector's answers
+            log("legacy intersection failed:", repr(exc))
+        legacy_procs = []
+
     # Wall budget for the refining stages: the batch has 3 min for ~40 commits
     # (4.5 min for ~60 in the final); keep well clear of it. Static answers are
     # always ready, so running out of budget only costs precision.
+    refine_min_ms = int(os.environ.get("BR_REFINE_MIN_MS", "0"))
+    if legacy_sets:
+        from . import pack as _pk
+
+        def _c(ns):
+            return _pk.pack([(n, ms[n]) for n in ns])[0] if ns else 0
+
+        kept = {cid: r for cid, r in statics.items() if _c(answers[cid]) > refine_min_ms}
+        log(f"refining {len(kept)} of {len(statics)} commits after the intersection")
+        statics = kept
     deadline_s = float(os.environ.get("BR_DEADLINE") or min(165.0, max(100.0, 2.6 * len(commits))))
     if selector is not None and os.environ.get("BR_VERIFY", "1") == "1":
         try:
@@ -151,16 +177,11 @@ def main() -> int:
         except Exception as exc:  # keep the static answers
             log("verification stage failed, keeping static answers:", repr(exc))
 
-    if legacy_procs:
-        try:
-            from . import legacy
-
-            for other in legacy.collect(legacy_procs, commits, started + 172.0, log):
-                for cid in commits:
-                    if cid in other:
-                        answers[cid] = sorted(set(answers[cid]) & other[cid])
-        except Exception as exc:  # keep this selector's answers
-            log("legacy intersection failed:", repr(exc))
+    # The clean and lazy stages rebuild answers from scratch: intersect again.
+    for other in legacy_sets:
+        for cid in commits:
+            if cid in other:
+                answers[cid] = sorted(set(answers[cid]) & other[cid])
 
     lines = []
     seen: set = set()
