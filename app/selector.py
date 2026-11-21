@@ -35,6 +35,7 @@ NO_REDUCE = os.environ.get("BR_NO_REDUCE")  # validation mode: always run whole 
 MAPS_OBJ = None
 ANSWER_FD = None
 BASE_STATE = None
+SMALL_PLAN = float(os.environ.get("BR_SMALL_PLAN", "0.2"))  # CPU s; see small_plan in run()
 BASE_FUNCTION_KEYS = frozenset()
 REGISTRY_CLEAR_AT = None  # first test after tests/test_dialect_entry_points.py (see registry_clear_at)
 NO_DIFF = os.environ.get("BR_NO_DIFF")  # validation: no import-state diff
@@ -182,7 +183,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak")
 
     def __init__(self, commit):
         self.commit = commit
@@ -211,6 +212,7 @@ class Plan:
         self.protect = set()  # tests whose verdicts decide about long held tests
         self.enders = {}  # tests whose failure can end the runs of the commit (see execute)
         self.fixture_users = set()  # tests that walk a class fixture list of which few entries changed
+        self.global_leak = None  # first test after which interpreter-wide settings differ
         self.gone = set()  # module or class names that the patch removes (no reduced runs then)
 
 
@@ -223,6 +225,21 @@ def _blank_or_comment(lines):
 
 def _indent(s):
     return len(s) - len(s.lstrip())
+
+
+_KIND_FLAGS = 0x20 | 0x80 | 0x100 | 0x200  # generator, coroutine, iterable coroutine, async generator
+
+
+def _kind_changed(x, y):
+    """True when a function (or a function nested in it) turns into or out of a generator or
+    a coroutine."""
+    if (x.co_flags ^ y.co_flags) & _KIND_FLAGS:
+        return True
+    cx = [c for c in x.co_consts if hasattr(c, "co_code")]
+    cy = [c for c in y.co_consts if hasattr(c, "co_code")]
+    if len(cx) != len(cy):
+        return True
+    return any(_kind_changed(a, b) for a, b in zip(cx, cy))
 
 
 def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
@@ -295,6 +312,11 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             o, nr, nl, na, removed, added = g
             if nr != na or any(_indent(x) != _indent(y) for x, y in zip(removed, added)):
                 simple = False
+        if simple and any(_kind_changed(x, y) for x, y in pairs):
+            # generator <-> plain function: every call behaves differently, not only the
+            # runs that reach the changed line, so the tests that run the unit are candidates
+            simple = False
+            plan.note.append("code kind changed")
         if simple:
             for g in groups:
                 for ln in range(g[0], g[0] + g[1]):
@@ -369,14 +391,51 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
         plan.lines["?"] = None  # no reduced runs for this commit
 
 
-def make_plan(commit, text, maps: Maps) -> Plan:
+INFECT = os.environ.get("BR_NO_INFECT") != "1"  # operand outcome map, see infect.py
+
+
+def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: list):
+    """plan_python_file, narrowed by the operand outcome map (infect.py, maps/infect.bin: the
+    operand relations that each test saw at each comparison when the pinned suite ran).
+    When the whole edit of the file is one operator change at a mapped comparison: with no
+    evaluation in any test or phase whose result changes, the file adds nothing; otherwise
+    its candidates shrink to the tests with such an evaluation. Any other edit, or a changed
+    evaluation outside single tests (import time, collection), takes the normal path."""
+    rec = maps.file(fp.old_path)
+    res = None
+    if rec is not None:
+        import infect
+
+        res = infect.infected_tests(
+            fp.old_path, old_text.split("\n"), fp.new_text.split("\n"), fp.groups, rec[0],
+            os.path.join(maps.path, "infect.bin"),
+        )
+    if res is None or res.global_phase:
+        return plan_python_file(plan, fp, maps, old_text)
+    used.append(fp.old_path)
+    if not res.tests:
+        plan.note.append("infect: no evaluation changes")
+        return False
+    before = set(plan.cands)
+    fresh = plan_python_file(plan, fp, maps, old_text)
+    if not fresh:
+        added = plan.cands - before
+        plan.cands = before | (added & res.tests)
+        plan.note.append("infect: %d of %d candidates" % (len(added & res.tests), len(added)))
+    return fresh
+
+
+def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
     plan = Plan(commit)
+    infect_used = []  # files planned with the operand outcome map
+    marks = []  # what the plan held before each file
     fps = engine.parse_patch(text)
     if not fps:
         plan.note.append("no files in patch")
         return plan
     fresh = False
     for fp in fps:
+        marks.append((len(plan.cands), len(plan.work), fresh, len(plan.blind), len(plan.data_cands), len(plan.gone), len(infect_used)))
         path = fp.new_path if fp.status != "delete" else fp.old_path
         old_text = None
         if fp.status in ("modify", "delete", "rename"):
@@ -425,7 +484,10 @@ def make_plan(commit, text, maps: Maps) -> Plan:
                 if rec is not None:
                     plan.cands.update(maps.tests(rec[7]))
                     plan.cands.update(maps.tests(rec[8]))
-            elif fp.status == "modify" and plan_python_file(plan, fp, maps, old_text):
+            elif fp.status == "modify" and (
+                plan_python_file_infect(plan, fp, maps, old_text, infect_used) if use_infect
+                else plan_python_file(plan, fp, maps, old_text)
+            ):
                 fresh = True
                 plan.lines.pop(fp.old_path, None)
                 rec = maps.file(fp.old_path)
@@ -467,6 +529,14 @@ def make_plan(commit, text, maps: Maps) -> Plan:
                         plan.data_cands.add(n)
         if is_py and not (path.startswith("sqlglot/") and fp.status == "modify"):
             plan.diffable = False
+    if infect_used:
+        # The recorded operand relations hold only while nothing else in the patch can change
+        # the values that reach the comparison: another file that brings candidates (code,
+        # a fixture, a new file) ends that, and the patch is planned again without the map.
+        marks.append((len(plan.cands), len(plan.work), fresh, len(plan.blind), len(plan.data_cands), len(plan.gone), len(infect_used)))
+        for a, b in zip(marks, marks[1:]):
+            if a[:6] != b[:6] and a[6] == b[6]:
+                return make_plan(commit, text, maps, use_infect=False)
     add_registry_candidates(plan, fps, maps)
     if fresh:
         plan.mode = "fresh"
@@ -673,8 +743,28 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
 # Children
 
 
+def _decimal_settings(c):
+    return (c.prec, c.rounding, c.Emin, c.Emax, c.capitals, c.clamp, tuple(sorted(k.__name__ for k, v in c.traps.items() if v)))
+
+
+def _interpreter_settings():
+    """Interpreter-wide settings that a test run should leave as it found them."""
+    import decimal
+    import logging
+
+    root = logging.getLogger()
+    return (
+        sys.getrecursionlimit(), sys.getswitchinterval(), os.getcwd(), len(sys.path), sys.path[:3],
+        hash(frozenset(os.environ.items())), _decimal_settings(decimal.getcontext()), gc.get_threshold(),
+        root.level, len(root.handlers), logging.root.manager.disable, sys.stdout is sys.__stdout__,
+        sys.stderr is sys.__stderr__, sys.excepthook, sys.gettrace() is None,
+    )
+
+
 def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=None):
     import runner
+
+    settings = [None, False]  # settings before the first test; a change was reported
 
     last = [time.process_time()]
 
@@ -683,6 +773,11 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
     def emit(number, failed):
         now = time.process_time()
         code = 2 if failed is None else (1 if failed else 0)  # 2 = not run
+        if settings[0] is not None and not settings[1] and _interpreter_settings() != settings[0]:
+            # The patched code changed an interpreter-wide setting (recursion limit, working
+            # directory, environment, ...). In a full run, every later test runs with it.
+            settings[1] = True
+            os.write(wfd, b"G %d\n" % number)
         os.write(wfd, b"%d %d %d\n" % (number, code, int((now - last[0]) * 1e6)))
         last[0] = now
         if pool_module.InlinePool.broke_any:
@@ -837,6 +932,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
         t_setup = time.process_time()
+        settings[0] = _interpreter_settings()
         runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
         if DEBUG:
             sys.stderr.write("child %s setup %.3f run %.3f\n" % (plan.commit, t_setup - t_child, time.process_time() - t_setup))
@@ -920,6 +1016,9 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                     broken.append(line[2:].decode())
                 elif line.startswith(b"P "):
                     plan.pool_died.append(int(line[2:]))
+                elif line.startswith(b"G "):
+                    n = int(line[2:])
+                    plan.global_leak = n if plan.global_leak is None else min(plan.global_leak, n)
                 elif line.startswith(b"D "):
                     keys = None if line == b"D many" else json.loads(line[2:])
                     todo = on_diff(keys)
@@ -1244,6 +1343,11 @@ def run(t_start, deadline, state):
                     # Many tests of the class have no verdict, so the passes of the others
                     # say little about this class. Only the longest tests are still left out.
                     selected.add(n)
+        if plan.global_leak is not None:
+            # a run left the interpreter with other settings: every later test of a full run
+            # (the order of tests.json) sees them
+            selected.update(range(plan.global_leak, len(tests)))
+            plan.note.append("interpreter settings changed in test %d" % plan.global_leak)
         for n in plan.pool_died:
             cls_id = tests[n]["id"].rsplit("::", 1)[0]
             for t in maps.tests(maps.meta.get("pool_users", 0)):
@@ -1394,6 +1498,12 @@ def run(t_start, deadline, state):
             finish(c, plan, {}, "DEADLINE", ran, held)
             return
         use_diff = plan.mode != "hot" and plan.diffable and BASE_STATE is not None and not NO_DIFF
+        if use_diff and small_plan(plan):
+            use_diff = False
+        if plan.mode != "hot" and not use_diff:
+            # no comparison of the import state: every candidate runs whole
+            plan.keeps = {}
+            plan.lines = {"?": None}
         if use_diff:
             def on_diff(keys):
                 refine_with_diff(plan, keys, maps, tests)
@@ -1476,6 +1586,13 @@ def run(t_start, deadline, state):
         else:
             fresh.append(c)
 
+    def small_plan(plan):
+        """An import-time commit whose candidates all run whole for less CPU than the
+        comparison of the import state costs in the child (about 0.2 s)."""
+        if RUN_ALL or plan.mode == "hot":
+            return False
+        return sum(maps.cost[n] if maps.cost else seconds[n] * 1.5 for n in plan.cands - plan.blind) <= SMALL_PLAN
+
     def planned_cost(c):
         plan = plans[c]
         return sum(min(estimate_cost(n, plan, maps, seconds), HOLD_SECONDS * 2) for n in plan.cands)
@@ -1517,7 +1634,7 @@ def run(t_start, deadline, state):
     #    child drops the loaded sqlglot modules and imports the patched tree again.
     index = None
     global BASE_STATE, BASE_FUNCTION_KEYS
-    want_diff = bool(fresh) and not NO_DIFF and any(plans[c].diffable for c in fresh)
+    want_diff = bool(fresh) and not NO_DIFF and any(plans[c].diffable and not small_plan(plans[c]) for c in fresh)
     if hot or want_diff:
         preload.import_sqlglot()
     if want_diff:
