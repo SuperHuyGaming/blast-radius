@@ -159,7 +159,11 @@ FIXTURE_BATCH = os.environ.get("BR_NO_FIXTURE_BATCH") != "1"
 FIXTURE_BATCH_MIN = 2  # commits in one shared child at least
 PRE_KEEPS = os.environ.get("BR_PRE_KEEPS", "1") == "1"  # reduced test code compiled in the parent (prepare_keeps)
 # cone commits under a holder process (cone_in_holder): 0 off, 1 when it pays, 2 always
-CONE_HOLDER = os.environ.get("BR_CONE_HOLDER", "1")
+# Measurement build (BR_PROBE=1): reports, through the answer of one commit that needs no test,
+# how many seconds of the answers are tests that were selected without a failing verdict (see
+# probe_encode). It changes no other answer. Off in every normal build.
+PROBE = [] if os.environ.get("BR_PROBE") == "1" else None
+CONE_HOLDER = "0" if PROBE is not None else os.environ.get("BR_CONE_HOLDER", "1")
 
 
 def _holder_pays():
@@ -3899,6 +3903,11 @@ def main():
         import traceback
 
         traceback.print_exc(file=sys.stderr)
+    if PROBE is not None:
+        try:
+            probe_encode(state)
+        except Exception as e:  # noqa: BLE001
+            log("probe failed:", repr(e))
     # every commit gets a line; a commit without an answer gets every test (never a miss)
     tests = state["tests"]
     commits = state["commits"]
@@ -3941,6 +3950,83 @@ def main():
     # and nanobind finalizers), which only costs CPU
     sys.stderr.flush()
     os._exit(0)
+
+
+def probe_encode(state):
+    """Measurement build only. Puts one number into the answers: the first commit whose answer
+    is empty gets one worker with tests whose recorded seconds sum to (50 + V) ms, so the
+    simulated seconds of the batch rise by 2.050 s + V ms. V = 4 * payload + m; m (0..3, drawn
+    at random in each run) says which 14-bit payload it is:
+      m = 0  seconds of all answers that are tests without a failing verdict, in units of 8 ms
+      m = 1  the commit with the most such seconds, long tests left out: seconds in units of
+             32 ms (9 bits), 1 bit (1: mostly other than short held tests), the kind of commit
+             (2 bits: 0 function body, 1 importer cone, 2 new import, 3 other), and 2 bits: the
+             number of commits with a long test selected without a failing verdict (3 = 3 or more)
+      m = 2  counts, 3 bits each (7 = seven or more): commits with such seconds, commits with a
+             new import, commits with an importer cone; then 2 bits: commits whose modules do
+             not import; then 3 bits: function-body commits with such seconds
+      m = 3  such seconds by cause: short held tests in units of 0.5 s (5 bits), long tests in
+             units of 4 s (4 bits), other in units of 0.5 s (5 bits)
+    Extra tests in an answer can never make a miss."""
+    answers, commits, tests = state["answers"], state["commits"], state["tests"]
+    if tests is None or not commits:
+        return
+    seconds = [t["seconds"] for t in tests]
+    rows = list(PROBE)
+    seen = {r["c"] for r in rows}
+    for c in commits:  # answers that did not come from finish(): all of it is unproven
+        w = answers.get(c)
+        if c not in seen and w:
+            total = max(sum(seconds[n] for n in b) for b in w) + WORKER_COST * len(w)
+            rows.append({"c": c, "mode": "direct", "broken": False, "total": total, "blind": total,
+                         "small": 0.0, "long": 0.0, "other": total})
+    cap = lambda v, top: max(0, min(top, int(v)))
+    kind = lambda r: {"hot": 0, "fresh_cone": 1, "fresh": 2, "fresh_purge": 2}.get(r["mode"], 3)
+    with_blind = [r for r in rows if r["blind"] > 0.0005]
+    m = os.urandom(1)[0] % 4
+    if os.environ.get("BR_PROBE_M"):  # (local decoding tables)
+        m = int(os.environ["BR_PROBE_M"]) % 4
+    if m == 0:
+        payload = cap(round(sum(r["blind"] for r in rows) * 1000 / 8), 16383)
+    elif m == 1:
+        # (long tests are left out here: m = 3 and the last two bits report them)
+        rest = lambda r: r["blind"] - r["long"]
+        top = max(rows, key=rest, default=None)
+        n_long = cap(sum(1 for r in rows if r["long"] > 0.0005), 3)
+        if top is None or rest(top) <= 0.0005:
+            payload = n_long
+        else:
+            payload = ((cap(round(rest(top) * 1000 / 32), 511) << 5) | (int(top["other"] > top["small"]) << 4)
+                       | (kind(top) << 2) | n_long)
+    elif m == 2:
+        payload = ((cap(len(with_blind), 7) << 11) | (cap(sum(1 for r in rows if kind(r) == 2), 7) << 8)
+                   | (cap(sum(1 for r in rows if kind(r) == 1), 7) << 5) | (cap(sum(1 for r in rows if r["broken"]), 3) << 3)
+                   | cap(sum(1 for r in with_blind if kind(r) == 0), 7))
+    else:
+        payload = ((cap(round(sum(r["small"] for r in rows) / 0.5), 31) << 9)
+                   | (cap(round(sum(r["long"] for r in rows) / 4.0), 15) << 5)
+                   | cap(round(sum(r["other"] for r in rows) / 0.5), 31))
+    target = 50 + 4 * payload + m  # milliseconds on one worker
+    empty = [c for c in commits if answers.get(c) == []]
+    log("probe: m", m, "payload", payload, "target ms", target, "rows", len(rows), "empty commits", len(empty))
+    if not empty:
+        return
+    weights = [int(round(s * 1000)) for s in seconds]
+    reach = [1]  # reach[i]: bit s is set when some of the first i tests sum to s ms
+    mask = (1 << (target + 1)) - 1
+    for w in weights:
+        reach.append((reach[-1] | (reach[-1] << w)) & mask if w > 0 else reach[-1])
+    if not (reach[-1] >> target) & 1:
+        log("probe: target not reachable")
+        return
+    chosen = []
+    left = target
+    for i in range(len(weights) - 1, -1, -1):
+        if (reach[i] >> left) & 1:
+            continue  # reachable without test i
+        chosen.append(i)
+        left -= weights[i]
+    answers[empty[0]] = [sorted(chosen)]
 
 
 def base_state_header():
@@ -4177,6 +4263,19 @@ def run(t_start, deadline, state):
         for name in plan.broken:  # a test file that cannot be imported: all its tests fail
             selected.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
         answers[c] = pack(sorted(selected), seconds)
+        if PROBE is not None:
+            proven = {n for n, bad in verdicts.items() if bad}
+            total = packed_seconds(selected, seconds)
+            small = {n for n in selected - proven if n in held and seconds[n] <= QUIET_HOLD_SECONDS}
+            long_ = {n for n in selected - proven if seconds[n] > QUIET_HOLD_SECONDS}
+            other = selected - proven - small - long_
+            PROBE.append({
+                "c": c, "mode": plan.mode, "broken": bool(plan.broken), "total": total,
+                "blind": total - packed_seconds(proven, seconds),
+                "small": total - packed_seconds(selected - small, seconds),
+                "long": total - packed_seconds(selected - long_, seconds),
+                "other": total - packed_seconds(selected - other, seconds),
+            })
         if DEBUG:
             debug_rows[c] = {
                 "mode": plan.mode, "status": status, "cands": sorted(plan.cands), "cpu": round(sum(os.times()[:4]), 3),
