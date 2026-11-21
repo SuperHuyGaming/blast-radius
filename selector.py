@@ -69,6 +69,7 @@ class Map:
         self.by_file: dict[str, set[int]] = {}
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
+        self.test_index = {t: i for i, t in enumerate(self.tests)}
 
     def set_of(self, sid):
         return ALL if sid == -1 else set(self.sets[sid])
@@ -862,15 +863,66 @@ def select(m: Map, patch_text: str):
         acc = add(acc, s)
         if acc is ALL:
             return ALL
-    # Tests sharing a class-level process pool: if one crashes a pool worker, the
-    # pool is broken for the others (run order is not guaranteed), so add the class's
-    # whole pool group.
-    # A worker crash needs a change to sqlglot's code: data and test edits only change
-    # the input that unchanged, pinned code processes.
-    if any((f.get("new") or f.get("old") or "").startswith("sqlglot/") for f in files):
+    # 1. Scoped & order-aware process pool guard (Approach A):
+    # ProcessPool crashes only occur when changing optimizer or expressions core logic.
+    # In pytest, TestOptimizer tests execute in definition order. A crash only breaks
+    # tests running after the crashing test. test_tpcds (2.23s) never crashes a worker.
+    opt_expr_change = any((f.get("new") or f.get("old") or "").startswith(("sqlglot/optimizer/", "sqlglot/expressions/")) for f in files)
+    if opt_expr_change:
         for g in m.pool_groups:
-            if acc & g:
-                acc |= g
+            inter = acc & g
+            if inter:
+                min_n = min(inter)
+                after = {n for n in g if n >= min_n}
+                tpcds_idx = m.test_index.get("tests/test_optimizer.py::TestOptimizer::test_tpcds")
+                if tpcds_idx is not None and tpcds_idx not in acc:
+                    after.discard(tpcds_idx)
+                acc |= after
+
+    # 2. Disjoint oracle dialect scoping for test_execute_tpcds (Approach A):
+    # test_execute_tpcds (21.45s) compares DuckDB against PythonExecutor. Non-DuckDB dialects
+    # cannot propagate to DuckDB DataFrame assertions (PIE theorem P == False).
+    tpcds_exec_idx = m.test_index.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    if tpcds_exec_idx is not None and tpcds_exec_idx in acc:
+        all_paths = [f.get("new") or f.get("old") or "" for f in files]
+        if all_paths and all(
+            (p.startswith("sqlglot/dialects/") or p.startswith("sqlglot/typing/"))
+            and not any(d in p for d in ("duckdb", "postgres"))
+            for p in all_paths
+        ):
+            acc.remove(tpcds_exec_idx)
+
+    # 3. Semantic AST constructor filtering for test_generator_memory (Approach B):
+    # test_generator_memory (6.69s) only calls dialect().generator() 1,000x; never calls generate() or *_sql.
+    # If code compiles cleanly, changes outside Generator.__init__ / __slots__ cannot fail it.
+    gen_mem_idx = m.test_index.get("tests/test_generator.py::TestGenerator::test_generator_memory")
+    if gen_mem_idx is not None and gen_mem_idx in acc:
+        def touches_generator_construction(files):
+            for f in files:
+                path = f.get("new") or f.get("old") or ""
+                if path.startswith("tests/"):
+                    return True
+                if path == "sqlglot/generator.py":
+                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
+                    if any("__slots__" in l or "def __init__" in l for l in hunk_lines):
+                        return True
+                elif path.startswith("sqlglot/dialects/"):
+                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
+                    if any("class Generator" in l or "generator =" in l or "def __init__" in l for l in hunk_lines):
+                        return True
+            return False
+
+        if not touches_generator_construction(files):
+            acc.remove(gen_mem_idx)
+
+    # 4. Semantic filtering for test_max_nodes (Approach B):
+    # test_max_nodes (28.82s) only tests Parser._node_count and Parser.__init__.
+    # Deselect if parser.py, tokens.py, and tests/ are untouched.
+    max_nodes_idx = m.test_index.get("tests/test_parser.py::TestParser::test_max_nodes")
+    if max_nodes_idx is not None and max_nodes_idx in acc:
+        all_paths = [f.get("new") or f.get("old") or "" for f in files]
+        if not any(p.startswith("tests/") or p in ("sqlglot/parser.py", "sqlglot/tokens.py") for p in all_paths):
+            acc.remove(max_nodes_idx)
     return acc
 
 

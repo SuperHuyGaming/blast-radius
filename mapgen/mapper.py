@@ -264,6 +264,214 @@ def _source_to_code(self, data, path, *, _optimize=-1):
 
 if PROBES:
     _be.SourceLoader.source_to_code = _source_to_code
+
+
+# Key tracing (MAP_KEYS=1): every dict display assigned to a name in a sqlglot class
+# body or module body becomes a dict subclass that records, per context, which keys
+# were looked up (hits and misses) and whether the table was iterated. Plain
+# `**Other.TABLE` entries in such a display are copied without counting as a read and
+# recorded as an alias (keys flow from Other.TABLE into this table). Any other read at
+# import time (iteration, copy, key lookups) is recorded too, so the selector can tell
+# which tables feed import-time state (tries, derived sets) and leave those alone.
+KEYS = os.environ.get("MAP_KEYS") == "1"
+import enum as _enum
+
+kt_keys: dict = {}     # name -> {ctx: set(key reprs)}
+kt_iter: dict = {}     # name -> set(ctx)
+kt_made: set = set()   # names of tables that were created as tracing dicts
+kt_alias: set = set()  # (source name, target name)
+kt_sites: set = set()  # "name@file:line" of import-time iterations (diagnostics)
+
+
+def _krepr(k):
+    if isinstance(k, str):
+        return "s:" + k
+    if isinstance(k, type):
+        return "t:" + k.__name__
+    if isinstance(k, _enum.Enum):
+        return "e:" + k.name
+    if k is None or isinstance(k, (bool, int, float)):
+        return "c:" + repr(k)
+    if isinstance(k, tuple):
+        return "u:" + "|".join(_krepr(x) for x in k)
+    return "?"
+
+
+class _KT(dict):
+    __slots__ = ("_kt",)
+
+    def _k(self, k):
+        try:
+            r = _krepr(k)
+        except Exception:
+            r = "?"
+        d = kt_keys.get(self._kt)
+        if d is None:
+            d = kt_keys[self._kt] = {}
+        s = d.get(current[0])
+        if s is None:
+            s = d[current[0]] = set()
+        s.add(r)
+
+    def _i(self):
+        s = kt_iter.get(self._kt)
+        if s is None:
+            s = kt_iter[self._kt] = set()
+        s.add(current[0])
+        c = current[0]
+        if c == "<import>" or c.startswith("C|"):
+            f = sys._getframe(2)
+            kt_sites.add(f"{self._kt}@{os.path.relpath(f.f_code.co_filename, ROOT)}:{f.f_lineno}")
+
+    def __getitem__(self, k):
+        self._k(k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        self._k(k)
+        return dict.get(self, k, default)
+
+    def __contains__(self, k):
+        self._k(k)
+        return dict.__contains__(self, k)
+
+    def pop(self, k, *a):
+        self._k(k)
+        return dict.pop(self, k, *a)
+
+    def setdefault(self, k, default=None):
+        self._k(k)
+        return dict.setdefault(self, k, default)
+
+    def __setitem__(self, k, v):
+        self._k(k)
+        return dict.__setitem__(self, k, v)
+
+    def __delitem__(self, k):
+        self._k(k)
+        return dict.__delitem__(self, k)
+
+    def __iter__(self):
+        self._i()
+        return dict.__iter__(self)
+
+    def __reversed__(self):
+        self._i()
+        return dict.__reversed__(self)
+
+    def keys(self):
+        self._i()
+        return dict.keys(self)
+
+    def items(self):
+        self._i()
+        return dict.items(self)
+
+    def values(self):
+        self._i()
+        return dict.values(self)
+
+    def __len__(self):
+        self._i()
+        return dict.__len__(self)
+
+    def copy(self):
+        self._i()
+        return dict.copy(self)
+
+    def popitem(self):
+        self._i()
+        return dict.popitem(self)
+
+    def __or__(self, o):
+        self._i()
+        return dict.__or__(self, o)
+
+    def __ror__(self, o):
+        self._i()
+        return dict.__ror__(self, o)
+
+    def __eq__(self, o):
+        self._i()
+        return dict.__eq__(self, o)
+
+    def __ne__(self, o):
+        self._i()
+        return dict.__ne__(self, o)
+
+    __hash__ = None
+
+    def __repr__(self):
+        self._i()
+        return dict.__repr__(self)
+
+    def __reduce_ex__(self, proto):
+        self._i()
+        return (dict, (dict(dict.items(self)),))
+
+
+def blast_kt_wrap_(name, d):
+    t = _KT(d)
+    t._kt = name
+    kt_made.add(name)
+    return t
+
+
+def blast_kt_copy_(src, target):
+    """A `**src` entry of a traced display: keys flow into `target`, not a read."""
+    if isinstance(src, _KT):
+        if src._kt != target:
+            kt_alias.add((src._kt, target))
+        return dict(dict.items(src))
+    return src
+
+
+_builtins.blast_kt_wrap_ = blast_kt_wrap_
+_builtins.blast_kt_copy_ = blast_kt_copy_
+
+
+class _KeyWrap(_ast.NodeTransformer):
+    """Wrap `NAME = {...}` / `NAME: T = {...}` in module and class bodies (not in
+    functions)."""
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+    visit_Lambda = visit_FunctionDef
+
+    def _wrap(self, name, value):
+        for i, k in enumerate(value.keys):
+            if k is None:  # **entry
+                value.values[i] = _ast.copy_location(_ast.Call(
+                    func=_ast.Name("blast_kt_copy_", _ast.Load()),
+                    args=[value.values[i], _ast.Constant(name)], keywords=[]), value.values[i])
+        return _ast.copy_location(_ast.Call(func=_ast.Name("blast_kt_wrap_", _ast.Load()),
+                                            args=[_ast.Constant(name), value], keywords=[]), value)
+
+    def visit_Assign(self, node):
+        if (isinstance(node.value, _ast.Dict) and len(node.targets) == 1
+                and isinstance(node.targets[0], _ast.Name)):
+            node.value = self._wrap(node.targets[0].id, node.value)
+        return node
+
+    def visit_AnnAssign(self, node):
+        if isinstance(node.value, _ast.Dict) and isinstance(node.target, _ast.Name):
+            node.value = self._wrap(node.target.id, node.value)
+        return node
+
+
+def _source_to_code_keys(self, data, path, *, _optimize=-1):
+    rp = os.path.realpath(str(path))
+    if not rp.startswith(SQLROOT) or not rp.endswith(".py"):
+        return _orig_source_to_code(self, data, path, _optimize=_optimize)
+    tree = _ast.parse(data, filename=str(path))
+    tree = _ast.fix_missing_locations(_KeyWrap().visit(tree))
+    return compile(tree, path, "exec", dont_inherit=True, optimize=_optimize)
+
+
+if KEYS:
+    _be.SourceLoader.source_to_code = _source_to_code_keys
 sys.dont_write_bytecode = True
 
 if COVER:
@@ -321,6 +529,13 @@ def pytest_sessionfinish(session, exitstatus):
         json.dump({"differ": {k: sorted(v) for k, v in cmp_differ.items()}, "seen": sorted(cmp_seen)},
                   open(os.path.join(OUT, f"cmp_{wid}.json"), "w"))
         json.dump(outcomes, open(os.path.join(OUT, f"probe_outcomes_{wid}.json"), "w"))
+    if KEYS:
+        wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
+        json.dump({"keys": {n: {c: sorted(s) for c, s in d.items()} for n, d in kt_keys.items()},
+                   "iter": {n: sorted(s) for n, s in kt_iter.items()},
+                   "made": sorted(kt_made), "alias": sorted(kt_alias), "sites": sorted(kt_sites)},
+                  open(os.path.join(OUT, f"keys_{wid}.json"), "w"))
+        json.dump(outcomes, open(os.path.join(OUT, f"keys_outcomes_{wid}.json"), "w"))
     if not COVER:
         return
     _session_finish_cover()
