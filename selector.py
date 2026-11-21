@@ -565,9 +565,11 @@ class PyFile:
                 # themselves be lambda-body lines with known callers.
                 acc: set[int] = set()
                 ok = True
+                checked = 0
                 for a in (old_anchor - 1, old_anchor):
                     if not (1 <= a <= len(self.old_lines)) or is_blank_or_comment(self.old_lines[a - 1]):
                         continue
+                    checked += 1
                     ra = locate(self.old_tree, a)
                     lam = lambda_body_span(ra[0], a) if ra is not None and not ra[1] else None
                     if lam is None:
@@ -578,7 +580,7 @@ class PyFile:
                         ok = False
                         break
                     acc |= cov
-                if ok:
+                if ok and checked:
                     return acc
             return self.import_level(stmt, False)
         # Inside a function: runs when its neighbours on the pinned commit ran.
