@@ -10,6 +10,7 @@ import gc
 import json
 import marshal
 import os
+import re
 import zlib
 import select
 import signal
@@ -35,8 +36,11 @@ ANSWER_FD = None
 WORKER_COST = 2.0
 HOLD_SECONDS = float(os.environ.get("BR_HOLD", "1.5"))  # test runs below this CPU cost always start
 COMMIT_SECONDS = float(os.environ.get("BR_COMMIT", "8.0"))  # CPU limit of the test runs of one commit
+FRESH_SECONDS = float(os.environ.get("BR_FRESH", "3.0"))  # the same for a commit that needs a new import
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
+AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
+MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
 WALL_LIMIT = float(os.environ.get("BR_WALL", "150"))  # the batch must end well inside 3 minutes
@@ -63,6 +67,7 @@ class Maps:
         self.set_cache = {}
         self.unit_cache = {}
         self.test_cache = {}
+        self._paths = None
         try:
             with open(os.path.join(path, "cost.bin"), "rb") as f:
                 self.cost = marshal.load(f)
@@ -113,6 +118,11 @@ class Maps:
             self.test_cache[number] = rec
         return rec
 
+    def paths(self):
+        if self._paths is None:
+            self._paths = {fid: rel for rel, fid in self.meta["files"].items()}
+        return self._paths
+
     def tests(self, set_id):
         if set_id == 0:
             return ()
@@ -131,7 +141,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died")
 
     def __init__(self, commit):
         self.commit = commit
@@ -145,6 +155,11 @@ class Plan:
         self.lines = {}  # repo-relative .py path -> lines of the changed statements (call-time code)
         self.keeps = {}  # test -> (statements, fixture entries, pool tasks) to run; absent = whole test
         self.broken = []  # modules that fail to import with the patch
+        self.times = {}  # test -> CPU seconds of its run (for logs)
+        self.pool_died = []  # tests during which a class-level process pool died
+
+
+CODING_RE = re.compile(r"coding[:=]\s*[-\w.]+")
 
 
 def _blank_or_comment(lines):
@@ -178,8 +193,9 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             elif s < o <= e:
                 hit.append(ui)
         if not hit:
-            if _blank_or_comment(added) and _blank_or_comment(removed) and (nl > 2 or not added):
-                continue
+            if _blank_or_comment(added) and _blank_or_comment(removed):
+                if nl > 2 or not any(CODING_RE.search(a) for a in added + removed):
+                    continue
             return True
         for ui in hit:
             hit_units.setdefault(ui, []).append(g)
@@ -234,8 +250,11 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
     for a line of module-level or class-level code, the tests that use what the line defines.
     A line without an entry falls back to every test that loads or runs the file."""
     stmt_set, def_set, def_known = rec[3], rec[11], rec[12]
+    readers = rec[13] if len(rec) > 13 else {}
+    paths = maps.paths()
     n = len(def_set) - 2
     complete = True
+    reader_lines = {}
     for o, nr, nl, na, removed, added in fp.groups:
         lines = range(o, o + nr) if nr else (o - 1, o)
         simple = nr == na and all(_indent(x) == _indent(y) for x, y in zip(removed, added))
@@ -246,7 +265,14 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
                 continue
             if def_known[ln]:
                 plan.cands.update(maps.tests(def_set[ln]))
+                rs = readers.get(ln) if simple else None
+                if rs is None:
+                    reader_lines = None
+                elif reader_lines is not None:
+                    for rfid, rline in rs:
+                        reader_lines.setdefault(paths[rfid], set()).add(rline)
             elif stmt_set[ln]:
+                reader_lines = None
                 plan.cands.update(maps.tests(stmt_set[ln]))
             elif nr:
                 complete = False
@@ -254,6 +280,15 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
         plan.cands.update(maps.tests(rec[7]))
         plan.cands.update(maps.tests(rec[8]))
         plan.note.append("import-time fallback")
+        reader_lines = None
+    if reader_lines:
+        # a class constant that only functions read: a test part is affected only when it
+        # runs one of the reading lines, so the reduced runs apply
+        for p, lines in reader_lines.items():
+            plan.lines.setdefault(p, set()).update(lines)
+        plan.note.append("reader lines")
+    else:
+        plan.lines["?"] = None  # no reduced runs for this commit
 
 
 def make_plan(commit, text, maps: Maps) -> Plan:
@@ -286,6 +321,7 @@ def make_plan(commit, text, maps: Maps) -> Plan:
         if is_py and in_tree:
             if fp.status != "modify":
                 fresh = True
+                plan.lines["?"] = None
                 rec = maps.file(fp.old_path) if fp.old_path else None
                 if rec is not None:
                     plan.cands.update(maps.tests(rec[7]))
@@ -293,6 +329,7 @@ def make_plan(commit, text, maps: Maps) -> Plan:
             elif plan_python_file(plan, fp, maps, old_text):
                 fresh = True
                 plan.lines.pop(fp.old_path, None)
+                hot_lines = any(v for v in plan.lines.values())
                 rec = maps.file(fp.old_path)
                 if rec is not None:
                     add_import_time_candidates(plan, fp, rec, maps)
@@ -333,7 +370,7 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
     for n in plan.cands:
         if tests[n]["id"] in SCALED_IDS:
             keeps[n] = (None, None, None, True, None)
-    if plan.mode != "hot":
+    if plan.mode != "hot" and (None in plan.lines.values() or not plan.lines):
         return keeps
     code_lines = [(rel, ln) for rel, lines in plan.lines.items() for ln in lines]
     fixtures = {}
@@ -361,7 +398,7 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
                 chosen.update(patterns[pat])
             if whole:
                 continue
-            if not seen and plan.work:
+            if not seen and (plan.work or plan.mode != "hot"):
                 continue  # the coverage maps disagree: run the whole test
         keep_stmts = set()
         keep_files = {}
@@ -437,8 +474,19 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
 def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
     import runner
 
+    last = [time.process_time()]
+
+    import pool as pool_module
+
     def emit(number, failed):
-        os.write(wfd, b"%d %d\n" % (number, 1 if failed else 0))
+        now = time.process_time()
+        os.write(wfd, b"%d %d %d\n" % (number, 1 if failed else 0, int((now - last[0]) * 1e6)))
+        last[0] = now
+        if pool_module.InlinePool.broke_any:
+            # the class's shared process pool died in this test: in a full run every later
+            # test of the class that uses the pool fails
+            pool_module.InlinePool.broke_any = False
+            os.write(wfd, b"P %d\n" % number)
 
     def started(number):
         os.write(wfd, b"S %d\n" % number)
@@ -483,6 +531,8 @@ def child_main(plan: Plan, order, tests, wfd, index, stop_after_fail):
 
         keeps = None
         if plan.mode != "hot" and plan.keeps and not NO_REDUCE:
+            if any(k[0] is not None or k[1] is not None for k in plan.keeps.values()):
+                reduce.install_loaders()
             keeps = apply_keeps(plan, MAPS_OBJ, tests)
         if plan.mode == "hot" and reduce.install_loaders():
             # an unchanged fixture entry that does not run changed code cannot change a result
@@ -570,9 +620,13 @@ def run_child(plan, order, tests, index, stop_after_fail, allowed, time_left):
                 t_test = time.monotonic() + allowed.get(current, 30.0)
             elif line.startswith(b"B "):
                 broken.append(line[2:].decode())
+            elif line.startswith(b"P "):
+                plan.pool_died.append(int(line[2:]))
             else:
-                a, b = line.split()
-                verdicts[int(a)] = b == b"1"
+                parts = line.split()
+                verdicts[int(parts[0])] = parts[1] == b"1"
+                if len(parts) > 2:
+                    plan.times[int(parts[0])] = int(parts[2]) / 1e6
                 current = None
                 t_test = time.monotonic() + 30.0
     os.close(r)
@@ -725,10 +779,23 @@ def run(t_start, deadline, state):
     answers = state["answers"]
     debug_rows = {}
 
-    def finish(c, plan, verdicts, status, ran, held):
+    fixture_readers = {}
+
+    def fixtures_of(n):
+        """The .sql fixture files that test n reads."""
+        if not fixture_readers:
+            for path, sid in maps.meta["opened"].items():
+                if path.startswith("tests/fixtures/") and path.endswith(".sql"):
+                    for t in maps.tests(sid):
+                        fixture_readers.setdefault(t, set()).add(path)
+            fixture_readers.setdefault(-1, set())
+        return fixture_readers.get(n) or frozenset()
+
+    def finish(c, plan, verdicts, status, ran, held, blind=()):
         failing = {n for n, bad in verdicts.items() if bad}
         selected = set(failing)
-        unknown = [n for n in ran if n not in verdicts]
+        selected.update(blind)
+        unknown = [n for n in ran if n not in verdicts and n not in set(blind)]
         if unknown:
             selected.update(unknown)  # the child ended early: nothing is known about these
         if plan.all_fail:
@@ -736,10 +803,27 @@ def run(t_start, deadline, state):
         # Tests that were too costly to run have no verdict. They are selected, with one
         # exception: when the cheaper tests on the same code all ran and all passed, a very
         # long test is left out (its selection would cost more than the small risk).
-        if selected or plan.broken or not verdicts:
+        # tests that the commit breaks. A very long test (the TPC-DS run) is left out unless a
+        # failing test is close to it: same test class, or same fixture file.
+        if plan.broken or not verdicts or unknown:
             selected.update(held)
         else:
-            selected.update(n for n in held if seconds[n] <= QUIET_HOLD_SECONDS)
+            # tests selected without a verdict count as evidence too: they may fail
+            evidence = failing | set(blind)
+            fail_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in evidence}
+            fail_fixtures = set()
+            for n in evidence:
+                fail_fixtures.update(fixtures_of(n))
+            for n in held:
+                if seconds[n] <= QUIET_HOLD_SECONDS or len(evidence) >= MANY_FAILURES:
+                    selected.add(n)
+                elif tests[n]["id"].rsplit("::", 1)[0] in fail_classes or fail_fixtures & fixtures_of(n):
+                    selected.add(n)
+        for n in plan.pool_died:
+            cls_id = tests[n]["id"].rsplit("::", 1)[0]
+            for t in maps.tests(maps.meta.get("pool_users", 0)):
+                if t > n and tests[t]["id"].rsplit("::", 1)[0] == cls_id:
+                    selected.add(t)
         for name in plan.broken:
             rel = name.replace(".", "/")
             for cand in (rel + ".py", rel + "/__init__.py"):
@@ -752,6 +836,8 @@ def run(t_start, deadline, state):
                 "mode": plan.mode, "status": status, "cands": sorted(plan.cands), "cpu": round(sum(os.times()[:4]), 3),
                 "verdicts": {str(k): int(v) for k, v in verdicts.items()}, "note": plan.note,
                 "reduced": sorted(plan.keeps), "held": sorted(held), "ran": len(ran),
+                "times": {str(k): round(v, 4) for k, v in plan.times.items()},
+                "costs": {str(n): round(estimate_cost(n, plan, maps, seconds), 4) for n in ran},
                 "est": round(sum(estimate_cost(n, plan, maps, seconds) for n in ran), 3),
             }
 
@@ -766,13 +852,14 @@ def run(t_start, deadline, state):
             limit = {n: max(HOLD_SECONDS, HOLD_FACTOR * (WORKER_COST + seconds[n])) for n in cands}
             ran = [n for n in cands if cost[n] <= limit[n]]
             held = [n for n in cands if cost[n] > limit[n]]
+            budget = COMMIT_SECONDS if plan.mode == "hot" else FRESH_SECONDS
             total = sum(cost[n] for n in ran)
-            if total > COMMIT_SECONDS:
+            if total > budget:
                 # keep the cheapest tests up to the limit; the others are held
                 keep_set = set()
                 acc = 0.0
                 for n in sorted(ran, key=lambda n: cost[n]):
-                    if acc + cost[n] > COMMIT_SECONDS:
+                    if acc + cost[n] > budget:
                         break
                     acc += cost[n]
                     keep_set.add(n)
@@ -787,25 +874,45 @@ def run(t_start, deadline, state):
         verdicts = {}
         status = "END"
         todo = ran
-        for attempt in range(3):
+        blind = []
+        stop_at_fail = not RUN_ALL
+        for attempt in range(4):
             left = deadline - time.monotonic()
             if left < 3.0:
                 status = "DEADLINE"
                 break
-            v, status, hung = run_child(plan, todo, tests, index, False, allowed, left - 2.0)
+            v, status, hung = run_child(plan, todo, tests, index, stop_at_fail, allowed, left - 2.0)
             if status == "REDO":
-                plan.mode = "fresh"
                 return "REDO"
             verdicts.update(v)
             if hung is not None:
                 verdicts[hung] = True  # a test that does not end is a timeout in the full run
             todo = [n for n in todo if n not in verdicts]
+            if plan.pool_died:
+                first = min(plan.pool_died)
+                cls_id = tests[first]["id"].rsplit("::", 1)[0]
+                users = set(maps.tests(maps.meta.get("pool_users", 0)))
+                dead = [n for n in todo if n > first and n in users and tests[n]["id"].rsplit("::", 1)[0] == cls_id]
+                blind += dead
+                todo = [n for n in todo if n not in set(dead)]
+            if stop_at_fail and any(verdicts.values()) and todo:
+                # The commit breaks something. From here a verdict only saves the recorded
+                # seconds of a passing test, so only runs that are cheap next to that go on;
+                # the other candidates are selected as they are.
+                stop_at_fail = False
+                cheap = [n for n in todo if cost[n] <= max(0.03, AFTER_FAIL_RATIO * seconds[n])]
+                blind += [n for n in todo if n not in set(cheap)]
+                todo = cheap
+                if todo:
+                    continue
+                status = "END"
+                break
             if status == "END" or not todo or hung is None:
                 break
-        finish(c, plan, verdicts, status, ran, held)
+        finish(c, plan, verdicts, status, ran, held, blind)
 
-    # 1. commits that need a fresh import run first, from a parent that has not imported sqlglot
-    hot = []
+    # 1. answers that need no run
+    hot, fresh = [], []
     for c in commits:
         plan = plans[c]
         if plan.mode == "all":
@@ -816,20 +923,29 @@ def run(t_start, deadline, state):
                 debug_rows[c] = {"mode": "noop", "cands": [], "verdicts": {}, "note": plan.note}
         elif plan.mode == "hot":
             hot.append(c)
+        else:
+            fresh.append(c)
+
+    def planned_cost(c):
+        plan = plans[c]
+        return sum(min(estimate_cost(n, plan, maps, seconds), HOLD_SECONDS * 2) for n in plan.cands)
+
+    hot.sort(key=planned_cost)
+    fresh.sort(key=planned_cost)
     need_heavy = any(
         tests[n]["file"] in ("tests/test_optimizer.py", "tests/test_executor.py")
-        for c in commits for n in plans[c].cands
+        for c in hot + fresh for n in plans[c].cands
     )
     if need_heavy:
         import duckdb  # noqa: F401
         import pandas  # noqa: F401
         import numpy  # noqa: F401
-    for c in commits:
-        if plans[c].mode == "fresh":
-            execute(c, plans[c], None)
 
-    # 2. the other commits share one parent that has sqlglot imported
-    redo = []
+    # 2. One parent process serves every commit. It imports sqlglot and the needed test
+    #    modules once. Commits that only change function bodies run first (cheap: the child
+    #    replaces code objects). Commits that change import-time code run after them: their
+    #    child drops the loaded sqlglot modules and imports the patched tree again.
+    index = None
     if hot:
         preload.import_sqlglot()
         mods = sorted({tests[n]["file"][:-3].replace("/", ".") for c in hot for n in plans[c].cands})
@@ -848,21 +964,21 @@ def run(t_start, deadline, state):
         index = engine.FunctionIndex(ROOT)
         gc.collect()
         gc.freeze()
-        for c in hot:
-            if execute(c, plans[c], index) == "REDO":
-                redo.append(c)
-    for c in redo:
-        # the parent has sqlglot loaded now; a fresh child must drop those modules first
+    purge = bool(hot)
+    for c in hot:
+        if execute(c, plans[c], index) == "REDO":
+            fresh.append(c)
+            plan = plans[c]
+            plan.note.append("redo")
+            for p in plan.files:
+                rec = maps.file(p)
+                if rec is not None:
+                    plan.cands.update(maps.tests(rec[7]))
+                    plan.cands.update(maps.tests(rec[8]))
+            plan.keeps = {n: k for n, k in plan.keeps.items() if k[4] is None}
+    for c in fresh:
         plan = plans[c]
-        plan.note.append("redo")
-        rec_cands = set(plan.cands)
-        for p in plan.files:
-            rec = maps.file(p)
-            if rec is not None:
-                rec_cands.update(maps.tests(rec[7]))
-                rec_cands.update(maps.tests(rec[8]))
-        plan.cands = rec_cands
-        plan.mode = "fresh_purge"
+        plan.mode = "fresh_purge" if purge else "fresh"
         execute(c, plan, None)
 
     if DEBUG:

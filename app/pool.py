@@ -64,13 +64,16 @@ class LazyFuture(Future):
             fn, args, kwargs = pickle.loads(payload)
         except BaseException:  # the real worker dies here
             pool._broken = True
-            InlinePool.broke_any = True
+            if pool._class_level:
+                InlinePool.broke_any = True
             self._exception = BrokenProcessPool("A process in the process pool was terminated abruptly")
             return
         try:
             value = fn(*args, **kwargs)
         except SystemExit:
             pool._broken = True
+            if pool._class_level:
+                InlinePool.broke_any = True
             self._exception = BrokenProcessPool("A process in the process pool was terminated abruptly")
             return
         except BaseException as e:
@@ -87,6 +90,8 @@ class LazyFuture(Future):
             self._result = pickle.loads(payload)
         except BaseException:
             pool._broken = True
+            if pool._class_level:
+                InlinePool.broke_any = True
             self._exception = BrokenProcessPool("A process in the process pool was terminated abruptly")
 
     def result(self, timeout=None):
@@ -107,6 +112,8 @@ class InlinePool:
     broke_any = False  # set when any pool of this process broke; the caller reads it
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+        # a pool made outside a test (class fixture) lives on for the later tests of the class
+        self._class_level = not STATE.in_test
         self._initializer = initializer
         self._initargs = initargs
         self._started = False
@@ -124,7 +131,8 @@ class InlinePool:
                 if isinstance(e, KeyboardInterrupt):
                     raise
                 self._broken = True
-                InlinePool.broke_any = True
+                if self._class_level:
+                    InlinePool.broke_any = True
                 return False
         return True
 

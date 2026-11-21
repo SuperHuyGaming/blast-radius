@@ -285,12 +285,13 @@ SCALED = {
 }
 
 
-def scale_lines(test_id, lines):
-    """Applies the small-scale constants. Returns None when the text is not the pinned one."""
+def scale_lines(test_id, lines, reduced=False):
+    """Applies the small-scale constants. Returns None when the text is not the pinned one.
+    In a reduced run a statement with such a constant can be absent."""
     out = list(lines)
     for old, new, count in SCALED[test_id]:
         hits = [i for i, s in enumerate(out) if old in s]
-        if len(hits) != count or any(out[i].count(old) != 1 for i in hits):
+        if len(hits) > count or (len(hits) < count and not reduced) or any(out[i].count(old) != 1 for i in hits):
             return None
         for i in hits:
             out[i] = out[i].replace(old, new)
@@ -320,7 +321,7 @@ def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_na
     old_lines = file_lines[first - 1:shape[1]]
     new_lines = old_lines if keep_stmts is None else reduced_lines(file_lines, shape, keep_stmts)
     if scaled:
-        new_lines = scale_lines(test_id, new_lines)
+        new_lines = scale_lines(test_id, new_lines, keep_stmts is not None)
         if new_lines is None:
             return False
     old_mod = engine.compile_lines(old_lines, first, (class_name,), full_path, flags, import_names)
