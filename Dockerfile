@@ -29,14 +29,27 @@ RUN python /tmp/fetch_sqlglot.py /repo b5e23dd1faff7c2a14ef374d02be8bab60c9343d6
 RUN python -m compileall -f -q -j 0 --invalidation-mode unchecked-hash /usr/local/lib/python3.13 /repo \
     && chmod -R a+rX /repo /usr/local/lib/python3.13
 
+# CPU settings for the run (see the selector notes): a fixed hash seed (the saved base state of
+# the import fingerprint depends on it) and mimalloc with transparent huge pages (cheaper fork,
+# exit and page faults; no effect where the host has THP off).
+ENV PYTHONHASHSEED=0 \
+    PYTHONMALLOC=mimalloc \
+    MIMALLOC_LARGE_OS_PAGES=1 \
+    MIMALLOC_RESERVE_OS_MEMORY=256MiB \
+    MIMALLOC_ARENA_EAGER_COMMIT=1 \
+    MIMALLOC_PURGE_DELAY=-1
+
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real
 #    setUpClass; if the check fails, the cache is removed and the selector runs setUpClass as before.
 COPY app /app
 RUN (python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
+    && mkdir -p /app/cache \
+    && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
+     || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app
 
 WORKDIR /repo
-CMD ["python", "/app/selector.py"]
+CMD ["python", "/app/main.py"]

@@ -310,10 +310,12 @@ def live_function(cls, method, old_code):
     return None
 
 
-def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled):
+def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled, pinned=None):
     """Replaces the code of a test method by its reduced and/or small-scale form.
 
-    keep_stmts: set of statement indices to keep, or None for all. Returns True on success."""
+    keep_stmts: set of statement indices to keep, or None for all. Returns True on success.
+    pinned: the pinned code object of the method, when its compile alone is known to give
+    an equal code object (the caller checks that): then it is not compiled again."""
     import engine
 
     _, class_name, method = test_id.split("::")
@@ -324,11 +326,16 @@ def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_na
         new_lines = scale_lines(test_id, new_lines, keep_stmts is not None)
         if new_lines is None:
             return False
-    old_mod = engine.compile_lines(old_lines, first, (class_name,), full_path, flags, import_names)
+    if pinned is not None:
+        old = pinned
+    else:
+        old_mod = engine.compile_lines(old_lines, first, (class_name,), full_path, flags, import_names)
+        if old_mod is None:
+            return False
+        old = find_code(old_mod, method, first)
     new_mod = engine.compile_lines(new_lines, first, (class_name,), full_path, flags, import_names)
-    if old_mod is None or new_mod is None:
+    if new_mod is None:
         return False
-    old = find_code(old_mod, method, first)
     new = find_code(new_mod, method, first)
     if old is None or new is None:
         return False

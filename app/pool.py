@@ -12,7 +12,14 @@ import pickle
 from concurrent.futures import Future
 
 from reduce import STATE
-from concurrent.futures.process import BrokenProcessPool
+
+def BrokenProcessPool(*args):  # noqa: N802
+    """concurrent.futures.process.BrokenProcessPool, imported when a pool breaks: that module
+    loads multiprocessing.connection and more (about 25 ms of CPU), which no test needs
+    otherwise."""
+    from concurrent.futures.process import BrokenProcessPool as cls
+
+    return cls(*args)
 
 _FINISHED = "FINISHED"
 

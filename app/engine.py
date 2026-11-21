@@ -362,16 +362,26 @@ class OverlayFinder:
         return self.files.get(rel + ".py", 1) is None or self.files.get(rel + "/__init__.py", 1) is None
 
 
+# True when the process keeps the module code objects that it loaded from pycs (selector.py
+# CODE_CACHE). Then this loader keeps its code object too: a constant that a module value
+# holds has one more reference either way, and marshal.dumps (statefp's fast path) writes
+# the same bytes for it (marshal marks objects with more than one reference).
+KEEP_CODE = False
+
+
 class _MemLoader:
     def __init__(self, path, text):
         self.path = path
         self.text = text
+        self.code = None
 
     def create_module(self, spec):
         return None
 
     def exec_module(self, module):
         code = compile(self.text, self.path, "exec", dont_inherit=True)
+        if KEEP_CODE:
+            self.code = code
         exec(code, module.__dict__)
 
     def get_source(self, name):

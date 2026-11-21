@@ -13,17 +13,41 @@ _PRIMITIVE = (str, int, float, bool, bytes, complex, type(None))
 _MARSHAL_OK = (dict, list, tuple, set, frozenset)
 
 
+_PRIM_NAME = {t: t.__name__ for t in _PRIMITIVE}
+
+
 class Fingerprinter:
-    def __init__(self, code_alias=None):
+    def __init__(self, code_alias=None, base_codes=None):
         self.memo = {}
         self.busy = set()
         self.code_memo = {}
+        self.code_objects = []  # every code object of code_memo, so that its id stays its own
         # code objects that count as equal to another one (a function whose body the patch changed)
         self.code_alias = code_alias or {}
+        # {id(code): hash} of another snapshot in this process (see base_codes()): a code
+        # object that it hashed gets the same hash here. Not when the alias maps one of those
+        # hashes to another: the hash of a code object holds the hashes of its nested ones.
+        self.base = None
+        if base_codes:
+            values = base_codes[1]
+            if not any(k != v and k in values for k, v in self.code_alias.items()):
+                self.base = base_codes[0]
+
+    def base_codes(self):
+        """What a later Fingerprinter needs to reuse the code hashes of this one (base_codes=).
+        Holds the code objects, so that their ids are not reused."""
+        return dict(self.code_memo), frozenset(self.code_memo.values()), list(self.code_objects)
 
     def code(self, c):
         h = self.code_memo.get(id(c))
+        if h is None and self.base is not None:
+            h = self.base.get(id(c))
+            if h is not None:
+                h = self.code_alias.get(h, h)
+                self.code_memo[id(c)] = h
+                return h
         if h is None:
+            self.code_objects.append(c)
             parts = [c.co_code, c.co_names, c.co_varnames, c.co_freevars, c.co_argcount, c.co_flags]
             for k in c.co_consts:
                 parts.append(self.code(k) if isinstance(k, types.CodeType) else (type(k).__name__, repr(k)))
@@ -34,8 +58,9 @@ class Fingerprinter:
 
     def fp(self, v, depth=0):
         t = type(v)
-        if t in _PRIMITIVE:
-            return (t.__name__, v)
+        n = _PRIM_NAME.get(t)
+        if n is not None:
+            return (n, v)
         key = id(v)
         got = self.memo.get(key)
         if got is not None:
@@ -57,17 +82,19 @@ class Fingerprinter:
     def _fp(self, v, t, depth):
         if t in _MARSHAL_OK:
             try:
-                return ("m", t.__name__, marshal.dumps(v))  # plain data: fast path
+                # plain data: fast path. Version 2 writes no object references, so the bytes
+                # do not depend on how many references an object happens to have
+                return ("m", t.__name__, marshal.dumps(v, 2))
             except ValueError:
                 pass
             if t is dict:
                 return self._dict(v, depth)
             if t is tuple and v and all(isinstance(x, type) for x in v):
                 # a tuple of classes (isinstance checks) is often made from a set: no order
-                return ("tc", frozenset(self.fp(x, depth + 1) for x in v))
+                return ("tc", frozenset(self._seq(v, depth + 1)))
             if t in (list, tuple):
-                return (t.__name__, tuple(self.fp(x, depth + 1) for x in v))
-            return ("s", frozenset(self.fp(x, depth + 1) for x in v))
+                return (t.__name__, tuple(self._seq(v, depth + 1)))
+            return ("s", frozenset(self._seq(v, depth + 1)))
         if isinstance(v, enum.Enum):
             return ("E", t.__module__, t.__qualname__, v.name, self.fp(v.value, depth + 1))
         if isinstance(v, type):
@@ -116,11 +143,51 @@ class Fingerprinter:
             return ("T", mod, t.__qualname__)
         return ("R", mod, t.__qualname__, text)
 
+    def _seq(self, v, d):
+        """[self.fp(x, d) for x in v], with the cheap cases (plain values, objects seen
+        before) inlined: the same values, computed in the same order."""
+        prim = _PRIM_NAME.get
+        memo = self.memo.get
+        fp = self.fp
+        out = []
+        add = out.append
+        for x in v:
+            n = prim(type(x))
+            if n is not None:
+                add((n, x))
+                continue
+            got = memo(id(x))
+            add(got if got is not None else fp(x, d))
+        return out
+
     def _dict(self, v, depth):
-        pairs = [(self.fp(k, depth + 1), self.fp(x, depth + 1)) for k, x in v.items()]
+        prim = _PRIM_NAME.get
+        memo = self.memo.get
+        fp = self.fp
+        d = depth + 1
+        pairs = []
+        add = pairs.append
+        classes = False
+        for k, x in v.items():
+            tk = type(k)
+            n = prim(tk)
+            if n is not None:
+                a = (n, k)
+            else:
+                if not classes and isinstance(k, type):
+                    classes = True
+                a = memo(id(k))
+                if a is None:
+                    a = fp(k, d)
+            n = prim(type(x))
+            if n is not None:
+                add((a, (n, x)))
+                continue
+            b = memo(id(x))
+            add((a, b if b is not None else fp(x, d)))
         # A dict keyed by classes is often filled from a set of classes, whose order follows
         # memory addresses and so differs from one import to the next: compare without order.
-        if any(isinstance(k, type) for k in v):
+        if classes:
             return ("d", frozenset(pairs))
         return ("d", tuple(pairs))
 
@@ -229,13 +296,13 @@ def class_paths():
     return paths
 
 
-def snapshot(code_alias=None):
+def snapshot(code_alias=None, base_codes=None):
     """{key: fingerprint} for the loaded sqlglot modules.
 
     Keys: ("G", module, name) for a module global, ("A", module, class, name) for a class attribute,
     ("O", module, class-or-global path, attribute, name) for the attributes of an object that
     such a key holds (one level down, so that a changed setting is named by its own attribute)."""
-    f = Fingerprinter(code_alias)
+    f = Fingerprinter(code_alias, base_codes)
     out = {}
     # the dict, set and frozenset values themselves, by key: keymap.py compares two of them
     # entry by entry when the patch changes one
