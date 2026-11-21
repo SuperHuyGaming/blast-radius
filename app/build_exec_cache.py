@@ -2,7 +2,8 @@
 
 usage: python build_exec_cache.py REPO OUT_DIR [--check]
 Runs the real TestExecutor.setUpClass of the pinned checkout and writes, for tpch and tpcds,
-OUT_DIR/exec_<which>.marshal = ({table: size of its csv.gz}, {table: rows}) in schema order.
+OUT_DIR/exec_<which>.marshal = ({table: size of its csv.gz}, {table: marshalled rows}) in schema
+order (the rows of each table are packed alone, so that one table can be unpacked alone).
 --check: also rebuilds every lazy attribute with preload.py (cache path) and compares it with
 what setUpClass made (Table columns, rows with exact types, view contents, fixture pairs)."""
 import marshal
@@ -34,7 +35,7 @@ def main():
     ):
         assert list(tables) == list(schema)
         sizes = {t: os.path.getsize(f"{directory}{t}.csv.gz") for t in schema}
-        rows = {t: tables[t].rows for t in schema}
+        rows = {t: marshal.dumps(tables[t].rows) for t in schema}
         path = os.path.join(out, "exec_%s.marshal" % which)
         with open(path + ".tmp", "wb") as f:
             marshal.dump((sizes, rows), f)

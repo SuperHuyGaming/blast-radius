@@ -110,6 +110,11 @@ MANY_FAILURES = 8  # with this many failing tests, a long test on the same code 
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
+# One child serves all the commits of the batch that change nothing but entries of .sql fixture
+# files (see fixture_only in run() and fixture_batch_child); BR_NO_FIXTURE_BATCH=1 gives each of
+# them its own child again (validation: the answers must be the same).
+FIXTURE_BATCH = os.environ.get("BR_NO_FIXTURE_BATCH") != "1"
+FIXTURE_BATCH_MIN = 3  # commits: the checks of the shared child cost about as much as one fork
 WALL_LIMIT = float(os.environ.get("BR_WALL", "150"))  # the batch must end well inside 3 minutes
 
 
@@ -1791,10 +1796,16 @@ def run_tokcheck(numbers, wfd):
         os.write(wfd, b"M %d\n" % n)
 
 
-def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=None):
-    import runner
-
-    settings = [None, False]  # settings before the first test; a change was reported
+def child_reporters(wfd):
+    """The two functions through which a child reports its test runs to the parent, and the
+    state that they keep. Returns (emit, started, settings, watches, begin):
+    emit(number, failed) writes the verdict line of a test (and the "G", "W" and "P" lines);
+    started(number) writes the "S" line and gives the first test the dialect registry of a full
+    run; settings = [interpreter settings before the first test, a change was reported, a
+    class's shared pool died]; watches = the shared containers to watch (plan.watch);
+    begin() makes the next test count as the first test of a child again (a child that serves
+    several commits calls it before each of them, see fixture_batch_child)."""
+    settings = [None, False, False]
     watches = []  # shared containers that the patched code may leave changed (plan.watch)
 
     last = [time.process_time()]
@@ -1820,10 +1831,17 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             # the class's shared process pool died in this test: in a full run every later
             # test of the class that uses the pool fails
             pool_module.InlinePool.broke_any = False
+            settings[2] = True
             os.write(wfd, b"P %d\n" % number)
 
     cleared = [False]
     started_once = []
+
+    def begin():
+        settings[0], settings[1], settings[2] = None, False, False
+        cleared[0] = False
+        del started_once[:]
+        last[0] = time.process_time()
 
     def started(number):
         if REGISTRY_START is not None and not started_once:
@@ -1847,6 +1865,14 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 pass
         os.write(wfd, b"S %d\n" % number)
 
+    return emit, started, settings, watches, begin
+
+
+def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=None):
+    import runner
+
+    emit, started, settings, watches, _ = child_reporters(wfd)
+
     try:
         if ANSWER_FD is not None:
             os.close(ANSWER_FD)
@@ -1864,6 +1890,12 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             faulthandler.dump_traceback_later(float(os.environ["BR_FAULT"]), file=sys.stderr)
         t_child = time.process_time()
         py_files = {p: t for p, t in plan.files.items() if p.endswith(".py")}
+        if any(not (p.startswith("sqlglot/") or (p.startswith("tests/fixtures/") and p.endswith(".sql")))
+               for p in plan.files):
+            # the commit changes test code or data: no on-demand table dicts (preload._LazyTables)
+            import preload as _preload
+
+            _preload.exec_tables_strict()
         if plan.mode in ("fresh", "fresh_purge", "fresh_cone"):
             post_path = None
             if PRE_PATH is not None:
@@ -2071,6 +2103,364 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             pass
     finally:
         os._exit(0)
+
+
+_MISSING = object()
+# Class attributes that every run of tests changes: unittest's own bookkeeping (the class
+# cleanups run when the class's tests end, and leave the list of their errors) and the copy
+# that refresh_class_fixtures keeps.
+_ROUTINE_CLASS_STATE = frozenset(("_classSetupFailed", "_class_cleanups", "tearDown_exceptions", "_br_parent_state"))
+_ROUTINE_POOL_STATE = frozenset(("_started", "_shutdown"))  # pool.InlinePool: a task ran; the class cleanup shut it down
+
+
+def _same_items(a, b):
+    """True when two lists, dicts or sets hold the same objects."""
+    if type(a) is not type(b) or len(a) != len(b):
+        return False
+    if type(a) is list:
+        return all(x is y for x, y in zip(a, b))
+    if type(a) is dict:
+        return all(b.get(k, _MISSING) is v for k, v in a.items())
+    return a == b
+
+
+def _same_value(a, b):
+    return a is b or (type(a) is type(b) and type(a) in _PRIMITIVE and a == b)
+
+
+def picture_of_tests(test_ids):
+    """For a child that serves several commits: what the classes and modules of these tests
+    hold now. Classes (each test class and its bases below unittest.TestCase): every class
+    attribute, the items of the lists, dicts and sets among them, and the flags of a process
+    pool stand-in (pool.py). Modules (the test modules, tests.helpers, the sqlglot package):
+    every global. None when a class is not loaded."""
+    import pool as pool_module
+
+    classes, modules = [], []
+    seen = set()
+    keys = sorted({(tid.split("::")[0][:-3].replace("/", "."), tid.split("::")[1]) for tid in test_ids})
+    for mod_name in [m for m, _ in keys] + ["tests.helpers", "sqlglot"]:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            return None
+        if id(mod) not in seen:
+            seen.add(id(mod))
+            modules.append((mod, dict(vars(mod))))
+    for mod_name, cls_name in keys:
+        cls = getattr(sys.modules[mod_name], cls_name, None)
+        if not isinstance(cls, type):
+            return None
+        for c in cls.__mro__:
+            if c is object or c.__module__.partition(".")[0] == "unittest" or id(c) in seen:
+                continue
+            seen.add(id(c))
+            attrs = dict(vars(c))
+            items = {}
+            for k, v in attrs.items():
+                if type(v) in (list, dict, set):
+                    items[k] = type(v)(v)
+                elif isinstance(v, pool_module.InlinePool):
+                    items[k] = dict(vars(v))
+            classes.append((c, attrs, items))
+    return classes, modules
+
+
+def restore_tests(picture, graveyard):
+    """Puts the classes back as picture_of_tests saw them, and compares the modules. Returns
+    the names of what differed, without the class state that every run changes (see
+    _ROUTINE_CLASS_STATE): an empty list means that the tests left these classes and modules
+    as a new child would find them. Objects that leave a class go to 'graveyard', so that no
+    finalizer runs here (a database connection, for instance)."""
+    classes, modules = picture
+    odd = []
+    for c, attrs, items in classes:
+        now = vars(c)
+        for k in [k for k in now if k not in attrs]:
+            graveyard.append(now[k])
+            delattr(c, k)
+            if k not in _ROUTINE_CLASS_STATE:
+                odd.append("%s.%s" % (c.__name__, k))
+        for k, v in attrs.items():
+            cur = now.get(k, _MISSING)
+            if cur is not v:
+                graveyard.append(cur)
+                setattr(c, k, v)
+                if k not in _ROUTINE_CLASS_STATE:
+                    odd.append("%s.%s" % (c.__name__, k))
+        for k, copy in items.items():
+            v = attrs[k]
+            if type(v) in (list, dict, set):
+                if not _same_items(v, copy):
+                    graveyard.append(type(v)(v))
+                    v.clear()
+                    (v.extend if type(v) is list else v.update)(copy)
+                    if k not in _ROUTINE_CLASS_STATE:
+                        odd.append("%s.%s items" % (c.__name__, k))
+            else:  # the process pool stand-in of the class
+                flags = vars(v)
+                if not _same_items(flags, copy):
+                    if any(not _same_value(flags.get(f, _MISSING), copy.get(f, _MISSING))
+                           for f in set(flags) | set(copy) if f not in _ROUTINE_POOL_STATE):
+                        odd.append("%s.%s pool" % (c.__name__, k))
+                    flags.clear()
+                    flags.update(copy)
+    for m, globs in modules:
+        now = vars(m)
+        if len(now) != len(globs) or any(not _same_value(now.get(k, _MISSING), v) for k, v in globs.items()):
+            odd.append("globals of %s" % m.__name__)
+    return odd
+
+
+def fixture_batch_child(batch, tests, wfd):
+    """Child side of run_fixture_batch_child. batch: [(plan, tests to run, skip_after_fail)] of
+    commits that change nothing but entries of .sql fixture files: their tests run on the
+    pinned code, each test reduced to the changed entries of the commit's file. This child
+    serves them one after the other, each as child_main does for such a commit (same steps
+    in the same order, same options of the test runs), between "C i" and "E i" lines.
+
+    After the tests of a commit, everything that the steps or the tests changed is put back:
+    open() and os.listdir, the reduce state, the code of the reduced test methods, the dialect
+    registry (each commit starts with the registry that this process had at its fork, as its
+    own child would), and the attributes of the test classes (class fixture lists, the class
+    cleanups that unittest ran, the flags of the class's pool). Then the checks: the
+    interpreter settings are the ones before the first commit, the test classes and modules
+    hold what they held (but for the state named above), no thread or module stand-in changed,
+    no pool died, no class setup failed. When a check fails, or the commit cannot be compared
+    entry by entry ("N i"), the commit gets no "E i": the parent gives it a child of its own.
+    A failed check ("X i") also ends this child, so the commits after it get their own child
+    too. At the end, the picture of the shared state of sqlglot and the test modules
+    (_shared_marks) must equal the one before the first commit ("Z ok"); the parent uses the
+    results of this child only then."""
+    import builtins
+    import io
+    import threading
+    import warnings
+
+    import runner
+
+    emit, started, settings, watches, begin = child_reporters(wfd)
+    try:
+        if ANSWER_FD is not None:
+            os.close(ANSWER_FD)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        if not DEBUG:
+            os.dup2(devnull, 2)
+        if DEBUG:
+            import faulthandler
+
+            faulthandler.enable(file=sys.stderr)
+        import preload
+        import reduce
+
+        t_child = time.process_time()
+        picture = picture_of_tests({tests[n]["id"] for _, order, _ in batch for n in order})
+        dialect = sys.modules.get("sqlglot.dialects.dialect")
+        if picture is None or dialect is None or not reduce.install_loaders():
+            raise RuntimeError("fixture batch: tests or loaders are not as expected")
+        registry = dialect.Dialect._classes
+        registry_start = dict(registry)
+        marks = _shared_marks()
+        io_names = (builtins.open, io.open, io.open_code, os.listdir)
+        filters = list(warnings.filters)
+        threads = threading.active_count()
+        pinned = None  # the interpreter settings before the tests of the first commit
+        graveyard = []
+        for i, (plan, order, skip_after_fail) in enumerate(batch):
+            os.write(wfd, b"C %d\n" % i)
+            odd = []
+            ran = False
+            reduce.SWAPPED = swapped = []
+            stand_ins = None
+            try:
+                read_old = engine.install_open_overlay(ROOT, plan.files)
+                patchrules.install_listing_overlay(ROOT, plan.files)
+                # the parent built the shared class fixtures from the pinned files
+                comparable = not any(failed for _, failed in preload.refresh_class_fixtures(ROOT, plan.files))
+                # an unchanged fixture entry that does not run changed code cannot change a result
+                changed = {}
+                for rel in plan.files:
+                    got = reduce.changed_entries(rel[len("tests/fixtures/"):], read_old)
+                    if not got:
+                        comparable = False  # not readable as entries: whole tests, in its own child
+                    changed.update(got)
+                if comparable:
+                    reduce.STATE.keep_changed = changed
+                    reduce.STATE.changed_only = True
+                    preload.reduce_class_fixtures(changed)
+                    keeps = None
+                    if plan.keeps and not NO_REDUCE:
+                        keeps = apply_keeps(plan, MAPS_OBJ, tests)
+                    if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
+                        import lazymods
+
+                        lazymods.load()  # before the settings snapshot below: as in the parent
+                    stand_ins = [type(sys.modules.get(name)) for name in ("numpy", "pandas", "pandas.testing")]
+                    begin()
+                    now = _interpreter_settings()
+                    if pinned is None:
+                        pinned = now
+                    if now != pinned:
+                        odd.append("settings before the tests")
+                    else:
+                        settings[0] = now
+                        result = runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started,
+                                                  skip_after_fail, plan.enders)
+                        ran = True
+                        if settings[1]:
+                            odd.append("settings changed in a test")
+                        if settings[2]:
+                            odd.append("pool died")
+                        if result.class_errors:
+                            odd.append("class setup failed")
+                        if runner._FAILED_IMPORTS:
+                            odd.append("test module not imported")
+            finally:
+                # back to the state in which a new child would start
+                reduce.STATE.keep_changed = None
+                reduce.STATE.changed_only = False
+                reduce.STATE.in_test = False
+                reduce.STATE.reset()
+                for f, code in reversed(swapped):
+                    f.__code__ = code
+                reduce.SWAPPED = None
+                builtins.open, io.open, io.open_code, os.listdir = io_names
+            if dialect.Dialect._classes is not registry:
+                odd.append("dialect registry replaced")
+            registry.clear()
+            registry.update(registry_start)
+            odd.extend(restore_tests(picture, graveyard))
+            if pinned is not None and _interpreter_settings() != pinned:
+                odd.append("settings after the tests")
+            if stand_ins is not None and stand_ins != [type(sys.modules.get(name)) for name in ("numpy", "pandas", "pandas.testing")]:
+                odd.append("numpy or pandas loaded in a test")
+            if threading.active_count() != threads:
+                odd.append("threads")
+            if len(warnings.filters) != len(filters) or any(a is not b for a, b in zip(warnings.filters, filters)):
+                odd.append("warning filters")
+            if odd:
+                os.write(wfd, ("X %d %s\n" % (i, "; ".join(odd)[:300])).encode())
+                break
+            os.write(wfd, b"%s %d\n" % (b"E" if ran else b"N", i))
+        os.write(wfd, b"Z ok\n" if _shared_marks() == marks else b"Z bad\n")
+        if DEBUG:
+            sys.stderr.write("fixture batch child: %d commits, cpu %.3f\n" % (len(batch), time.process_time() - t_child))
+        os.write(wfd, b"END\n")
+    except BaseException as e:  # noqa: BLE001
+        try:
+            os.write(wfd, ("ERR %r\n" % (e,)).encode()[:400])
+        except OSError:
+            pass
+    finally:
+        os._exit(0)
+
+
+def run_fixture_batch_child(batch, tests, time_left):
+    """Runs the tests of several fixture-only commits in one forked child (fixture_batch_child).
+    batch: [(plan, tests to run, allowed seconds per test, skip_after_fail, cap)], as run_child
+    takes them for one commit. Returns {position in batch: (verdicts, tests not run after a
+    failure, CPU seconds per test)} for the commits whose runs ended with every check passed.
+    Empty when the child did not end by itself with its last check passed (a test that hangs,
+    runs past the limits of run_child, or kills the process; shared state that differs at the
+    end): every commit then runs in its own child, as without this function."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
+        fixture_batch_child([(plan, order, skip) for plan, order, _, skip, _ in batch], tests, w)
+        os._exit(0)
+    os.close(w)
+    done = {}
+    record = None  # (verdicts, skipped, times) of the commit whose tests run now
+    status = "DIED"
+    confirmed = False
+    buf = b""
+    t_end = time.monotonic() + time_left
+    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN  # time for the child's own setup
+    allowed, cap, t_cap = {}, None, None
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= t_end or now >= t_test or (t_cap is not None and now >= t_cap):
+                status = "TIMEOUT"
+                break
+            ready, _, _ = select.select([r], [], [], max(0.01, min(t_end, t_test, t_cap or t_end) - now))
+            if not ready:
+                continue
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                if line == b"END":
+                    status = "END"
+                elif line.startswith(b"ERR"):
+                    status = "ERR"
+                    log("fixture batch", line.decode(errors="replace"))
+                elif line.startswith(b"C "):
+                    # the next commit: the limits of its own tests, as in run_child
+                    cur = int(line[2:])
+                    record = ({}, set(), {})
+                    allowed, cap, t_cap = batch[cur][2], batch[cur][4], None
+                    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
+                elif line.startswith(b"E "):
+                    if record is not None:
+                        done[int(line[2:])] = record
+                    record, t_cap = None, None
+                    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
+                elif line.startswith(b"N "):
+                    record, t_cap = None, None
+                    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
+                elif line.startswith(b"X "):
+                    record, t_cap = None, None
+                    log("fixture batch ends:", batch[int(line.split()[1])][0].commit, line.decode(errors="replace"))
+                    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
+                elif line.startswith(b"Z "):
+                    confirmed = line == b"Z ok"
+                elif line.startswith(b"S "):
+                    if t_cap is None and cap is not None:
+                        t_cap = time.monotonic() + cap
+                    t_test = time.monotonic() + allowed.get(int(line[2:]), 30.0)
+                elif line[:1].isalpha():
+                    # "G", "P" (the child ends the batch itself) or a line that such a commit
+                    # never writes: no result for this commit
+                    record = None
+                else:
+                    parts = line.split()
+                    if record is not None:
+                        if parts[1] == b"2":
+                            record[1].add(int(parts[0]))
+                        else:
+                            record[0][int(parts[0])] = parts[1] == b"1"
+                        if len(parts) > 2:
+                            record[2][int(parts[0])] = int(parts[2]) / 1e6
+                    t_test = time.monotonic() + 30.0
+    finally:
+        # as in run_child: the child must not run on, and no zombie may stay
+        os.close(r)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0] > 0:
+                pass
+        except ChildProcessError:
+            pass
+    if status != "END" or not confirmed:
+        log("fixture batch: no result (status %s, last check %s), %d commits run one by one" % (status, confirmed, len(batch)))
+        return {}
+    return done
 
 
 def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(), on_diff=None, cap=None):
@@ -2900,61 +3290,67 @@ def run(t_start, deadline, state):
                 elif not (fixtures_of(n) & changed) - hit:
                     plan.cands.discard(n)
 
+    def prepare_plan(plan):
+        """What the child of this commit runs: (tests to run, held tests, seconds allowed per
+        test, tests that do not run after a failure, cap on the seconds of all runs)."""
+        ran, held, cost = choose(plan)
+        plan.tokcheck = []
+        if TOKCHECK and not RUN_ALL and TOKENIZER_FILES.intersection(plan.files):
+            import tokcheck
+
+            checkable = tokcheck.tests_of(MAPS)
+            plan.tokcheck = sorted(t for t in held if t in checkable and seconds[t] > QUIET_HOLD_SECONDS)
+            if plan.watch and plan.tokcheck:
+                # The check tokenizes in the child before the tests run, and patched
+                # tokenizer code could then write to a watched container before the first
+                # test: the watch would no longer show which test leaves it changed. With
+                # a watch, the check does not run and its tests count as changed.
+                plan.must.update(plan.tokcheck)
+                plan.note.append("watch: token stream check not run, %s selected" % plan.tokcheck)
+                plan.tokcheck = []
+        allowed = {n: max(TEST_TIMEOUT, 25.0 * cost[n]) * SLOWDOWN for n in ran}
+        # Once a test has failed, the commit is known to break something. A further
+        # verdict then only saves the recorded seconds of a passing test, so only runs
+        # that are cheap next to those seconds go on; the others are selected as they are.
+        skip = set() if RUN_ALL or plan.watch else {
+            n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
+        }
+        # A failing test of the class (or fixture) of a long held test selects that long
+        # test (see finish). When failures have selected every long held test, and the
+        # longest of them is longer than all tests that run together, the tests that are
+        # still to run fit beside it on one more worker, which costs 2 s at most. So when
+        # the runs that are left cost more CPU than that, they end there and the tests
+        # are selected as they are. The answer then holds every candidate without a pass.
+        plan.enders = {}
+        long_held = [t for t in held if seconds[t] > QUIET_HOLD_SECONDS]
+        if long_held and not RUN_ALL and not plan.watch and max(seconds[t] for t in long_held) >= sum(seconds[n] for n in ran):
+            plan.enders["held"] = set(long_held)
+            left_cost = sum(cost[n] for n in ran)
+            for n in ran:
+                left_cost -= cost[n]
+                n_class, n_fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
+                decides = {
+                    t for t in long_held
+                    if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & fixtures_of(t)
+                }
+                if decides:
+                    plan.enders[n] = (decides, left_cost > WORKER_COST)
+        # A guard against runs that cost many times their estimate (a patch that makes every
+        # test slow without hanging): past the cap, the tests without a verdict are selected.
+        # The longest per-test limit is added, so that one hung test still counts as a failure.
+        cap = None
+        if ran and not RUN_ALL:
+            cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
+        return ran, held, allowed, skip, cap
+
     def execute(c, plan, index):
         box = {}
         if plan.mode == "hot" and not plan.work and not RUN_ALL:
             class_fixture_rule(plan)
 
         def prepare():
-            ran, held, cost = choose(plan)
+            ran, held, allowed, skip, cap = prepare_plan(plan)
             box["ran"], box["held"] = ran, held
-            plan.tokcheck = []
-            if TOKCHECK and not RUN_ALL and TOKENIZER_FILES.intersection(plan.files):
-                import tokcheck
-
-                checkable = tokcheck.tests_of(MAPS)
-                plan.tokcheck = sorted(t for t in held if t in checkable and seconds[t] > QUIET_HOLD_SECONDS)
-                if plan.watch and plan.tokcheck:
-                    # The check tokenizes in the child before the tests run, and patched
-                    # tokenizer code could then write to a watched container before the first
-                    # test: the watch would no longer show which test leaves it changed. With
-                    # a watch, the check does not run and its tests count as changed.
-                    plan.must.update(plan.tokcheck)
-                    plan.note.append("watch: token stream check not run, %s selected" % plan.tokcheck)
-                    plan.tokcheck = []
-            allowed = {n: max(TEST_TIMEOUT, 25.0 * cost[n]) * SLOWDOWN for n in ran}
-            # Once a test has failed, the commit is known to break something. A further
-            # verdict then only saves the recorded seconds of a passing test, so only runs
-            # that are cheap next to those seconds go on; the others are selected as they are.
-            skip = set() if RUN_ALL or plan.watch else {
-                n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
-            }
-            # A failing test of the class (or fixture) of a long held test selects that long
-            # test (see finish). When failures have selected every long held test, and the
-            # longest of them is longer than all tests that run together, the tests that are
-            # still to run fit beside it on one more worker, which costs 2 s at most. So when
-            # the runs that are left cost more CPU than that, they end there and the tests
-            # are selected as they are. The answer then holds every candidate without a pass.
-            plan.enders = {}
-            long_held = [t for t in held if seconds[t] > QUIET_HOLD_SECONDS]
-            if long_held and not RUN_ALL and not plan.watch and max(seconds[t] for t in long_held) >= sum(seconds[n] for n in ran):
-                plan.enders["held"] = set(long_held)
-                left_cost = sum(cost[n] for n in ran)
-                for n in ran:
-                    left_cost -= cost[n]
-                    n_class, n_fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
-                    decides = {
-                        t for t in long_held
-                        if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & fixtures_of(t)
-                    }
-                    if decides:
-                        plan.enders[n] = (decides, left_cost > WORKER_COST)
-            # A guard against runs that cost many times their estimate (a patch that makes every
-            # test slow without hanging): past the cap, the tests without a verdict are selected.
-            # The longest per-test limit is added, so that one hung test still counts as a failure.
-            cap = None
-            if ran and not RUN_ALL:
-                cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
             return ran, allowed, skip, cap
 
         left = deadline - time.monotonic()
@@ -3019,7 +3415,10 @@ def run(t_start, deadline, state):
                     if p.endswith(".py"):
                         plan.broken.append(p[:-3].replace("/", "."))
                 plan.note.append("import does not end")
-        ran, held = box["ran"], box["held"]
+        conclude(c, plan, verdicts, status, hung, box["ran"], box["held"], index)
+
+    def conclude(c, plan, verdicts, status, hung, ran, held, index):
+        """The answer of a commit from the verdicts that its child reported."""
         if status == "OVER":
             plan.note.append("over the time cap")
         # a test that does not end is a timeout in the full run; the tests after it run again
@@ -3188,8 +3587,7 @@ def run(t_start, deadline, state):
         import lazymods
 
         lazymods.load()
-        gc.collect()
-        gc.freeze()
+        gc.freeze()  # (no collection first: it would walk every object, and little is garbage)
 
     preimported = []
 
@@ -3251,12 +3649,105 @@ def run(t_start, deadline, state):
         # objects (the steps above may have frozen them: preimport_for_fresh, load_pandas_here)
         gc.unfreeze()
         index = engine.FunctionIndex(ROOT)
-        gc.collect()
-        gc.freeze()
+        gc.freeze()  # (no collection first: it would walk every object, and little is garbage)
     purge = bool(hot) or want_diff
+
+    # 2b. Commits that change nothing but entries of .sql fixture files need no patched code:
+    #     their tests run on the pinned code of this process, with the patched file text. One
+    #     child serves all of them, one after the other (fixture_batch_child), instead of one
+    #     fork each. The commits whose tests load numpy or pandas form a group of their own:
+    #     as today, their child runs after this process has loaded those libraries.
+    prepared = {}  # commit -> what prepare_plan gave
+
+    def fixture_only(c):
+        """True for a commit that the shared child can serve: only existing .sql files under
+        tests/fixtures/ change, none of them read by a shared class fixture; no code to
+        replace, no special handling of any kind (watch, added tests, blind selection, token
+        check, tests known to be needed); every candidate runs (none is held), none is a long
+        test, and none belongs to the class with the lazy fixture (TestExecutor: its tests
+        build class attributes at their first use and set module globals through a pool
+        initializer)."""
+        plan = plans[c]
+        if plan.mode != "hot" or plan.work or plan.watch or plan.added or plan.blind or plan.must or plan.all_fail:
+            return False
+        if plan.broken or plan.lines or plan.def_units or plan.fpairs or plan.gone or plan.infect_files or plan.sure_infected:
+            return False
+        if not plan.files or not plan.cands:
+            return False
+        for rel, text in plan.files.items():
+            if text is None or not rel.startswith("tests/fixtures/") or not rel.endswith(".sql"):
+                return False
+            if not os.path.isfile(os.path.join(ROOT, rel)):
+                return False
+        class_fixture_rule(plan)  # as execute() does first for such a commit
+        for info in shared_info:
+            if info is not None and (set(info[2]) | info[3]).intersection(plan.files):
+                return False
+        lazy_class = preload.EXEC_KEY[0].replace(".", "/") + ".py::" + preload.EXEC_KEY[1] + "::"
+        if any(seconds[n] > QUIET_HOLD_SECONDS or tests[n]["id"].startswith(lazy_class) for n in plan.cands):
+            return False
+        ran, held, allowed, skip, cap = prepare_plan(plan)
+        if not ran or held or plan.tokcheck or plan.enders or set(ran) != plan.cands:
+            return False
+        prepared[c] = (ran, held, allowed, skip, cap)
+        return True
+
+    def run_fixture_batch(members):
+        """One child for these commits. Returns the commits that got their answer; the others
+        (a check of the shared child failed) run in their own child, as before."""
+        left = deadline - time.monotonic()
+        if left < 20.0:
+            return set()
+        batch = [(plans[m],) + tuple(prepared[m][i] for i in (0, 2, 3, 4)) for m in members]
+        done = run_fixture_batch_child(batch, tests, left - 2.0)
+        answered = set()
+        for i, m in enumerate(members):
+            if i not in done:
+                continue
+            verdicts, skipped, times = done[i]
+            plan = plans[m]
+            plan.skipped.update(skipped)
+            plan.times.update(times)
+            try:
+                conclude(m, plan, verdicts, "END", None, prepared[m][0], prepared[m][1], index)
+                answered.add(m)
+                if DEBUG:
+                    debug_rows[m]["batch"] = len(members)
+            except Exception as e:  # noqa: BLE001  (its own child, and execute_safe, decide)
+                log(m, "fixture batch: no answer", repr(e))
+                plan.skipped.clear()
+                plan.times.clear()
+        log("fixture batch:", len(members), "commits,", len(answered), "answered")
+        return answered
+
+    groups = {}  # commit -> its tests load numpy or pandas
+    if FIXTURE_BATCH and not RUN_ALL and not NO_REDUCE and len(hot) >= FIXTURE_BATCH_MIN:
+        for c in hot:
+            try:
+                if fixture_only(c):
+                    groups[c] = needs_pandas(c)
+            except Exception as e:  # noqa: BLE001  (its own child, as before)
+                log(c, "fixture batch: not planned", repr(e))
+        log("fixture-only commits:", sum(1 for g in groups.values() if not g), "and", sum(1 for g in groups.values() if g), "with pandas")
+        for key in (False, True):
+            if sum(1 for g in groups.values() if g == key) < FIXTURE_BATCH_MIN:
+                groups = {c: g for c, g in groups.items() if g != key}
+    answered = set()
     for c in hot:
+        if c in answered:
+            continue
         if c == pandas_turn:
             load_pandas_here()
+        if c in groups:
+            members = [m for m in hot if groups.get(m) == groups[c]]
+            for m in members:
+                del groups[m]  # one try
+            try:
+                answered.update(run_fixture_batch(members))
+            except Exception as e:  # noqa: BLE001
+                log("fixture batch failed", repr(e))
+            if c in answered:
+                continue
         if execute_safe(c, plans[c], index) == "REDO":
             fresh.append(c)
             plan = plans[c]

@@ -163,7 +163,8 @@ def _exec_schema(mod, which):
 
 
 def _exec_cached_rows(mod, which):
-    """{table: rows} from the build-time cache, or None when there is no valid cache."""
+    """{table: marshalled rows} from the build-time cache, or None when there is no valid
+    cache. The rows of one table are unpacked only when that table is read (_LazyTables)."""
     import marshal
 
     path = os.path.join(EXEC_CACHE, "exec_%s.marshal" % which)
@@ -173,7 +174,7 @@ def _exec_cached_rows(mod, which):
     except (OSError, ValueError, EOFError, TypeError):
         return None
     schema, directory = _exec_schema(mod, which)
-    if list(data) != list(schema):
+    if list(data) != list(schema) or not all(type(v) is bytes for v in data.values()):
         return None
     for table in schema:
         try:
@@ -201,11 +202,18 @@ def _exec_build(cls, name):
             )
         return conn
     if name.endswith("_tables"):
+        import marshal
+
         cached = _exec_cached_rows(mod, which)
+        if cached is not None:
+            lazy = _LazyTables(schema, lambda table: mod.Table(columns=schema[table], rows=marshal.loads(cached[table])))
+            if EXEC_TABLES_STRICT:
+                lazy.load_all()
+                return dict(lazy)
+            return lazy
         tables = {}
         for table, columns in schema.items():
-            rows = cached[table] if cached is not None else exec_rows_from_csv(mod, f"{directory}{table}.csv.gz")
-            tables[table] = mod.Table(columns=columns, rows=rows)
+            tables[table] = mod.Table(columns=columns, rows=exec_rows_from_csv(mod, f"{directory}{table}.csv.gz"))
         return tables
     # tpch_sqls / tpcds_sqls: setUpClass loads every entry (no reduced run applies here)
     fixture = EXEC_SQL_FIXTURES[which]
@@ -221,6 +229,76 @@ def _exec_build(cls, name):
     finally:
         if STATE is not None:
             STATE.in_test = saved
+
+
+class _LazyTables(dict):
+    """The {table: Table} dict that TestExecutor.setUpClass builds, filled on demand.
+
+    The tests hand this dict to the worker pool, and a worker reads only the tables of the
+    query that it executes (tests/test_executor.py mp_execute: _tables[name]); the TPC-H
+    queries execute nothing, so none of its tables is read. A read of one table by its name
+    unpacks that table. Every other use of the dict (iteration, length, membership, get,
+    comparison, copy, pickle, changes) first unpacks all tables, in the order of setUpClass,
+    so it sees the same dict as before. A commit that changes anything but sqlglot code or
+    .sql fixtures gets the plain dict (exec_tables_strict)."""
+
+    __slots__ = ("_names", "_build", "_full")
+
+    def __init__(self, names, build):
+        super().__init__()
+        self._names = tuple(names)
+        self._build = build
+        self._full = False
+
+    def __missing__(self, key):
+        if self._full or key not in self._names:
+            raise KeyError(key)
+        value = self._build(key)
+        dict.__setitem__(self, key, value)
+        return value
+
+    def load_all(self):
+        if not self._full:
+            have = {k: dict.__getitem__(self, k) for k in dict.keys(self)}
+            dict.clear(self)
+            for name in self._names:  # the order of setUpClass
+                dict.__setitem__(self, name, have[name] if name in have else self._build(name))
+            self._full = True
+        return self
+
+    def _all(name):  # noqa: N805
+        plain = getattr(dict, name)
+
+        def method(self, *args, **kwargs):
+            self.load_all()
+            return plain(self, *args, **kwargs)
+
+        method.__name__ = name
+        return method
+
+    for _name in ("__iter__", "__len__", "__contains__", "__eq__", "__ne__", "__repr__", "__reversed__",
+                  "__or__", "__ror__", "__ior__", "__setitem__", "__delitem__", "__sizeof__",
+                  "keys", "values", "items", "get", "copy", "pop", "popitem", "setdefault", "update", "clear"):
+        locals()[_name] = _all(_name)
+    del _name, _all
+
+    def __reduce_ex__(self, protocol):
+        return (dict, (dict(self.load_all()),))
+
+
+EXEC_TABLES_STRICT = False  # the tables as a plain, complete dict (see exec_tables_strict)
+
+
+def exec_tables_strict():
+    """For a commit that changes more than sqlglot code and .sql fixtures (test code can then
+    use the tables in any way): the table dicts are plain and complete from the start."""
+    global EXEC_TABLES_STRICT
+    EXEC_TABLES_STRICT = True
+    cls = getattr(sys.modules.get(EXEC_KEY[0]), EXEC_KEY[1], None)
+    for name in ("tpch_tables", "tpcds_tables"):
+        value = None if cls is None else cls.__dict__.get(name)
+        if isinstance(value, _LazyTables):
+            setattr(cls, name, dict(value.load_all()))
 
 
 class _LazyClassAttr:

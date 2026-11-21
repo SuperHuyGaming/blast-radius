@@ -298,6 +298,12 @@ def scale_lines(test_id, lines, reduced=False):
     return out
 
 
+# A child that serves several commits one after the other (selector.fixture_batch_child) puts
+# a list here: apply_reduction then notes (function, the code it had) for each method that it
+# replaces, and the child puts that code back after the commit's tests.
+SWAPPED = None
+
+
 def live_function(cls, method, old_code):
     """The function object behind cls.method (under decorators), when it has the pinned code."""
     f = cls.__dict__.get(method)
@@ -342,5 +348,7 @@ def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_na
     func = live_function(cls, method, old)
     if func is None or len(old.co_freevars) != len(new.co_freevars):
         return False
+    if SWAPPED is not None:
+        SWAPPED.append((func, func.__code__))
     func.__code__ = new
     return True
