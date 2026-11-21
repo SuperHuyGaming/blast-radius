@@ -260,6 +260,31 @@ def is_docstring(stmt):
     return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
 
 
+def lambda_body_span(stmt, ln):
+    """(lo, hi) lines of the body of the innermost lambda inside stmt whose body holds
+    line ln; None if ln is not in a lambda body. A lambda body only runs when called."""
+    best = None
+    for n in ast.walk(stmt):
+        if isinstance(n, ast.Lambda):
+            b = n.body
+            if b.lineno <= ln <= b.end_lineno and (best is None or b.lineno >= best[0]):
+                best = (b.lineno, b.end_lineno)
+    return best
+
+
+def lambda_callers(m, path, lam, ln):
+    """Tests that called a lambda whose body spans lam, judged from its body lines that
+    ran only when called. ALL if the changed line ln itself also ran at import time."""
+    if m.line(path, ln) is ALL:
+        return ALL
+    acc: set[int] = set()
+    for l in range(lam[0], lam[1] + 1):
+        s = m.line(path, l)
+        if s is not ALL:
+            acc |= s
+    return acc
+
+
 def func_body_lines(node):
     """Line ranges of every function body inside node (or node itself if a function)."""
     out = []
@@ -508,6 +533,14 @@ class PyFile:
         if not in_func:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
                 return set()
+            lam = lambda_body_span(stmt, ln)
+            if lam is not None:
+                # Inside a lambda body: runs only when the lambda is called, which line
+                # coverage records. If those lines also ran at import time (lambda on the
+                # same line as other parts of the statement), fall back.
+                cov = lambda_callers(self.m, self.path, lam, ln)
+                if cov is not ALL:
+                    return cov
             return self.import_level(stmt, True)
         lo, hi = header_span(stmt) if is_header else (stmt.lineno, stmt.end_lineno)
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_header:
@@ -527,6 +560,26 @@ class PyFile:
         if not in_func:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
                 return set()
+            if lambda_body_span(stmt, new_ln) is not None:
+                # Added inside a lambda body: judge by the pinned neighbours, which must
+                # themselves be lambda-body lines with known callers.
+                acc: set[int] = set()
+                ok = True
+                for a in (old_anchor - 1, old_anchor):
+                    if not (1 <= a <= len(self.old_lines)) or is_blank_or_comment(self.old_lines[a - 1]):
+                        continue
+                    ra = locate(self.old_tree, a)
+                    lam = lambda_body_span(ra[0], a) if ra is not None and not ra[1] else None
+                    if lam is None:
+                        ok = False
+                        break
+                    cov = lambda_callers(self.m, self.path, lam, a)
+                    if cov is ALL:
+                        ok = False
+                        break
+                    acc |= cov
+                if ok:
+                    return acc
             return self.import_level(stmt, False)
         # Inside a function: runs when its neighbours on the pinned commit ran.
         acc: set[int] = set()
