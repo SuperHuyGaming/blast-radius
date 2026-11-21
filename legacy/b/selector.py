@@ -70,6 +70,55 @@ class Map:
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
         self.test_index = {t: i for i, t in enumerate(self.tests)}
+        self.pool_ast_pos: dict[int, int] = {}
+        for g in self.pool_groups:
+            files_classes: dict[str, dict[str, list[tuple[str, int]]]] = {}
+            for t_idx in g:
+                parts = self.tests[t_idx].split("::")
+                if len(parts) == 3:
+                    fpath, cname, mname = parts
+                    files_classes.setdefault(fpath, {}).setdefault(cname, []).append((mname, t_idx))
+            for fpath, classes in files_classes.items():
+                f_src = SRC / fpath
+                if not f_src.is_file():
+                    continue
+                try:
+                    tree = ast.parse(f_src.read_text(encoding="utf-8"))
+                    for node in tree.body:
+                        if isinstance(node, ast.ClassDef) and node.name in classes:
+                            ast_order = {}
+                            pos = 0
+                            for item in node.body:
+                                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
+                                    ast_order[item.name] = pos
+                                    pos += 1
+                            for mname, t_idx in classes[node.name]:
+                                if mname in ast_order:
+                                    self.pool_ast_pos[t_idx] = ast_order[mname]
+                except Exception as e:  # noqa: BLE001
+                    log(f"error parsing {fpath} for pool AST order: {e!r}")
+
+        self.generator_slots_span = (925, 948)
+        self.generator_init_span = (950, 1010)
+        gen_file = SRC / "sqlglot/generator.py"
+        if gen_file.is_file():
+            try:
+                slots_s = slots_e = init_s = init_e = None
+                for i, line in enumerate(gen_file.read_text(encoding="utf-8").splitlines(), 1):
+                    if line.startswith("    __slots__ = ("):
+                        slots_s = i
+                    elif slots_s and slots_e is None and line.strip().endswith(")"):
+                        slots_e = i
+                    elif line.startswith("    def __init__("):
+                        init_s = i
+                    elif init_s and init_e is None and line.startswith("    def "):
+                        init_e = i - 1
+                if slots_s and slots_e:
+                    self.generator_slots_span = (slots_s, slots_e)
+                if init_s and init_e:
+                    self.generator_init_span = (init_s, init_e)
+            except Exception as e:  # noqa: BLE001
+                log(f"error scanning generator.py spans: {e!r}")
 
     def set_of(self, sid):
         return ALL if sid == -1 else set(self.sets[sid])
@@ -865,18 +914,15 @@ def select(m: Map, patch_text: str):
             return ALL
     # 1. Scoped & order-aware process pool guard (Approach A):
     # ProcessPool crashes only occur when changing optimizer or expressions core logic.
-    # In pytest, TestOptimizer tests execute in definition order. A crash only breaks
-    # tests running after the crashing test. test_tpcds (2.23s) never crashes a worker.
+    # In pytest, TestOptimizer tests execute in AST definition order. A crash only breaks
+    # tests running at or after the crashing test in sequential AST execution order.
     opt_expr_change = any((f.get("new") or f.get("old") or "").startswith(("sqlglot/optimizer/", "sqlglot/expressions/")) for f in files)
     if opt_expr_change:
         for g in m.pool_groups:
             inter = acc & g
             if inter:
-                min_n = min(inter)
-                after = {n for n in g if n >= min_n}
-                tpcds_idx = m.test_index.get("tests/test_optimizer.py::TestOptimizer::test_tpcds")
-                if tpcds_idx is not None and tpcds_idx not in acc:
-                    after.discard(tpcds_idx)
+                min_pos = min(m.pool_ast_pos.get(n, n) for n in inter)
+                after = {n for n in g if m.pool_ast_pos.get(n, n) >= min_pos}
                 acc |= after
 
     # 2. Disjoint oracle dialect scoping for test_execute_tpcds (Approach A):
@@ -906,9 +952,16 @@ def select(m: Map, patch_text: str):
                     hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
                     if any("__slots__" in l or "def __init__" in l for l in hunk_lines):
                         return True
-                elif path.startswith("sqlglot/dialects/"):
+                    for old_start, _, lns in f.get("hunks", []):
+                        old_len = sum(1 for tag, _ in lns if tag in (" ", "-"))
+                        old_end = old_start + max(old_len - 1, 0)
+                        if m.generator_slots_span and not (old_end < m.generator_slots_span[0] or old_start > m.generator_slots_span[1]):
+                            return True
+                        if m.generator_init_span and not (old_end < m.generator_init_span[0] or old_start > m.generator_init_span[1]):
+                            return True
+                elif path.startswith(("sqlglot/dialects/", "sqlglot/generators/")):
                     hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
-                    if any("class Generator" in l or "generator =" in l or "def __init__" in l for l in hunk_lines):
+                    if any("Generator" in l or "generator =" in l or "def __init__" in l or "__slots__" in l for l in hunk_lines):
                         return True
             return False
 
