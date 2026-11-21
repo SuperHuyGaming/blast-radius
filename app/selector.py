@@ -25,6 +25,11 @@ sys.path.insert(0, HERE)
 import engine  # noqa: E402
 import patchrules  # noqa: E402
 
+try:
+    import keymap  # noqa: E402  (key read map of the table constants; optional)
+except ImportError:
+    keymap = None
+
 ROOT = os.environ.get("BR_ROOT", "/repo")
 DATA = os.environ.get("BR_DATA", "/data")
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "maps"))
@@ -37,11 +42,14 @@ ANSWER_FD = None
 BASE_STATE = None
 SMALL_PLAN = float(os.environ.get("BR_SMALL_PLAN", "0.2"))  # CPU s; see small_plan in run()
 BASE_FUNCTION_KEYS = frozenset()
+BASE_OBJECTS = {}  # statefp key -> the pinned table (dict, set, frozenset) that it held at the snapshot
 REGISTRY_CLEAR_AT = None  # first test after tests/test_dialect_entry_points.py (see registry_clear_at)
+REGISTRY_START = None  # dialect names registered when a full run starts (build_registry_start.py)
 NO_DIFF = os.environ.get("BR_NO_DIFF")  # validation: no import-state diff
 CLASS_FILTER = os.environ.get("BR_CLASS_FILTER") == "1"  # off: the instantiation trace does not see every reader
 FRESH_REDUCE = os.environ.get("BR_FRESH_REDUCE", "1") == "1"
 NO_CLASSMAP = os.environ.get("BR_NO_CLASSMAP") == "1"  # validation: no cut by the class attribute map
+NO_KEYMAP = os.environ.get("BR_NO_KEYMAP") == "1" or keymap is None  # validation: no key map cut (keymap.py)
 
 WORKER_COST = 2.0
 HOLD_SECONDS = float(os.environ.get("BR_HOLD", "1.5"))  # test runs below this CPU cost always start
@@ -53,9 +61,7 @@ INERT_SECONDS = 1.0  # the same when the import state did not change at all
 # the candidates of the class.
 CLASS_SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0} if os.environ.get("BR_CLASS_SETUP", "1") == "1" else {}
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
-QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "2.0"))
-UNSEEN_CLASS = 10  # more tests of one class without a verdict than this: the class is not verified
-UNSEEN_HOLD_SECONDS = 5.0  # in a class that is not verified, held tests up to this length are selected
+QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
@@ -811,8 +817,21 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             os.write(wfd, b"P %d\n" % number)
 
     cleared = [False]
+    started_once = []
 
     def started(number):
+        if REGISTRY_START is not None and not started_once:
+            # The full run starts with the dialects that importing the test files registers
+            # (maps/registry_start.json); the others are registered by the first test that
+            # looks them up. This process registered all of them at start-up.
+            started_once.append(True)
+            try:
+                dialect = sys.modules["sqlglot.dialects.dialect"]
+                classes = dialect.Dialect._classes
+                for key in [k for k in classes if k in dialect.DIALECT_MODULE_NAMES and k not in REGISTRY_START]:
+                    del classes[key]
+            except Exception:  # noqa: BLE001  (sqlglot does not import: the tests report that)
+                pass
         if not cleared[0] and REGISTRY_CLEAR_AT is not None and number >= REGISTRY_CLEAR_AT:
             # the full run reaches this test with an empty dialect registry (see registry_clear_at)
             cleared[0] = True
@@ -890,7 +909,14 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 if len(changed) > 300:
                     os.write(wfd, b"D many\n")
                 else:
-                    rows = [[list(k), k in fpr.function_keys or k in BASE_FUNCTION_KEYS] for k in changed]
+                    entries = {}
+                    if not NO_KEYMAP:
+                        try:  # the changed entries of the changed tables (keymap.py)
+                            entries = keymap.diff_rows(changed, BASE_OBJECTS, BASE_STATE, fpr.objects, fpr,
+                                                       statefp.Fingerprinter)
+                        except Exception:  # noqa: BLE001
+                            entries = {}
+                    rows = [[list(k), k in fpr.function_keys or k in BASE_FUNCTION_KEYS, entries.get(k)] for k in changed]
                     os.write(wfd, b"D " + json.dumps(rows).encode() + b"\n")
                 import_all_tests()
                 chunks = []
@@ -1102,7 +1128,7 @@ def classmap_readers(keys, maps: Maps):
     classes = cm["classes"]
     out = set(cm["unknown"])  # tests whose reads are not known
     receivers = None
-    for key, is_function in keys:
+    for key, is_function in (row[:2] for row in keys):
         if is_function:
             return None
         if key[0] == "A" and len(key) == 4:
@@ -1175,7 +1201,8 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
     names = set()
     whole = bool(plan.gone)  # a removed name can fail any line that mentions it
     owners = set()
-    for key, is_function in keys:
+    for row in keys:
+        key, is_function = row[0], row[1]
         owners.add("%s.%s" % (key[1], key[2]) if key[0] == "A" else None)
         name = key[-1]
         if name == "__bases__" or not isinstance(name, str):
@@ -1197,6 +1224,14 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
             before = len(plan.cands)
             plan.cands &= readers | plan.data_cands
             plan.note.append("class map: %d -> %d" % (before, len(plan.cands)))
+    if not whole and not NO_KEYMAP:
+        # Only entries of traced tables changed: a candidate that looked up none of them and
+        # never used one of those tables as a whole gets the same answers (keymap.py).
+        readers = keymap.cut(plan, keys, MAPS, ROOT)
+        if readers is not None:
+            before = len(plan.cands)
+            plan.cands &= readers | plan.data_cands
+            plan.note.append("key map: %d -> %d" % (before, len(plan.cands)))
     if not keys and not plan.fpairs:
         # Nothing that the import leaves behind differs. The edit very likely does nothing;
         # the cheapest candidates still run as a check, and nothing is selected unrun.
@@ -1362,7 +1397,12 @@ def run(t_start, deadline, state):
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     state["tests"] = tests
     state["commits"] = commits
-    global MAPS_OBJ, REGISTRY_CLEAR_AT
+    global MAPS_OBJ, REGISTRY_CLEAR_AT, REGISTRY_START
+    try:
+        with open(os.path.join(MAPS, "registry_start.json")) as f:
+            REGISTRY_START = frozenset(json.load(f))
+    except (OSError, ValueError):
+        REGISTRY_START = None
     maps = MAPS_OBJ = Maps(MAPS)
     REGISTRY_CLEAR_AT = registry_clear_at([t["id"] for t in tests])
     all_tests = list(range(len(tests)))
@@ -1418,10 +1458,8 @@ def run(t_start, deadline, state):
         if plan.all_fail:
             selected = set(all_tests)
         # Tests that were too costly to run have no verdict. They are selected, with one
-        # exception: when the cheaper tests on the same code all ran and all passed, a very
-        # long test is left out (its selection would cost more than the small risk).
-        # tests that the commit breaks. A very long test (the TPC-DS run) is left out unless a
-        # failing test is close to it: same test class, or same fixture file.
+        # exception: a very long test (the TPC-DS run, for instance) is left out unless a
+        # failing test is close to it (same test class, or same fixture file) or many tests fail.
         if "import state unchanged" in plan.note and not failing and not plan.broken and not unknown:
             pass  # the import left nothing different and the cheapest candidates pass
         elif plan.broken or not verdicts or unknown:
@@ -1435,11 +1473,6 @@ def run(t_start, deadline, state):
             fail_fixtures = set()
             for n in failing:
                 fail_fixtures.update(fixtures_of(n))
-            # tests of each class that have no verdict (held, or selected without a run)
-            unseen = {}
-            for n in selected | set(held):
-                if n not in verdicts:
-                    unseen[class_of(n)] = unseen.get(class_of(n), 0) + 1
             for n in held:
                 if seconds[n] <= QUIET_HOLD_SECONDS:
                     selected.add(n)
@@ -1447,10 +1480,6 @@ def run(t_start, deadline, state):
                     selected.add(n)
                 elif len(failing) >= MANY_FAILURES:
                     selected.add(n)  # a commit that breaks this much can break any test
-                elif unseen.get(class_of(n), 0) > UNSEEN_CLASS and seconds[n] <= UNSEEN_HOLD_SECONDS:
-                    # Many tests of the class have no verdict, so the passes of the others
-                    # say little about this class. Only the longest tests are still left out.
-                    selected.add(n)
         if plan.global_leak is not None:
             # a run left the interpreter with other settings: every later test of a full run
             # (the order of tests.json) sees them
@@ -1746,7 +1775,7 @@ def run(t_start, deadline, state):
     #    replaces code objects). Commits that change import-time code run after them: their
     #    child drops the loaded sqlglot modules and imports the patched tree again.
     index = None
-    global BASE_STATE, BASE_FUNCTION_KEYS
+    global BASE_STATE, BASE_FUNCTION_KEYS, BASE_OBJECTS
     want_diff = bool(fresh) and not NO_DIFF and any(plans[c].diffable and not small_plan(plans[c]) for c in fresh)
     if hot or want_diff:
         preload.import_sqlglot()
@@ -1757,6 +1786,7 @@ def run(t_start, deadline, state):
 
         BASE_STATE, base_fpr = statefp.snapshot()
         BASE_FUNCTION_KEYS = base_fpr.function_keys
+        BASE_OBJECTS = base_fpr.objects
     if hot:
         mods = sorted({tests[n]["file"][:-3].replace("/", ".") for c in hot for n in plans[c].cands})
         preload.import_tests(mods)

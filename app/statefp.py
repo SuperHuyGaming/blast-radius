@@ -237,6 +237,9 @@ def snapshot(code_alias=None):
     such a key holds (one level down, so that a changed setting is named by its own attribute)."""
     f = Fingerprinter(code_alias)
     out = {}
+    # the dict, set and frozenset values themselves, by key: keymap.py compares two of them
+    # entry by entry when the patch changes one
+    f.objects = {}
     seen_classes = set()
     f.function_keys = set()  # keys whose value is a function (found by name at run time, also dynamically)
 
@@ -251,6 +254,8 @@ def snapshot(code_alias=None):
                 for name, x in state:
                     out[("O",) + key[1:] + (name,)] = f.fp(x)
                 return
+        if t is dict or t is set or t is frozenset:
+            f.objects[key] = v
         out[key] = f.fp(v)
 
     def add_class(cls, mod=None, path=None):
