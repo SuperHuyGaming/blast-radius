@@ -959,7 +959,13 @@ def select(m: Map, patch_text: str):
                             return True
                         if m.generator_init_span and not (old_end < m.generator_init_span[0] or old_start > m.generator_init_span[1]):
                             return True
-                elif path.startswith(("sqlglot/dialects/", "sqlglot/generators/")):
+                elif path.startswith("sqlglot/generators/"):
+                    return True
+                elif path == "sqlglot/dialects/dialect.py":
+                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
+                    if any("def generator" in l or "generator_class" in l or "Generator" in l for l in hunk_lines):
+                        return True
+                elif path.startswith("sqlglot/dialects/"):
                     hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
                     if any("Generator" in l or "generator =" in l or "def __init__" in l or "__slots__" in l for l in hunk_lines):
                         return True
