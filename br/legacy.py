@@ -36,6 +36,28 @@ def start(data: str, root: str, log) -> list:
     return procs
 
 
+def poll_finished(procs: list, commits, log) -> list:
+    """Collect from any child process that has already finished without blocking or killing."""
+    results = []
+    for item in list(procs):
+        name, p = item
+        if p.poll() is not None:
+            procs.remove(item)
+            try:
+                out, _ = p.communicate(timeout=1.0)
+                if p.returncode == 0:
+                    got = {}
+                    for line in out.splitlines():
+                        if line.strip():
+                            d = json.loads(line)
+                            got[d["commit"]] = {int(i) for w in d["workers"] for i in w}
+                    results.append(got)
+                    log("legacy", name, f"finished early, answered {len(got)} commits")
+            except Exception as exc:
+                log("legacy", name, "poll error:", repr(exc))
+    return results
+
+
 def collect(procs, commits, deadline: float, log) -> list:
     """Return one {commit: set(test numbers)} per selector that finished cleanly."""
     results = []

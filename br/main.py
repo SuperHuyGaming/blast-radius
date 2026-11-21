@@ -94,21 +94,19 @@ def main() -> int:
                 log(cid, "error, running everything:", repr(exc))
                 answers[cid] = every
 
-    # Intersect with the earlier selectors before refining, so the refining
-    # stages spend CPU only on tests that every selector still keeps.
+    # Poll any earlier selectors that have already finished without killing running ones
     legacy_sets = []
     if legacy_procs:
         try:
             from . import legacy
 
-            legacy_sets = legacy.collect(legacy_procs, commits, started + 60.0, log)
+            legacy_sets = legacy.poll_finished(legacy_procs, commits, log)
             for other in legacy_sets:
                 for cid in commits:
                     if cid in other:
                         answers[cid] = sorted(set(answers[cid]) & other[cid])
         except Exception as exc:  # keep this selector's answers
-            log("legacy intersection failed:", repr(exc))
-        legacy_procs = []
+            log("early legacy poll failed:", repr(exc))
 
     # Wall budget for the refining stages: the batch has 3 min for ~40 commits
     # (4.5 min for ~60 in the final); keep well clear of it. Static answers are
@@ -177,7 +175,17 @@ def main() -> int:
         except Exception as exc:  # keep the static answers
             log("verification stage failed, keeping static answers:", repr(exc))
 
-    # The clean and lazy stages rebuild answers from scratch: intersect again.
+    # Collect all remaining legacy selectors up to deadline and intersect answers
+    if legacy_procs:
+        try:
+            from . import legacy
+
+            remain_sets = legacy.collect(legacy_procs, commits, started + 172.0, log)
+            legacy_sets.extend(remain_sets)
+        except Exception as exc:  # keep this selector's answers
+            log("final legacy intersection failed:", repr(exc))
+
+    # The clean, lazy, and legacy stages all contribute to the final answers.
     for other in legacy_sets:
         for cid in commits:
             if cid in other:
