@@ -13,7 +13,7 @@ Map contents (test sets are indexes into "sets"; set -1 = every test):
   derive: {name: [names]}      names defined at import time by statements using the name
   import_use: [names]          names used by import-time statements that define nothing nameable
 """
-import ast, gzip, json, os, sys
+import ast, gzip, json, os, re, sys
 from collections import defaultdict
 
 raw, src, out = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -306,6 +306,21 @@ if merged_seen:
             acc |= t
         cmp_out[key] = sid(acc)
 
+# Tests that share one process pool kept on the test class (self.pool / cls.pool):
+# a patch that crashes a pool worker breaks the pool for every later user, so they
+# fail together. Found as the tests that ran a `self.pool.submit(` line.
+pool_groups = []
+for f, ls in line_sets.items():
+    if not f.startswith("tests/"):
+        continue
+    try:
+        text = open(os.path.join(src, f), encoding="utf-8").read().splitlines()
+    except OSError:
+        continue
+    for ln, s in ls.items():
+        if s is not ALL and 0 < ln <= len(text) and re.search(r"(self|cls)\.\w*pool\w*\.(submit|map)\(", text[ln - 1]):
+            pool_groups.append(sid(s))
+
 refs_out = {n: sid(s) for n, s in refs.items()}
 for n in refs_all:
     refs_out[n] = -1
@@ -323,6 +338,7 @@ data = {
     "qderive": {k: sorted(v) for k, v in qderive.items()},
     "str_names": sorted(str_names),
     "cmp_differ": cmp_out,
+    "pool_groups": pool_groups,
     "cmp_seen": cmp_seen,
     "class_uses": class_uses,
 }

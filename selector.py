@@ -65,6 +65,7 @@ class Map:
         self.classes_import = set(d.get("classes_import", []))
         self.cmp_differ = d.get("cmp_differ", {})
         self.cmp_seen = set(d.get("cmp_seen", []))
+        self.pool_groups = [set(self.sets[g]) for g in d.get("pool_groups", []) if g != -1]
         self.by_file: dict[str, set[int]] = {}
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
@@ -840,6 +841,13 @@ def select(m: Map, patch_text: str):
         acc = add(acc, s)
         if acc is ALL:
             return ALL
+    # Tests sharing a class-level process pool: if one crashes a pool worker, the
+    # pool is broken for every user that runs after it, so add those (run order).
+    for g in m.pool_groups:
+        hit = acc & g
+        if hit:
+            first = min(hit)
+            acc |= {t for t in g if t > first}
     return acc
 
 
