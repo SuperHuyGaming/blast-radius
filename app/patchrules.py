@@ -448,3 +448,65 @@ def shadows_module(path):
         return name in sys.stdlib_module_names or importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
         return True
+
+
+def statement_around_lambda(old_lines, start, end, line, old_line, new_line):
+    """The coverage map gives a line that holds a lambda to the tests that run the lambda.
+    When the edit on such a line is outside the lambda, it changes the statement around the
+    lambda, and tests that never call the lambda can see it (for instance "a and f(lambda: x)"
+    edited to "a or f(lambda: x)"). Returns (first, last) line of that statement, else None.
+    old_lines[start - 1:end] is the top-level statement (function, method) that holds the line."""
+    import ast
+
+    text = old_lines[start - 1:end]
+    if not any("lambda" in t for t in text):
+        return None
+    shift = start - 1
+    src = "\n".join(text)
+    if text and text[0][:1] in (" ", "\t"):
+        src = "if 1:\n" + src
+        shift = start - 2
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return (start, end)
+    at = line - shift
+    lambdas = [n for n in ast.walk(tree) if isinstance(n, ast.Lambda) and n.lineno <= at <= n.end_lineno]
+    if not lambdas:
+        return None
+    # the changed columns of the old line, in bytes (ast columns are UTF-8 offsets)
+    a = old_line.encode("utf-8", "surrogateescape")
+    b = new_line.encode("utf-8", "surrogateescape")
+    p = 0
+    while p < len(a) and p < len(b) and a[p] == b[p]:
+        p += 1
+    s = 0
+    while s < len(a) - p and s < len(b) - p and a[len(a) - 1 - s] == b[len(b) - 1 - s]:
+        s += 1
+    lo, hi = p, len(a) - s
+    inner = min(lambdas, key=lambda n: (n.end_lineno - n.lineno, -n.col_offset))
+    inside = (at > inner.lineno or lo > inner.col_offset) and (at < inner.end_lineno or hi < inner.end_col_offset)
+    if inside:
+        return None
+    best = None
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.stmt) or n is tree.body[0] and shift == start - 2:
+            continue
+        first = n.lineno
+        decos = getattr(n, "decorator_list", None)
+        if decos:
+            first = min(first, min(d.lineno for d in decos))
+        last = n.end_lineno
+        body = getattr(n, "body", None)
+        if isinstance(body, list) and body and isinstance(body[0], ast.AST):
+            b0 = body[0].lineno
+            fd = getattr(body[0], "decorator_list", None)
+            if fd:
+                b0 = min(b0, min(d.lineno for d in fd))
+            if first <= at <= b0 - 1:
+                last = b0 - 1  # the header of a compound statement
+        if first <= at <= last and (best is None or last - first < best[1] - best[0]):
+            best = (first, last)
+    if best is None:
+        return (start, end)
+    return (best[0] + shift, best[1] + shift)

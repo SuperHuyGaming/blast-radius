@@ -258,7 +258,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh")
 
     def __init__(self, commit):
         self.commit = commit
@@ -276,6 +276,7 @@ class Plan:
         self.pool_died = []  # tests during which a class-level process pool died
         self.fpairs = []  # (old code, new code) of changed function bodies that also run at import
         self.stmt_lines = {}  # path -> lines of changed function statements (import-time commits)
+        self.infect_fresh = None  # tests with a changed evaluation, for a function that also runs at import
         self.diff = None  # names whose import-time value the patch changes (import-state diff)
         self.def_units = {}  # path -> lines of functions whose header (defaults, decorators) changed
         self.data_cands = set()  # tests that read a changed file as data
@@ -504,24 +505,33 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             o, nr, nl, na, removed, added = g
             if nr != na or any(_indent(x) != _indent(y) for x, y in zip(removed, added)):
                 simple = False
+            elif any(x.lstrip().startswith(("nonlocal ", "global ")) for x in removed + added):
+                # a scope declaration has no line of its own in the coverage map, and it
+                # changes what every use of the name in the function means
+                simple = False
         if simple and any(_kind_changed(x, y) for x, y in pairs):
             # generator <-> plain function: every call behaves differently, not only the
             # runs that reach the changed line, so the tests that run the unit are candidates
             simple = False
             plan.note.append("code kind changed")
         if simple:
+            hit_lines = [ln for g in groups for ln in range(g[0], g[0] + g[1])]
             for g in groups:
-                for ln in range(g[0], g[0] + g[1]):
-                    if stmt_pex[ln]:
-                        # the function also runs at import: its body change is known here
-                        plan.fpairs.extend(pairs)
-                        sl = plan.stmt_lines.setdefault(rel, set())
-                        for g2 in groups:
-                            for l2 in range(g2[0], g2[0] + g2[1]):
-                                sl.update(range(span_a[l2], span_b[l2] + 1) if span_a[l2] else (l2,))
-                        return True
-                    plan.cands.update(maps.tests(stmt_set[ln]))
-                    touched.update(range(span_a[ln], span_b[ln] + 1) if span_a[ln] else (ln,))
+                for i in range(g[1]):
+                    # an edit beside a lambda on its line: the lines of the statement around it
+                    around = patchrules.statement_around_lambda(old_lines, s, e, g[0] + i, g[4][i], g[5][i])
+                    if around:
+                        hit_lines.extend(l2 for l2 in range(around[0], around[1] + 1) if l2 not in hit_lines)
+            for ln in hit_lines:
+                if stmt_pex[ln]:
+                    # the function also runs at import: its body change is known here
+                    plan.fpairs.extend(pairs)
+                    sl = plan.stmt_lines.setdefault(rel, set())
+                    for l2 in hit_lines:
+                        sl.update(range(span_a[l2], span_b[l2] + 1) if span_a[l2] else (l2,))
+                    return True
+                plan.cands.update(maps.tests(stmt_set[ln]))
+                touched.update(range(span_a[ln], span_b[ln] + 1) if span_a[ln] else (ln,))
         else:
             if unit_pex[ui]:
                 return True
@@ -629,6 +639,8 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
 
 
 INFECT = os.environ.get("BR_NO_INFECT") != "1"  # operand outcome map, see infect.py
+INFECT2 = os.environ.get("BR_NO_INFECT2") != "1"  # its phase 2 (and/or trees, literal operands)
+INFECT_FRESH = os.environ.get("BR_NO_INFECT_FRESH") != "1"  # the same for functions that also run at import
 
 
 def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: list):
@@ -643,10 +655,14 @@ def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: lis
     if rec is not None:
         import infect
 
+        old_lines, new_lines = old_text.split("\n"), fp.new_text.split("\n")
         res = infect.infected_tests(
-            fp.old_path, old_text.split("\n"), fp.new_text.split("\n"), fp.groups, rec[0],
-            os.path.join(maps.path, "infect.bin"),
+            fp.old_path, old_lines, new_lines, fp.groups, rec[0], os.path.join(maps.path, "infect.bin"),
         )
+        if res is None and INFECT2:
+            res = infect.infected_tests2(
+                fp.old_path, old_lines, new_lines, fp.groups, rec[0], os.path.join(maps.path, "infect2.bin"),
+            )
     if res is None or res.global_phase:
         return plan_python_file(plan, fp, maps, old_text)
     used.append(fp.old_path)
@@ -659,6 +675,12 @@ def plan_python_file_infect(plan: Plan, fp, maps: Maps, old_text: str, used: lis
         added = plan.cands - before
         plan.cands = before | (added & res.tests)
         plan.note.append("infect: %d of %d candidates" % (len(added & res.tests), len(added)))
+    elif plan.cands == before and plan.fpairs:
+        # The function also runs at import, so the child imports the patched tree. No
+        # evaluation at import time changes its result (global_phase is false). When the
+        # child then finds the import state equal to the pinned one, only the tests with a
+        # changed evaluation can differ, as above (see refine_with_diff).
+        plan.infect_fresh = set(res.tests)
     return fresh
 
 
@@ -1808,6 +1830,12 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         plan.class_filter = wanted
     plan.lines = full
     plan.note.append("import state: %d names" % len(names))
+    if plan.infect_fresh is not None and not keys and not plan.gone and not plan.added and INFECT_FRESH:
+        # the import left nothing different, and the edit is one mapped comparison: the
+        # candidates shrink to the tests that saw an evaluation whose result changes
+        before = len(plan.cands)
+        plan.cands &= plan.infect_fresh | plan.data_cands
+        plan.note.append("infect after import: %d -> %d" % (before, len(plan.cands)))
     plan.keeps = compute_keeps(plan, maps, tests)
     if plan.unaffected:
         plan.cands -= plan.unaffected
