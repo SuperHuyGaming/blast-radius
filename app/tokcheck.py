@@ -17,6 +17,8 @@ import signal
 import sys
 import zlib
 
+from rawz import unz as _unz
+
 _MAP = {}
 
 
@@ -25,7 +27,7 @@ def load(maps_dir):
     if m == 0:
         try:
             with open(os.path.join(maps_dir, "tok_inputs.bin"), "rb") as f:
-                m = marshal.loads(zlib.decompress(f.read()))
+                m = marshal.loads(_unz(f.read()))
         except (OSError, ValueError, EOFError, zlib.error):
             m = None
         _MAP[maps_dir] = m

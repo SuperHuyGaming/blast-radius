@@ -7,6 +7,8 @@ which names a patch removes. Each rule follows from how Python and pytest load c
 from __future__ import annotations
 
 import ast
+
+from astwalk import walk as _walk
 import os
 import re
 import sys
@@ -391,9 +393,44 @@ def gone_name_tests(maps, fp, old_text):
 DOC_READ_RE = re.compile(r"__doc__|getdoc|doctest")
 
 
+DOCS_READ_FILE = "docs_read.json"  # written at image build by build_docs_read.py
+
+
+def _file_size(path):
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return -1
+
+
+def _saved_docs_read(maps):
+    """The answer of tests_read_docs as build_docs_read.py saved it for the pinned tree, or None
+    when there is no such file or the test files are not the ones it read (by name and size)."""
+    import json
+
+    files = test_files(maps)
+    for d in (os.environ.get("BR_EXEC_CACHE", "/app/cache"), os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")):
+        try:
+            with open(os.path.join(d, DOCS_READ_FILE)) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            continue
+        try:
+            if [r[0] for r in saved["files"]] != list(files):
+                return None
+            for rel, size in saved["files"]:
+                if _file_size(os.path.join(ROOT, rel)) != size:
+                    return None
+            return bool(saved["value"])
+        except (KeyError, TypeError, IndexError, ValueError):
+            return None
+    return None
+
+
 def tests_read_docs(maps):
     if "docs" not in _SRC:
-        _SRC["docs"] = any(DOC_READ_RE.search(source(rel)) for rel in test_files(maps))
+        saved = _saved_docs_read(maps)
+        _SRC["docs"] = saved if saved is not None else any(DOC_READ_RE.search(source(rel)) for rel in test_files(maps))
     return _SRC["docs"]
 
 
@@ -441,9 +478,21 @@ def shadows_module(path):
     the checkout is on sys.path ahead of them, so every import of that name gets the new file."""
     import importlib.util
 
-    if "/" in path or not path.endswith(".py"):
+    if not path.endswith(".py"):
         return False
-    name = path[:-3]
+    parts = path.split("/")
+    if len(parts) == 1:
+        name = path[:-3]
+    elif len(parts) == 2 and parts[1] == "__init__.py":
+        # a new top-level package (a regular package wins over a module of the same name
+        # further down sys.path, as a plain module does)
+        name = parts[0]
+    else:
+        return False
+    if name in ("sitecustomize", "usercustomize"):
+        # the site module imports these at the start of every interpreter (the checkout is
+        # on PYTHONPATH): their code runs before any test
+        return True
     try:
         return name in sys.stdlib_module_names or importlib.util.find_spec(name) is not None
     except (ImportError, ValueError):
@@ -471,7 +520,7 @@ def statement_around_lambda(old_lines, start, end, line, old_line, new_line):
     except (SyntaxError, ValueError):
         return (start, end)
     at = line - shift
-    lambdas = [n for n in ast.walk(tree) if isinstance(n, ast.Lambda) and n.lineno <= at <= n.end_lineno]
+    lambdas = [n for n in _walk(tree) if isinstance(n, ast.Lambda) and n.lineno <= at <= n.end_lineno]
     if not lambdas:
         return None
     # the changed columns of the old line, in bytes (ast columns are UTF-8 offsets)
@@ -489,7 +538,7 @@ def statement_around_lambda(old_lines, start, end, line, old_line, new_line):
     if inside:
         return None
     best = None
-    for n in ast.walk(tree):
+    for n in _walk(tree):
         if not isinstance(n, ast.stmt) or n is tree.body[0] and shift == start - 2:
             continue
         first = n.lineno

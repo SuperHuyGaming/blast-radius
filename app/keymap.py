@@ -22,6 +22,8 @@ import os
 import types
 import zlib
 
+from rawz import unz as _unz
+
 WHOLE = "*"  # the table was used as a whole: every change can matter
 LEN = "#len"  # len() or truth value: matters when the number of entries changes
 KEYS = "#keys"  # the keys in order (iteration over keys, keys()): matters when they change
@@ -132,14 +134,38 @@ def diff_rows(changed, base_objects, base_state, new_objects, new_fpr, fingerpri
     return out
 
 
+class _LazyTables:
+    """table id -> {stable key: set id}, each table read from its own marshal blob at its first
+    use (the image stores keymap.bin so: rawmaps.py); a run reads a few of the 3,600 tables."""
+
+    __slots__ = ("_blobs", "_done")
+
+    def __init__(self, blobs):
+        self._blobs = blobs
+        self._done = {}
+
+    def __getitem__(self, tid):
+        t = self._done.get(tid)
+        if t is None:
+            t = self._done[tid] = marshal.loads(self._blobs[tid])
+        return t
+
+    def __len__(self):
+        return len(self._blobs)
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self._blobs)))
+
+
 class KeyMap:
     """The key read map (keymap.bin, made by build_keymap.py)."""
 
     def __init__(self, path):
         with open(path, "rb") as f:
-            d = marshal.loads(zlib.decompress(f.read()))
+            d = marshal.loads(_unz(f.read()))
         self.holders = d["holders"]  # holder name -> table id (traced, never changed by a test)
-        self.tables = d["tables"]  # table id -> {stable key: set id}
+        # table id -> {stable key: set id}
+        self.tables = _LazyTables(d["tables"]) if d.get("lazy_tables") else d["tables"]
         self.sets = d["sets"]  # set id -> bytes of array('H') test numbers
         unknown = array.array("H")
         unknown.frombytes(d["unknown"])

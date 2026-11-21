@@ -32,10 +32,15 @@ The program applies each patch in memory, runs the tests that can be affected, a
 - **Lazy numpy, pandas and duckdb** (`app/lazymods.py`). They load only when a test really needs them.
 - **Saved base state** (`app/build_base_state.py`). The image build saves the import-state fingerprint of the pinned tree. The selector checks the seed and Python version before it uses the file.
 
+- **Loop filter** (`app/iterred.py`, `app/maps/i/`). Some tests loop over many inputs in one statement. The map records, per loop pass of the pinned run, the lines that the pass runs. A reduced run keeps only the passes that reach the changed lines.
+- **Class route** (`app/classroute.py`, `app/maps/class_route.json`, `app/maps/import_exec.json`). An import-time edit can change only plain attributes of one class body. Then the child runs that class body again and sets the changed attributes, without a new import. The maps list the classes for which this gave the same import state on the pinned tree.
+- **Parent cost** (`app/rawz.py`, `app/rawmaps.py`, `app/astwalk.py`, `app/build_docs_read.py`). The image build stores the maps without compression and saves one fact about the pinned test files. The selector prepares the reduced test code once in the parent (`prepare_keeps`). One helper process serves the importer-cone commits.
+
 ## Rules for unusual patches
 
 `app/patchrules.py` holds the rules for new files, renames, pytest configuration, removed names and test files that cannot be imported. Other safety rules are in `app/selector.py` and `app/engine.py`.
 
+- **Mixed edits** (`refine_with_diff`, `_edits_own_definition`). A patch can hold a call-time edit and an import-time edit. The reduced runs keep the lines of the call-time edit, and a changed function allows reduced runs only when the edit holds its own definition.
 - **Closures** (`engine.plan_swaps`). New code can read free variables with other names than the pinned code. A live closure keeps the old cells, so the child does a fresh import instead of a code swap.
 - **Indentation-only edits** (`_indentation_changed`, `_file_compiles`). An edit can move only the indentation of a line and still break the file. Then the child imports the patched tree, as a full run would.
 - **Hung tests and pool tasks** (`conclude` in `run`). A test that does not end counts as a failure. A hung pool task blocks a worker of the class pool in a real run. Thus the later tests of that class are selected unrun.

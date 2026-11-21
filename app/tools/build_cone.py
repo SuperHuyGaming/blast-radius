@@ -406,12 +406,23 @@ def main():
     cone.record(walk)
     result, failed = {}, {}
     targets = only or [m for m in order if m in reach]
+    # A target whose state depends on the order of its import with other modules fails check 2
+    # ("cone fingerprint differs": hive copies TypeAnnotator.COERCES_TO, which bigquery changes
+    # in place later). The cones of these modules then join its cone, and the checks run again.
+    with_mods = [m for m in os.environ.get(
+        "BR_CONE_WITH", "sqlglot.dialects.bigquery,sqlglot.optimizer.annotate_types").split(",") if m]
     for x in targets:
         members = set(reach[x])
+        joined = False
         why = None
         for attempt in range(6):
             cone_list = [m for m in order if m in members]
             why, grow = check_module(x, cone_list, members, base, base_fp, order, missing, max_cone, clean)
+            if why is not None and not grow and not joined and why.get("why") == "cone fingerprint differs":
+                joined = True
+                for m in with_mods:
+                    members |= reach.get(m, {m})
+                continue
             if why is None or not grow:
                 break
             # state of these modules depends on the cone: they (and their importers) join it

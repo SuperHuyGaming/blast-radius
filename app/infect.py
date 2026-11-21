@@ -21,6 +21,8 @@ import ast
 import marshal
 import re
 import zlib
+
+from rawz import unz as _unz
 from array import array
 
 OPS = ("Is", "IsNot", "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "In", "NotIn")
@@ -70,7 +72,7 @@ def _file_sites(map_path, m, rel):
         if blob is None:
             return None
         s = {}
-        for row in marshal.loads(zlib.decompress(blob)):
+        for row in marshal.loads(_unz(blob)):
             s[tuple(row[:4])] = (row[4], row[5])
         _FILES[k] = s
     return s
@@ -79,7 +81,7 @@ def _file_sites(map_path, m, rel):
 def _set(map_path, m, sid):
     sets = _SETS.get(map_path)
     if sets is None:
-        sets = _SETS[map_path] = marshal.loads(zlib.decompress(m["sets"]))
+        sets = _SETS[map_path] = marshal.loads(_unz(m["sets"]))
     a = array("H")
     a.frombytes(sets[sid])
     return a
@@ -278,7 +280,7 @@ def _rows2(map_path, m, kind, rel):
         if blob is None:
             return None
         s = {}
-        for row in marshal.loads(zlib.decompress(blob)):
+        for row in marshal.loads(_unz(blob)):
             s[tuple(row[:4])] = row[4:]
         _FILES2[k] = s
     return s

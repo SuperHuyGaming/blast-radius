@@ -22,6 +22,8 @@ import for that commit.
 from __future__ import annotations
 
 import ast
+
+from astwalk import walk as _ast_walk
 import enum
 import importlib
 import marshal
@@ -131,21 +133,32 @@ class Heap:
 
     def _scan(self, stack, vals, seen):
         """Pushes the values to walk; returns the named entries ((position, module), ...)."""
-        leaf = self._leaf
+        leaf_get = self._leaf.get
         marks = []
         append = stack.append
+        own = self._own
+        module_type = types.ModuleType
+        function_type = types.FunctionType
+        named_ = named
         for pos, v in enumerate(vals):
             t = type(v)
-            got = leaf.get(t)
+            got = leaf_get(t)
             if got is None:
                 got = self._is_leaf_type(t)
-            if t is types.ModuleType or t is types.FunctionType or (not got and isinstance(v, type)):
-                owner = named(v)
+            if got:
+                # a leaf is never walked; a module is a named entry
+                if t is module_type:
+                    owner = named_(v)
+                    if owner is not None:
+                        marks.append((pos, owner))
+                continue
+            if t is function_type or isinstance(v, type):
+                owner = named_(v)
                 if owner is not None:
                     marks.append((pos, owner))
-                    if t is types.ModuleType or owner != self._own:
+                    if owner != own:
                         continue  # walked from its own module
-            if not got and id(v) not in seen:
+            if id(v) not in seen:
                 append(v)
         return marks
 
@@ -155,16 +168,22 @@ class Heap:
         stack = [module]
         push = self._push
         recs = self.recs
+        module_type = types.ModuleType
+        function_type = types.FunctionType
+        method_type = types.MethodType
+        is_leaf_type = self._is_leaf_type
+        scan = self._scan
+        seen_add = seen.add
         while stack:
             o = stack.pop()
             k = id(o)
             if k in seen:
                 continue
-            seen.add(k)
+            seen_add(k)
             t = type(o)
             kids = None
             name = None
-            if t is types.ModuleType:
+            if t is module_type:
                 if o is not module:
                     continue
                 kind, kids, name = "n", vars(o), own
@@ -175,7 +194,7 @@ class Heap:
                 if not _sqlglot(getattr(o, "__module__", "") or ""):
                     continue
                 kind, kids = "c", o.__dict__
-            elif t is types.FunctionType:
+            elif t is function_type:
                 if not _sqlglot(o.__module__ or ""):
                     continue
                 if o.__module__ != own and named(o) is not None:
@@ -207,10 +226,10 @@ class Heap:
             elif t is property:
                 push(stack, (o.fget, o.fset, o.fdel))
                 continue
-            elif t is types.MethodType:
+            elif t is method_type:
                 push(stack, (o.__func__, o.__self__))
                 continue
-            elif self._is_leaf_type(t):
+            elif is_leaf_type(t):
                 continue
             else:
                 kind = "o"
@@ -220,10 +239,10 @@ class Heap:
                 keys = tuple(kids)
                 vals = tuple(kids.values())
                 saved = (keys, vals, o.__bases__ if kind == "c" else None)
-                marks = self._scan(stack, vals, seen)
+                marks = scan(stack, vals, seen)
             elif kind in ("l", "s"):
                 saved = tuple(o)
-                marks = self._scan(stack, saved, seen)
+                marks = scan(stack, saved, seen)
             elif kind == "f":
                 cells = o.__closure__ or ()
                 contents = tuple(_cell(c) for c in cells)
@@ -282,6 +301,14 @@ def _object_state(o):
 
 
 HEAP = None
+_EXPECTED_CODE = {}  # id(function) -> the code object that the child gave it (expect_code)
+
+
+def expect_code(swaps):
+    """In the child, before reimport(): these functions outside the cone got a new code object
+    ((function, code) pairs), on purpose. The record holds their pinned code."""
+    for f, code in swaps:
+        _EXPECTED_CODE[id(f)] = (f, code)
 
 
 def record(walk_order=()):
@@ -299,7 +326,7 @@ def import_lines(text):
     """The import statements and dynamic import calls of a module, for comparison."""
     tree = ast.parse(text)
     out = []
-    for node in ast.walk(tree):
+    for node in _ast_walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             out.append(ast.dump(node, include_attributes=False))
         elif isinstance(node, ast.Call):
@@ -450,7 +477,11 @@ def _same(kind, o, saved, marks, cset):
         return kind == "l" and _same_marked(now, saved, cone_marks)
     if kind == "f":
         cells = o.__closure__ or ()
-        return (o.__code__ is saved[0] and o.__defaults__ is saved[1] and o.__kwdefaults__ is saved[2]
+        code_ok = o.__code__ is saved[0]
+        if not code_ok:
+            exp = _EXPECTED_CODE.get(id(o))
+            code_ok = exp is not None and exp[0] is o and exp[1] is o.__code__
+        return (code_ok and o.__defaults__ is saved[1] and o.__kwdefaults__ is saved[2]
                 and len(cells) == len(saved[3]) and all(map(_IS, cells, saved[3]))
                 and all(map(_IS, map(_cell, cells), saved[4])))
     st = _object_state(o)

@@ -371,6 +371,45 @@ def snapshot(code_alias=None, base_codes=None, only=None):
     return out, f
 
 
+def class_state(cls, mod, path, f):
+    """{key: fingerprint} of one class (and the classes nested in it), with the keys and values
+    that snapshot() gives for it; f: the Fingerprinter (its objects and function_keys are filled
+    as snapshot() fills them)."""
+    out = {}
+    seen = set()
+
+    def add_value(key, v):
+        t = type(v)
+        if t in (types.FunctionType, classmethod, staticmethod, property, types.MethodType):
+            f.function_keys.add(key)
+        tm = getattr(t, "__module__", "") or ""
+        if tm.startswith("sqlglot") and not isinstance(v, (type, enum.Enum)) and t is not types.FunctionType:
+            state = f._state(v, t)
+            if state:
+                for name, x in state:
+                    out[("O",) + key[1:] + (name,)] = f.fp(x)
+                return
+        if t is dict or t is set or t is frozenset:
+            f.objects[key] = v
+        out[key] = f.fp(v)
+
+    def add_class(c, m, p):
+        if c in seen:
+            return
+        seen.add(c)
+        for name, v in list(c.__dict__.items()):
+            if name in SKIP_ATTRS:
+                continue
+            if isinstance(v, type) and v.__module__ == c.__module__ and v.__qualname__.startswith(c.__qualname__ + "."):
+                add_class(v, v.__module__, v.__qualname__)
+                continue
+            add_value(("A", m, p, name), v)
+        out[("A", m, p, "__bases__")] = f.fp(c.__bases__)
+
+    add_class(cls, mod, path)
+    return out
+
+
 def diff(base, new):
     """Keys whose value differs, or that exist on one side only."""
     changed = [k for k, v in new.items() if base.get(k, _MISSING) != v]

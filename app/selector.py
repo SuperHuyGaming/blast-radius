@@ -52,6 +52,8 @@ else:
 
 import engine  # noqa: E402
 import patchrules  # noqa: E402
+from rawz import unz as _unz  # noqa: E402  (map blobs: raw in the image, zlib in the repo)
+from astwalk import walk as _walk  # noqa: E402
 
 engine.KEEP_CODE = engine_keep_code
 
@@ -71,6 +73,10 @@ DEBUG = os.environ.get("BR_DEBUG")
 RUN_ALL = os.environ.get("BR_RUN_ALL")  # validation mode: run every candidate, no early stop
 RUN_SLOW = os.environ.get("BR_RUN_SLOW")  # validation mode: also run the slow tests
 NO_REDUCE = os.environ.get("BR_NO_REDUCE")  # validation mode: always run whole tests
+ITERS_ON = os.environ.get("BR_ITERS", "1") != "0"  # loop-iteration parts (iterred.py)
+# Loop-iteration parts also for tests that have no statement parts (the map then traces the
+# whole test). Off: paired runs showed no CPU gain for such tests (their time is in set-up).
+ITERS_WHOLE = os.environ.get("BR_ITERS_WHOLE") == "1"
 MAPS_OBJ = None
 ANSWER_FD = None
 BASE_STATE = None
@@ -151,6 +157,29 @@ COST_FIX = os.environ.get("BR_NO_COST_FIX") != "1"
 # them its own child again (validation: the answers must be the same).
 FIXTURE_BATCH = os.environ.get("BR_NO_FIXTURE_BATCH") != "1"
 FIXTURE_BATCH_MIN = 2  # commits in one shared child at least
+PRE_KEEPS = os.environ.get("BR_PRE_KEEPS", "1") == "1"  # reduced test code compiled in the parent (prepare_keeps)
+# cone commits under a holder process (cone_in_holder): 0 off, 1 when it pays, 2 always
+CONE_HOLDER = os.environ.get("BR_CONE_HOLDER", "1")
+
+
+def _holder_pays():
+    """The holder only keeps this process's 2 MB pages whole: it pays where the allocator's
+    arena gets transparent huge pages (always, or madvise with mimalloc's large OS pages)."""
+    if CONE_HOLDER == "2":
+        return True
+    if CONE_HOLDER != "1":
+        return False
+    try:
+        with open("/sys/kernel/mm/transparent_hugepage/enabled") as f:
+            mode = f.read()
+    except OSError:
+        return False
+    if "[always]" in mode:
+        return True
+    return ("[madvise]" in mode and os.environ.get("PYTHONMALLOC") == "mimalloc"
+            and os.environ.get("MIMALLOC_LARGE_OS_PAGES") == "1")
+
+
 WALL_LIMIT = float(os.environ.get("BR_WALL", "150"))  # the batch must end well inside 3 minutes
 
 
@@ -201,7 +230,7 @@ class Maps:
             if fid is None:
                 return None
             with open(os.path.join(self.path, "f", f"{fid}.bin"), "rb") as f:
-                rec = self.file_cache[rel] = marshal.loads(zlib.decompress(f.read()))
+                rec = self.file_cache[rel] = marshal.loads(_unz(f.read()))
         return rec
 
     def unit_entries(self, rel, line):
@@ -214,7 +243,7 @@ class Maps:
         if chunk is None:
             try:
                 with open(os.path.join(self.path, "u", "%d_%d.bin" % key), "rb") as f:
-                    chunk = marshal.loads(zlib.decompress(f.read()))
+                    chunk = marshal.loads(_unz(f.read()))
             except OSError:
                 chunk = {}
             self.unit_cache[key] = chunk
@@ -232,7 +261,7 @@ class Maps:
         if rec == 0:
             try:
                 with open(os.path.join(self.path, "t", "%d.bin" % number), "rb") as f:
-                    rec = marshal.loads(zlib.decompress(f.read()))
+                    rec = marshal.loads(_unz(f.read()))
             except OSError:
                 rec = None
             self.test_cache[number] = rec
@@ -243,7 +272,7 @@ class Maps:
         if self._readers is None:
             try:
                 with open(os.path.join(self.path, "readers.bin"), "rb") as f:
-                    self._readers = marshal.loads(zlib.decompress(f.read()))
+                    self._readers = marshal.loads(_unz(f.read()))
             except OSError:
                 self._readers = {}
         raw = self._readers.get(name)
@@ -260,7 +289,7 @@ class Maps:
         if self._class_users is None:
             try:
                 with open(os.path.join(self.path, "classes.bin"), "rb") as f:
-                    self._class_users = marshal.loads(zlib.decompress(f.read()))
+                    self._class_users = marshal.loads(_unz(f.read()))
             except OSError:
                 self._class_users = {}
         return self._class_users.get(name)
@@ -270,7 +299,7 @@ class Maps:
         if self._classmap is None:
             try:
                 with open(os.path.join(self.path, "classmap.bin"), "rb") as f:
-                    cm = marshal.loads(zlib.decompress(f.read()))
+                    cm = marshal.loads(_unz(f.read()))
                 hooked = array("I")
                 hooked.frombytes(cm["hooked"])
                 unknown = array("H")
@@ -291,7 +320,7 @@ class Maps:
             if TIGHT:
                 try:
                     with open(os.path.join(self.path, "tight_lines.bin"), "rb") as f:
-                        raw = marshal.loads(zlib.decompress(f.read()))
+                        raw = marshal.loads(_unz(f.read()))
                     for n, files in raw.items():
                         out = self._tight[n] = {}
                         for rel, blob in files.items():
@@ -336,7 +365,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps")
 
     def __init__(self, commit):
         self.commit = commit
@@ -349,6 +378,8 @@ class Plan:
         self.blind = set()  # tests selected without a run when the commit is not clean
         self.lines = {}  # repo-relative .py path -> lines of the changed statements (call-time code)
         self.keeps = {}  # test -> (statements, fixture entries, pool tasks) to run; absent = whole test
+        self.iters = {}  # test -> ((kept paths, their prefixes), rewritten sites, edits): see iterred.py
+        self.pre_keeps = None  # (the keeps and iters it was made from, reduced code per test): prepare_keeps
         self.broken = []  # modules that fail to import with the patch
         self.times = {}  # test -> CPU seconds of its run (for logs)
         self.pool_died = []  # tests during which a class-level process pool died
@@ -377,6 +408,12 @@ class Plan:
         self.watched = None  # the statefp keys of the containers that the child watched (None: not reported)
         self.leaks = []  # (test, statefp key, changed entries or None): a watched container changed
         self.cone = None  # import-time commit: the modules to import again (cone.py), or None
+        # path -> (abs path, [(old code, new code)], modules whose import runs the changed function):
+        # a file whose only change is the body of one function that also runs at import (swap_candidate)
+        self.swap = {}
+        self.swap_work = []  # cone child: (abs path, pairs) of the files that it handles by code replacement
+        self.klass = {}  # path -> (module, class): every change of the file lies in the body of this top-level class
+        self.class_work = []  # cone child: (module, class, patched text, abs path, import-time reads of the class)
         self.guard = {}  # test -> CPU seconds after which its run is stopped and the test selected
         self.prep = None  # (allowed, skip, cap, cost) of prepare_plan, for a second child
         self.suspects = set()  # tests without a verdict that count like failing ones (stopped runs)
@@ -495,7 +532,7 @@ def _type_checking_spans(text):
     # no function declares them global, and nothing assigns an attribute TYPE_CHECKING.
     # (A name bound inside a function or a comprehension is local to it.)
     names = typing_names | flag_names
-    for n in ast.walk(tree):
+    for n in _walk(tree):
         if isinstance(n, ast.Global) and names & set(n.names):
             return []
         if isinstance(n, ast.Attribute) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.attr == "TYPE_CHECKING":
@@ -582,6 +619,86 @@ def type_checking_groups(fp, old_text):
     if not new_spans:
         return set()  # also when the new text does not compile: the import fails then
     return {gi for gi, (o, nr, nl, na, removed, added) in maybe if inside(nl, na, new_spans)}
+
+
+
+_CHAIN_CACHE = {}
+
+
+def _if_chain_heads(old_text, key):
+    """{line of an if or elif header: sorted header lines of its whole if/elif chain} for the
+    pinned text, and {line of a statement: line of the statement right before it in the same
+    block}."""
+    got = _CHAIN_CACHE.get(key)
+    if got is not None:
+        return got
+    import ast
+
+    chains, prev = {}, {}
+    try:
+        tree = ast.parse(old_text)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        for node in ast.walk(tree):
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                block = getattr(node, field, None)
+                if isinstance(block, list):
+                    for a, b in zip(block, block[1:]):
+                        if isinstance(a, ast.stmt) and isinstance(b, ast.stmt):
+                            prev[b.lineno] = a
+            if isinstance(node, ast.If) and node.lineno not in chains:
+                heads = [node.lineno]
+                cur = node
+                while len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If) and cur.orelse[0].col_offset == node.col_offset:
+                    cur = cur.orelse[0]
+                    heads.append(cur.lineno)
+                for h in heads:
+                    chains[h] = heads
+    got = _CHAIN_CACHE[key] = (chains, prev)
+    return got
+
+
+def _chain_lines(old_text, key, groups):
+    """Lines to add to the changed lines when an edit turns an elif into an if or an if into
+    an elif. Such an edit changes which branches run for every evaluation of the chain, also
+    for the runs that took an earlier branch and so never ran the edited line (the pinned
+    coverage of that line misses them): the header lines of the whole chain count."""
+    import ast
+
+    out = []
+    for g in groups:
+        o, nr, nl, na, removed, added = g
+        for i, (x, y) in enumerate(zip(removed, added)):
+            kx = x.lstrip().split(" ", 1)[0].rstrip(":")
+            ky = y.lstrip().split(" ", 1)[0].rstrip(":")
+            if kx == ky or not ({kx, ky} & {"elif", "else"}):
+                continue
+            chains, prev = _if_chain_heads(old_text, key)
+            ln = o + i
+            if ln in chains:
+                out.extend(chains[ln])
+            p = prev.get(ln)
+            if isinstance(p, ast.If) and p.lineno in chains:
+                out.extend(chains[p.lineno])
+    return out
+
+
+
+def _header_changed(old_lines, s, e, groups):
+    """True when an edit touches the decorator or def lines of the unit at lines s..e."""
+    end = None
+    seen_def = False
+    for ln in range(s, e + 1):
+        text = old_lines[ln - 1].split("#", 1)[0].rstrip()
+        if not seen_def and text.lstrip().startswith(("def ", "async def ")):
+            seen_def = True
+        if seen_def and text.endswith(":"):
+            end = ln
+            break
+    if end is None:
+        return False
+    return any(s <= o + i <= end for o, nr, *_ in groups for i in range(max(nr, 1)))
 
 
 def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
@@ -671,6 +788,13 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
                 # a scope declaration has no line of its own in the coverage map, and it
                 # changes what every use of the name in the function means
                 simple = False
+        if simple and rel.startswith("tests/") and _header_changed(old_lines, s, e, groups):
+            # a test method's def line (its parameters): unittest calls the method with self
+            # only, so the call itself fails; no line of the body records that, and the def
+            # line runs only when the test module is imported: every test of the unit is a
+            # candidate and runs whole
+            simple = False
+            plan.note.append("test def header changed")
         if simple and any(_kind_changed(x, y) for x, y in pairs):
             # generator <-> plain function: every call behaves differently, not only the
             # runs that reach the changed line, so the tests that run the unit are candidates
@@ -678,6 +802,11 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             plan.note.append("code kind changed")
         if simple:
             hit_lines = [ln for g in groups for ln in range(g[0], g[0] + g[1])]
+            groups_lines = set(hit_lines)
+            for ln in _chain_lines(old_text, rel, groups):
+                # elif <-> if: the runs that took an earlier branch of the chain change too
+                if ln not in hit_lines:
+                    hit_lines.append(ln)
             for g in groups:
                 for i in range(g[1]):
                     # an edit beside a lambda on its line: the lines of the statement around it
@@ -701,6 +830,10 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
                     sl = plan.stmt_lines.setdefault(rel, set())
                     for l2 in hit_lines:
                         sl.update(range(span_a[l2], span_b[l2] + 1) if span_a[l2] else (l2,))
+                        if l2 not in groups_lines and stmt_set[l2]:
+                            # lines added by a rule (if/elif chain, lambda statement): the
+                            # import-time candidates below look only at the changed lines
+                            plan.cands.update(maps.tests(stmt_set[l2]))
                     return True
                 found = maps.tests(stmt_set[ln])
                 if tight and dl is not None and not tight.keys().isdisjoint(found):
@@ -771,6 +904,52 @@ def test_data_candidates(plan: Plan, fp, maps: Maps):
     return True
 
 
+
+_ENUM_LINES = {}
+
+
+def _enum_body_lines(rel):
+    """Lines of the bodies of Enum classes in a pinned module. Enum members are read through
+    the class's own tables (__members__, value lookups, iteration), which the def-use map of
+    names does not see, and import-time code (a metaclass, a registry) can consume them."""
+    out = _ENUM_LINES.get(rel)
+    if out is not None:
+        return out
+    import ast
+    import enum
+
+    out = set()
+    try:
+        tree = ast.parse(patchrules.source(rel))
+    except SyntaxError:
+        _ENUM_LINES[rel] = out
+        return out
+    mod = sys.modules.get(rel[:-3].replace("/", ".").removesuffix(".__init__"))
+
+    def visit(body, prefix):
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                qual = prefix + [node.name]
+                is_enum = None
+                if mod is not None:
+                    obj = mod
+                    for part in qual:
+                        obj = getattr(obj, part, None)
+                        if obj is None:
+                            break
+                    if obj is not None:
+                        is_enum = isinstance(obj, enum.EnumMeta)
+                if is_enum is None:
+                    is_enum = any("Enum" in ast.unparse(b) or ast.unparse(b).endswith("AutoName") for b in node.bases)
+                if is_enum:
+                    out.update(range(node.lineno, node.end_lineno + 1))
+                visit(node.body, qual)
+
+    visit(tree.body, [])
+    _ENUM_LINES[rel] = out
+    return out
+
+
 def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
     """Candidates for an edit that changes what the module does at import. The map gives,
     for a line of module-level or class-level code, the tests that use what the line defines.
@@ -789,10 +968,14 @@ def add_import_time_candidates(plan: Plan, fp, rec, maps: Maps):
         for s, e, _, kind in units:
             if kind == 0 and s <= o <= e and e > s:
                 plan.def_units.setdefault(fp.old_path, set()).update(range(s, e + 1))
+    enum_lines = _enum_body_lines(fp.old_path) if fp.old_path.endswith(".py") else ()
     for o, nr, nl, na, removed, added in fp.groups:
         lines = range(o, o + nr) if nr else (o - 1, o)
         simple = nr == na and all(_indent(x) == _indent(y) for x, y in zip(removed, added))
         if not simple and not (_blank_or_comment(added) and _blank_or_comment(removed)):
+            complete = False
+        elif enum_lines and not (_blank_or_comment(added) and _blank_or_comment(removed)) and any(ln in enum_lines for ln in lines):
+            # an Enum member: its readers go through the class tables (see _enum_body_lines)
             complete = False
         for ln in lines:
             if not 0 < ln <= n:
@@ -954,7 +1137,8 @@ def _writes_shared_state(fn):
     local = set()
     for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
         local.add(a.arg)
-    for n in ast.walk(fn):
+    nodes = _walk(fn)
+    for n in nodes:
         targets = []
         if isinstance(n, ast.Assign):
             targets = n.targets
@@ -973,7 +1157,7 @@ def _writes_shared_state(fn):
             depth += 1
         return (e.id if isinstance(e, ast.Name) else None), depth
 
-    for n in ast.walk(fn):
+    for n in nodes:
         targets = []
         if isinstance(n, (ast.Assign, ast.Delete)):
             targets = n.targets
@@ -1015,7 +1199,8 @@ def _container_writes(fn):
     for a in (fn.args.vararg, fn.args.kwarg):
         if a is not None:
             local.add(a.arg)
-    for n in ast.walk(fn):
+    nodes = _walk(fn)
+    for n in nodes:
         if isinstance(n, (ast.Global, ast.Nonlocal)):
             declared.update(n.names)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
@@ -1048,7 +1233,7 @@ def _container_writes(fn):
         if d is not None:
             out.setdefault(d, set()).add(kind)
 
-    for n in ast.walk(fn):
+    for n in nodes:
         if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
             targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target]
             for t in targets:
@@ -1300,11 +1485,14 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
                 if rec is not None:
                     plan.cands.update(maps.tests(rec[7]))
                     plan.cands.update(maps.tests(rec[8]))
-            elif fp.status == "modify" and (
+            elif fp.status == "modify" and (n_fp := len(plan.fpairs)) >= 0 and (
                 plan_python_file_infect(plan, fp, maps, old_text, infect_used) if use_infect
                 else plan_python_file(plan, fp, maps, old_text)
             ):
                 fresh = True
+                swap_candidate(plan, fp, maps, old_text, plan.fpairs[n_fp:])
+                if fp.old_path not in plan.swap:
+                    class_candidate(plan, fp, maps, old_text)
                 plan.lines.pop(fp.old_path, None)
                 rec = maps.file(fp.old_path)
                 if rec is not None:
@@ -1388,26 +1576,212 @@ _CLEAR_AT = {}
 DEBUG_DKEYS = {}  # commit -> the "D" rows of its child (debug output only)
 CONE_MAP = None  # module -> its importer cone in import order (maps/cone.json, build_cone.py)
 CONE_WALK = []  # the modules, each after the modules it imports (cone.Heap)
+CONE_FIXTURES = os.environ.get("BR_NO_CONE_FIXTURES") != "1"  # a changed .sql fixture beside the modules does not end the cone path
+NO_SWAP_CONE = os.environ.get("BR_NO_SWAP_CONE") == "1"  # validation: no code replacement in cone children
+_IMPORT_EXEC = None  # path -> {line of a function body: modules whose import runs it} (maps/import_exec.json)
+
+
+def import_exec(maps):
+    global _IMPORT_EXEC
+    if _IMPORT_EXEC is None:
+        out = {}
+        try:
+            with open(os.path.join(maps.path, "import_exec.json")) as f:
+                data = json.load(f)
+            names = data["modules"]
+            for rel, rows in data["files"].items():
+                out[rel] = {ln: [names[i] for i in ms] for ln, ms in rows}
+            out[""] = True  # the map is there
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            out = {}
+        _IMPORT_EXEC = out
+    return _IMPORT_EXEC
+
+
+NO_CLASS_ROUTE = os.environ.get("BR_NO_CLASS_ROUTE") == "1"  # validation: no class route (classroute.py)
+_ASSIGN_RE = re.compile(r"\s+([A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
+_ATTR_READS = None  # maps/attr_import_reads.json
+
+
+def attr_reads(maps):
+    global _ATTR_READS
+    if _ATTR_READS is None:
+        try:
+            with open(os.path.join(maps.path, "class_route.json")) as f:
+                _ATTR_READS = json.load(f)["classes"]
+        except (OSError, ValueError, KeyError, TypeError):
+            _ATTR_READS = {}
+    return _ATTR_READS
+
+
+def class_candidate(plan: Plan, fp, maps: Maps, old_text: str):
+    """For a modified sqlglot file: notes in plan.klass the top-level class C when every hunk
+    that is not blank or comment lines changes, line for line, statements directly in the body
+    of C (not its header, not a class nested in it). The child then decides (classroute.py)."""
+    rel = fp.old_path
+    rec = maps.file(rel)
+    if NO_CLASS_ROUTE or rec is None or not rel.startswith("sqlglot/") or CONE_MAP is None:
+        return
+    if rel[:-3].replace("/", ".").removesuffix(".__init__") in CONE_MAP:
+        return  # the module has a small importer cone
+    inert = type_checking_groups(fp, old_text)
+    units = rec[0]
+    names = set()
+    targets = set()  # the names that the changed statements assign, where the first line shows it
+    old_lines = old_text.split("\n")
+    for gi, g in enumerate(fp.groups):
+        if gi in inert:
+            continue
+        o, nr, nl, na, removed, added = g
+        if _blank_or_comment(added) and _blank_or_comment(removed) and (
+                nl > 2 or not any(CODING_RE.search(a) for a in added + removed)):
+            continue  # comment lines change nothing, wherever they are
+        if nr > 0:
+            hit = [u for u in units if u[0] <= o + nr - 1 and o <= u[1]]
+        else:
+            hit = [u for u in units if u[0] < o <= u[1]]
+        if not hit:
+            return
+        for u in hit:
+            if len(u[2]) != 1 or u[3] != 0:
+                return
+            if old_lines[u[0] - 1].lstrip().startswith(("def ", "async def ", "@", "class ")):
+                return  # a method: its function object would differ
+            names.add(u[2][0])
+            m = _ASSIGN_RE.match(old_lines[u[0] - 1])
+            if m:
+                targets.add(m.group(1))
+    if len(names) != 1:
+        return
+    name = names.pop()
+    mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
+    read = attr_reads(maps).get(mod + ":" + name)
+    if read is None:
+        return  # not a class that the build-time checks passed (build_class_reexec.py)
+    if "*" in read or not targets.isdisjoint(read):
+        return  # read at import: the child would only find that out and import the whole tree
+    plan.klass[rel] = (mod, name, os.path.join(ROOT, rel), frozenset(read))
+
+
+def swap_candidate(plan: Plan, fp, maps: Maps, old_text: str, fpairs):
+    """For a modified sqlglot file that needs a fresh import only because one function body
+    that also runs at import changed (fpairs: what plan_python_file added to plan.fpairs for
+    it): notes in plan.swap the code pairs and the modules whose import runs that function on
+    the pinned tree (maps/import_exec.json). Nothing else of the file differs at import time
+    (deftime_equal for every unit that the patch touches), so the patched tree differs from the
+    pinned one only by that body, and the import can differ only where the body runs: the
+    child replaces the code object, as for a function-body commit, and imports again only the
+    cones of those modules (cone_plan). Any doubt: no entry, and the whole tree is imported."""
+    rel = fp.old_path
+    rec = maps.file(rel)
+    if NO_SWAP_CONE or not fpairs or rec is None or not rel.startswith("sqlglot/") or CONE_MAP is None:
+        return
+    if rel[:-3].replace("/", ".").removesuffix(".__init__") in CONE_MAP:
+        return  # the module has a small importer cone
+    table = import_exec(maps)
+    if not table:
+        return
+    inert = type_checking_groups(fp, old_text)
+    units, flags, inames = rec[0], rec[1], rec[2]
+    old_lines = old_text.split("\n")
+    new_lines = fp.new_text.split("\n")
+    full = os.path.join(ROOT, rel)
+    hit_units = set()
+    for gi, g in enumerate(fp.groups):
+        if gi in inert:
+            continue
+        o, nr, nl, na, removed, added = g
+        hit = []
+        for ui, u in enumerate(units):
+            s, e = u[0], u[1]
+            if nr > 0:
+                if s <= o + nr - 1 and o <= e:
+                    hit.append(ui)
+            elif s < o <= e:
+                hit.append(ui)
+        if not hit:
+            if _blank_or_comment(added) and _blank_or_comment(removed):
+                if nl > 2 or not any(CODING_RE.search(a) for a in added + removed):
+                    continue
+            return
+        hit_units.update(hit)
+    changed = []
+    for ui in sorted(hit_units):
+        s, e, class_path, kind = units[ui]
+        if kind != 0:
+            return
+        delta_before = 0
+        delta_in = 0
+        for g in fp.groups:
+            if g[0] + g[1] - 1 < s and g[0] < s:
+                delta_before += g[3] - g[1]
+            elif g[0] <= e:
+                delta_in += g[3] - g[1]
+        try:
+            a = engine.compile_unit(old_lines, s, e, class_path, full, flags, inames)
+            b = engine.compile_unit(new_lines, s + delta_before, e + delta_before + delta_in, class_path, full, flags, inames)
+        except (SyntaxError, ValueError):
+            return
+        if a is None or b is None:
+            return
+        pairs = []
+        if not engine.deftime_equal(a, b, pairs):
+            return
+        if all(engine.func_code_equal(x, y) for x, y in pairs):
+            continue
+        if not class_path and any(line.startswith("def __getattr__(") for line in old_lines[s - 1:e]):
+            return
+        changed.append((ui, pairs))
+    if len(changed) != 1:
+        return
+    ui, pairs = changed[0]
+    # the fingerprint of the import state counts exactly these bodies as unchanged (plan.fpairs)
+    if len(pairs) != len(fpairs) or not all(
+            engine.func_code_equal(x, x2) and engine.func_code_equal(y, y2) for (x, y), (x2, y2) in zip(pairs, fpairs)):
+        return
+    s, e = units[ui][0], units[ui][1]
+    lines = table.get(rel, {})
+    execs = set()
+    for ln in range(s, e + 1):
+        execs.update(lines.get(ln, ()))
+    plan.swap[rel] = (full, pairs, sorted(execs))
 
 
 def cone_plan(plan: Plan) -> bool:
-    """Sets plan.cone for an import-time commit that can take the cone path: it changes only
-    existing sqlglot modules that maps/cone.json lists, and none of their import statements
-    (so the import graph, and the order of a fresh import, stay as they were)."""
+    """Sets plan.cone for an import-time commit that can take the cone path. Each file is an
+    existing sqlglot module that either maps/cone.json lists, with its import statements
+    unchanged (so the import graph, and the order of a fresh import, stay as they were): its
+    cone is imported again from the patched text; or whose only change is a function body
+    (plan.swap): its code is replaced and the cones of the modules whose import runs that
+    function are imported again."""
     if CONE_MAP is None or plan.mode != "fresh" or plan.added or not plan.files:
         return False
     mods = set()
+    work = []
+    class_work = []
     for rel, text in plan.files.items():
+        if (CONE_FIXTURES and text is not None and rel.startswith("tests/fixtures/") and rel.endswith(".sql")
+                and os.path.isfile(os.path.join(ROOT, rel))):
+            # an existing .sql fixture: no import reads it, and the child shows the tests the
+            # patched text as it does after an import of the whole tree
+            continue
         if text is None or not rel.endswith(".py") or not rel.startswith("sqlglot/"):
             return False
         name = rel[:-3].replace("/", ".").removesuffix(".__init__")
-        if name not in CONE_MAP:
-            return False
         if python_text(text) != text:
-            # the text that Python compiles from the file's bytes is not the patch text (a
-            # coding declaration, a byte order mark, bytes that do not decode): the import
-            # lines compared below would not be the ones that run
             return False
+        if name not in CONE_MAP:
+            sw = plan.swap.get(rel)
+            if sw is not None and all(m in CONE_MAP for m in sw[2]):
+                for m in sw[2]:
+                    mods.update(CONE_MAP[m])
+                work.append((sw[0], sw[1]))
+                continue
+            kl = plan.klass.get(rel)
+            if kl is None:
+                return False
+            class_work.append((kl[0], kl[1], text, kl[2], kl[3]))
+            continue
         try:
             with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
                 old = f.read()
@@ -1419,7 +1793,11 @@ def cone_plan(plan: Plan) -> bool:
     order = [m for m in sys.modules if m in mods]
     if len(order) != len(mods):
         return False
+    if class_work and (len(class_work) > 1 or any(m == kl[0] for kl in class_work for m in mods)):
+        return False
     plan.cone = order
+    plan.swap_work = work
+    plan.class_work = class_work
     return True
 
 
@@ -1465,7 +1843,7 @@ def _registry_spans(text):
             pass
         tree = ast.parse(text)
         spans = []
-        for node in ast.walk(tree):
+        for node in _walk(tree):
             if isinstance(node, ast.ClassDef):
                 for item in node.body:
                     if isinstance(item, ast.FunctionDef) and item.name in REGISTRY_METHODS:
@@ -1607,7 +1985,40 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
             plan.unaffected.add(n)
             continue
         keeps[n] = (keep_stmts, keep_files, keep_tasks, n in keeps, chosen)
+    if plan.mode == "hot" and ITERS_ON and plan.lines and None not in plan.lines.values():
+        compute_iters(plan, maps, keeps)
     return keeps
+
+
+def compute_iters(plan: Plan, maps: Maps, keeps):
+    """Loop iterations (iterred.py): in a kept statement that is a loop, only the iterations
+    that run a changed line run, unless the statement runs the line outside its iterations."""
+    import iterred
+
+    lines = {rel: lns for rel, lns in plan.lines.items() if rel.endswith(".py")}
+    for n in plan.cands:
+        rec = iterred.record(maps.path, n)
+        if rec is None:
+            continue
+        mode, edits, stmts = rec
+        k = keeps.get(n)
+        if mode == "stmt":
+            if k is None or k[0] is None or k[3]:
+                continue
+            todo = [s for s in k[0] if s in stmts]
+        else:
+            if not ITERS_WHOLE or k is not None or maps.test_units(n) is not None:
+                continue
+            todo = list(stmts)
+        kept = []
+        sites = []
+        for s in todo:
+            got = iterred.choose(stmts[s], lines)
+            if got is not None:
+                kept.extend(got)
+                sites.extend(stmts[s][0])
+        if kept:
+            plan.iters[n] = (iterred.keep_sets(kept), tuple(sorted(set(sites))), edits)
 
 
 _PINNED_INDEX = {}
@@ -1658,6 +2069,73 @@ def _moved_shape(full, lines, shape):
     return (shape[0] + move, shape[1] + move) + tuple(shape[2:])
 
 
+def _reduction_inputs(maps: Maps, tests, n, keep_stmts, scaled, it, lines_cache, faithful):
+    """The part of apply_keeps for test n that reads only the pinned test file and the maps:
+    (test id, file, class name, method, old code, new code), with old = new = None when the
+    whole method stays, or None when no reduction applies (the whole test runs). The caller
+    makes sure that the patch does not change the test's file."""
+    import reduce
+
+    test_id = tests[n]["id"]
+    rel, cls_name, meth = test_id.split("::")
+    trec = maps.test_units(n)
+    shape = None
+    if trec is not None:
+        shape = (trec[0], trec[1], trec[2])
+        if keep_stmts is not None and {i for i, st in enumerate(trec[2]) if st[2]} <= keep_stmts:
+            keep_stmts = None  # every statement stays
+    if keep_stmts is None and not scaled and it is None:
+        return (test_id, rel, cls_name, meth, None, None)
+    frec = maps.file(rel)
+    if frec is None:
+        return None
+    if shape is None:
+        shape = maps.meta["shapes"].get(n)
+        if shape is None:
+            return None
+    lines = lines_cache.get(rel)
+    if lines is None:
+        with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+            lines = lines_cache[rel] = f.read().split("\n")
+    full = os.path.join(ROOT, rel)
+    pinned = pinned_code(full, meth, shape[0]) if n in faithful else None
+    got = reduce.reduction_codes(test_id, full, shape, lines, frec[1], frec[2], keep_stmts, scaled, pinned, it)
+    if got is None:
+        return None
+    return (test_id, rel, cls_name, meth) + got
+
+
+_PRE_LINES = {}  # pinned test file -> its lines (prepare_keeps, parent side)
+
+
+def prepare_keeps(plan: Plan, maps: Maps, tests):
+    """Parent side, before the fork of a function-body commit's child: the reduced code of
+    its test methods (what apply_keeps would compile in the child). Same results; the work
+    (file reads, map records, compiles) is done once here, so that the child does not pay
+    for it in copy-on-write page faults, and file reads and map records are shared by all
+    children. Only when the patch changes no file that the reduced tests are in; otherwise
+    the child does it all, as before. The result names the keeps and iters that it was made
+    from: apply_keeps uses it only for exactly these."""
+    plan.pre_keeps = None
+    if not plan.keeps or NO_REDUCE or plan.mode != "hot":
+        return
+    iters = plan.iters if ITERS_ON else {}
+    items = list(plan.keeps.items()) + [(n, (None, None, None, False, None)) for n in iters if n not in plan.keeps]
+    rels = {tests[n]["id"].split("::")[0] for n, _ in items}
+    if rels & set(plan.files):
+        return
+    faithful = maps.faithful()
+    pre = {}
+    for n, (keep_stmts, keep_files, keep_tasks, scaled, _) in items:
+        it = iters.get(n)
+        try:
+            got = _reduction_inputs(maps, tests, n, keep_stmts, scaled, it, _PRE_LINES, faithful)
+        except Exception:  # noqa: BLE001  (the child does it, as before)
+            return
+        pre[n] = None if got is None else got + (keep_files, keep_tasks, it)
+    plan.pre_keeps = (plan.keeps, plan.iters, pre)
+
+
 def apply_keeps(plan: Plan, maps: Maps, tests):
     """Child side: replaces the code of the reduced test methods. Returns {test: (files, tasks)}."""
     import importlib
@@ -1665,9 +2143,36 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
     import reduce
 
     out = {}
+    iters = plan.iters if plan.mode == "hot" and ITERS_ON else {}
+    if iters:
+        import iterred
+
+        iterred.install()
+    pre = plan.pre_keeps
+    if pre is not None and plan.mode == "hot" and pre[0] is plan.keeps and pre[1] is plan.iters:
+        # the parent compiled the reduced methods (prepare_keeps): only the swaps are left
+        for n, item in pre[2].items():
+            if item is None:
+                continue
+            test_id, rel, cls_name, meth, old, new, keep_files, keep_tasks, it = item
+            if old is not None:
+                try:
+                    cls = getattr(importlib.import_module(rel[:-3].replace("/", ".")), cls_name)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not reduce.install_reduction(cls, meth, old, new):
+                    if DEBUG:
+                        sys.stderr.write("reduction not applied: %s\n" % test_id)
+                    continue
+            out[n] = (keep_files, keep_tasks) if it is None else (keep_files, keep_tasks, it[0][0], it[0][1])
+        return out
     lines_cache = {}
     faithful = maps.faithful()
-    for n, (keep_stmts, keep_files, keep_tasks, scaled, _) in plan.keeps.items():
+    items = list(plan.keeps.items())
+    if iters:
+        items += [(n, (None, None, None, False, None)) for n in iters if n not in plan.keeps]
+    for n, (keep_stmts, keep_files, keep_tasks, scaled, _) in items:
+        it = iters.get(n)
         test_id = tests[n]["id"]
         rel, cls_name, meth = test_id.split("::")
         trec = maps.test_units(n)
@@ -1676,7 +2181,7 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
             shape = (trec[0], trec[1], trec[2])
             if keep_stmts is not None and {i for i, st in enumerate(trec[2]) if st[2]} <= keep_stmts:
                 keep_stmts = None  # every statement stays
-        if keep_stmts is not None or scaled:
+        if keep_stmts is not None or scaled or it is not None:
             frec = maps.file(rel)
             if frec is None:
                 continue
@@ -1704,11 +2209,11 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
             # at build time): the pinned code object stands in for that compile.
             pinned = pinned_code(full, meth, shape[0]) if n in faithful and rel not in plan.files else None
             if not reduce.apply_reduction(cls, test_id, full, shape, lines,
-                                          frec[1], frec[2], keep_stmts, scaled, pinned):
+                                          frec[1], frec[2], keep_stmts, scaled, pinned, it):
                 if DEBUG:
                     sys.stderr.write("reduction not applied: %s\n" % test_id)
                 continue
-        out[n] = (keep_files, keep_tasks)
+        out[n] = (keep_files, keep_tasks) if it is None else (keep_files, keep_tasks, it[0][0], it[0][1])
     return out
 
 
@@ -2086,7 +2591,37 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 # other commits, whose parent froze them): a collection would walk all of them.
                 gc.freeze()
                 try:
+                    if plan.swap_work:
+                        # files whose only change is a function body: the code objects are
+                        # replaced, as for a function-body commit (the module is not in the cone)
+                        swaps = []
+                        for full, pairs in plan.swap_work:
+                            got = engine.plan_swaps(pairs, index) if index is not None else None
+                            if got is None:
+                                raise cone.Redo("no safe code replacement")
+                            swaps.extend(got)
+                        for f, code in swaps:
+                            f.__code__ = code
+                        cone.expect_code(swaps)
+                    class_done = None
+                    if plan.class_work:
+                        # one class-level statement of a class changed: the patched class is
+                        # created beside the pinned one (classroute.py); the checks of
+                        # reimport() below also cover what its creation did outside it
+                        import classroute
+
+                        kmod, kname, ktext, kfull, kreads = plan.class_work[0]
+                        if BASE_STATE is None:
+                            raise cone.Redo("class route: no base state")
+                        class_done = classroute.prepare(kmod, kname, ktext, kfull, kreads, BASE_STATE, BASE_CODES, {})
                     cone_touched = cone.reimport(plan.cone, lambda: engine.install_overlay(ROOT, py_files))
+                    if class_done is not None:
+                        k_old, k_new, k_names, k_changed = class_done[:4]
+                        k_ref = classroute.apply(k_old, k_new, k_names)
+                        class_done = k_new = None
+                        if not classroute.gone(k_ref):
+                            raise cone.Redo("class route: the new class is still alive")
+                        class_done = (k_old, kmod, kname, k_changed)
                 except Exception as e:  # noqa: BLE001  (cone.Redo: a check failed; anything else too)
                     if DEBUG:
                         sys.stderr.write("child %s cone: %r\n" % (plan.commit, e))
@@ -2149,6 +2684,24 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     only = set(plan.cone) | cone_touched
                     new_state, fpr = statefp.snapshot(alias, BASE_CODES, only)
                     changed = statefp.diff_only(BASE_STATE, new_state, only)
+                    if class_done is not None:
+                        # the keys of the class that now holds the patched values, placed
+                        # where a snapshot of all modules lists them (modules by name)
+                        k_old, kmod, kname, k_changed = class_done
+                        k_state = statefp.class_state(k_old, kmod, kname, fpr)
+                        k_now = [k for k, v in k_state.items() if BASE_STATE.get(k, _MISSING) != v]
+                        if k_now != k_changed:
+                            os.write(wfd, b"REDO\n")
+                            os._exit(0)
+                        at = len(changed)
+                        for i, k in enumerate(changed):
+                            if k in new_state and k[1] > kmod:
+                                at = i
+                                break
+                            if k not in new_state:
+                                at = i
+                                break
+                        changed[at:at] = k_now
                 else:
                     new_state, fpr = statefp.snapshot(alias, BASE_CODES)
                     changed = statefp.diff(BASE_STATE, new_state)
@@ -2592,6 +3145,10 @@ def run_fixture_batch_child(batch, tests, time_left):
     ("E i"). A test that hangs, runs past the limits of run_child or kills the process ends
     the child: that commit and the ones after it have no result here, and each runs in its
     own child, as without this function."""
+    if PRE_KEEPS:
+        for plan, *_ in batch:
+            if plan.pre_keeps is None or plan.pre_keeps[0] is not plan.keeps:
+                prepare_keeps(plan, MAPS_OBJ, tests)
     r, w = os.pipe()
     release_pin_if_slow()
     pid = os.fork()
@@ -2697,6 +3254,8 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     cap: seconds that all the tests together may take from the start of the first one.
     on_diff: for a commit that changes import-time code. The child first reports which
     import-time values differ from the pinned tree; on_diff(names) then decides what to run."""
+    if plan.mode == "hot" and PRE_KEEPS and (plan.pre_keeps is None or plan.pre_keeps[0] is not plan.keeps):
+        prepare_keeps(plan, MAPS_OBJ, tests)
     r, w = os.pipe()
     plan_r = plan_w = None
     if on_diff is not None:
@@ -2926,6 +3485,57 @@ def _changes_def_header(plan: Plan):
     return False
 
 
+def _edits_own_definition(plan: Plan, key):
+    """True when the pinned function that a changed key of the import-state diff names lies
+    inside a statement that the patch edits and whose lines plan.def_units holds one by one.
+    Then every test part that called the function under this name in the pinned runs ran
+    lines that the reduced runs keep.
+
+    key: ("G", module, name) or ("A", module, class path, name). The function is looked up
+    in this process, which holds the pinned import: the plain function under classmethod,
+    staticmethod or a bound method; for a wrapper whose own code lies elsewhere, the
+    function that it keeps as __wrapped__; of a property, every accessor must lie in such
+    a statement. Anything else gives False (whole runs)."""
+    m = sys.modules.get(key[1]) if len(key) > 2 and isinstance(key[1], str) else None
+    if m is None:
+        return False
+    d = vars(m)
+    if key[0] == "A" and len(key) == 4 and isinstance(key[2], str):
+        for part in key[2].split("."):
+            obj = d.get(part)
+            if not isinstance(obj, type):
+                return False
+            d = obj.__dict__
+    elif not (key[0] == "G" and len(key) == 3):
+        return False
+    todo = [d.get(key[-1])]
+    found = 0
+    steps = 0
+    while todo:
+        steps += 1
+        if steps > 16:
+            return False
+        v = todo.pop()
+        if isinstance(v, (classmethod, staticmethod, types.MethodType)):
+            todo.append(v.__func__)
+        elif isinstance(v, property):
+            todo.extend(f for f in (v.fget, v.fset, v.fdel) if f is not None)
+        elif isinstance(v, types.FunctionType):
+            code = v.__code__
+            rel = os.path.relpath(code.co_filename, ROOT)
+            if code.co_firstlineno in plan.def_units.get(rel, ()):
+                found += 1  # every caller runs lines of this code
+                continue
+            # a wrapper made by a decorator elsewhere: the function that it wraps decides
+            inner = getattr(v, "__wrapped__", None)
+            if inner is None:
+                return False
+            todo.append(inner)
+        else:
+            return False
+    return found > 0
+
+
 _GETATTR_SPANS = {}
 
 
@@ -2984,6 +3594,13 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         plan.note.append("import state: many changes")
         plan.lines = {"?": None}
         return
+    # A patch can hold, beside its import-time edit, an edit in call-time code of another
+    # function (planned by plan_python_file: plan.work, and the lines of the changed
+    # statements in plan.lines). The import-state diff says nothing about which tests run
+    # those statements, so their lines stay among the lines of the reduced runs below.
+    work_files = {full for full, _ in plan.work}
+    call_lines = {rel: set(lns) for rel, lns in plan.lines.items()
+                  if lns and os.path.join(ROOT, rel) in work_files}
     names = set()
     whole = bool(plan.gone)  # a removed name can fail any line that mentions it
     owners = set()
@@ -2996,8 +3613,11 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         elif is_function:
             # A function is also reached by computed names (dispatch tables). The reduced
             # runs are safe for it only when the patch changed that function's own header:
-            # then every user runs its body, and the body lines are known.
-            if not plan.def_units:
+            # then every user runs its body, and the body lines are known. That is checked
+            # for this very function: an edited definition elsewhere in the patch says
+            # nothing about it. (So a function whose body the patch changed in call-time
+            # code, beside an import-time edit, gives whole runs.)
+            if not _edits_own_definition(plan, key):
                 whole = True
         else:
             names.add(name)
@@ -3018,7 +3638,7 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
             before = len(plan.cands)
             plan.cands &= readers | plan.data_cands
             plan.note.append("key map: %d -> %d" % (before, len(plan.cands)))
-    if not keys and not plan.fpairs:
+    if not keys and not plan.fpairs and not plan.work:
         # Nothing that the import leaves behind differs. The edit very likely does nothing;
         # the cheapest candidates still run as a check, and nothing is selected unrun.
         plan.note.append("import state unchanged")
@@ -3059,7 +3679,7 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
                 acc.update(range(rec[9][ln], rec[10][ln] + 1))
             else:
                 acc.add(ln)
-    for src in (plan.stmt_lines, plan.def_units):
+    for src in (plan.stmt_lines, plan.def_units, call_lines):
         for path, lns in src.items():
             full.setdefault(path, set()).update(lns)
             plan.plain_lines.update((path, ln) for ln in lns)
@@ -3234,6 +3854,15 @@ def pin_to_one_cpu():
         _PIN = (time.monotonic(), sum(os.times()[:4]), allowed)
     except (OSError, ValueError, IndexError, AttributeError):
         pass
+
+
+def pin_carry(cpu_before):
+    """In a process forked from the pinned one that starts children of its own (the cone
+    holder): its CPU clock starts at zero, so the CPU seconds that the batch had used before
+    the fork are added to what release_pin_if_slow compares the wall time with."""
+    global _PIN
+    if _PIN is not None:
+        _PIN = (_PIN[0], _PIN[1] - cpu_before, _PIN[2])
 
 
 def release_pin_if_slow():
@@ -3445,6 +4074,7 @@ def run(t_start, deadline, state):
     if os.environ.get("BR_PLAN_ONLY"):
         with open(os.environ["BR_PLAN_ONLY"], "w") as f:
             json.dump({c: {"mode": p.mode, "cands": sorted(p.cands), "note": p.note, "files": sorted(p.files),
+                           "iters": {str(n): len(v[0][0]) for n, v in p.iters.items()},
                            "infect_fresh": None if p.infect_fresh is None else sorted(p.infect_fresh)}
                        for c, p in plans.items()}, f)
         return
@@ -3503,7 +4133,10 @@ def run(t_start, deadline, state):
         # exception: a very long test (the TPC-DS run, for instance) is left out unless a
         # failing test is close to it (same test class, or same fixture file) or many tests fail.
         if "import state unchanged" in plan.note and not failing and not plan.broken and not unknown:
-            pass  # the import left nothing different and the cheapest candidates pass
+            # the import left nothing different and the cheapest candidates pass; a held test
+            # that reads a data file of the patch (a fixture edited beside the code) can still
+            # fail, so it stays selected
+            selected.update(n for n in held if n in plan.data_cands)
         elif plan.broken or not verdicts or unknown:
             selected.update(held)
         else:
@@ -3548,7 +4181,7 @@ def run(t_start, deadline, state):
             debug_rows[c] = {
                 "mode": plan.mode, "status": status, "cands": sorted(plan.cands), "cpu": round(sum(os.times()[:4]), 3),
                 "verdicts": {str(k): int(v) for k, v in verdicts.items()}, "note": plan.note,
-                "reduced": sorted(plan.keeps), "held": sorted(held), "ran": len(ran), "diff": plan.diff,
+                "reduced": sorted(plan.keeps), "iters": {str(n): len(v[0][0]) for n, v in plan.iters.items()}, "held": sorted(held), "ran": len(ran), "diff": plan.diff,
                 "must": sorted(plan.must), "sure": sorted(plan.sure_infected.intersection(held)), "tokcheck": plan.tokcheck,
                 "times": {str(k): round(v, 4) for k, v in plan.times.items()},
                 "body": {str(k): round(v, 4) for k, v in plan.body.items()},
@@ -3557,7 +4190,7 @@ def run(t_start, deadline, state):
                 "costs": {str(n): round(estimate_cost(n, plan, maps, seconds), 4) for n in ran},
                 "est": round(sum(estimate_cost(n, plan, maps, seconds) for n in ran), 3),
                 "cone": len(plan.cone) if plan.mode == "fresh_cone" else ("redo" if plan.cone == [] else None),
-                "dkeys": DEBUG_DKEYS.get(c),
+                "dkeys": DEBUG_DKEYS.get(c), "swap": len(plan.swap_work) if plan.mode == "fresh_cone" else None,
             }
             if plan.watch:
                 debug_rows[c]["leaks"] = plan.leaks[:20]
@@ -4196,16 +4829,126 @@ def run(t_start, deadline, state):
             needers = [c for c in cone_first + hot + later if needs_pandas(c)]
             pandas_turn = needers[0] if len(needers) >= 2 else None
     cone_done = set()
-    for c in cone_first:
-        if c == pandas_turn:
+
+    def cone_loop(todo):
+        """Runs the cone commits of todo, each in its own child. Returns the commits that got
+        their answer; the others (REDO) are imported whole below."""
+        done = set()
+        cone_index = None
+        if any(plans[c].swap_work for c in todo):
+            # the live functions, for the cone children that replace code objects (gc.get_objects
+            # leaves out frozen objects: preimport_for_fresh froze them)
+            t_idx = time.process_time()
+            gc.unfreeze()
+            cone_index = engine.FunctionIndex(ROOT)
+            gc.freeze()
+            log("cone function index in", round(time.process_time() - t_idx, 3))
+        for c in todo:
+            if c == pandas_turn:
+                load_pandas_here()
+            plan = plans[c]
+            plan.mode = "fresh_cone"
+            if execute_safe(c, plan, cone_index if plan.swap_work else None) == "REDO":
+                plan.cone = []  # the checks failed: the whole tree is imported below
+                plan.mode = "fresh"
+            else:
+                done.add(c)
+        return done
+
+    def cone_in_holder(todo):
+        """Runs cone_loop(todo) in a forked holder process, while this process waits without
+        running any Python code. Why: the work of this process while a child lives (the
+        import-state comparison of each cone commit) writes to memory that it shares with
+        that child, and every such write splits a 2 MB page of this process into 4 kB pages
+        for good. Then each later fork copies, and each child exit tears down, about ten
+        times more page table entries (measured: about 10 ms more CPU per later child).
+        In the holder, those writes split only the holder's pages. Nothing is loaded twice:
+        the holder inherits everything that this process loaded before the cone step, and
+        this process continues from the same state as after cone_loop. Returns the commits
+        that the holder answered (their answers are filled in here) and the commits whose
+        cone checks failed (REDO: imported whole below, as after cone_loop). Commits without
+        a report from the holder are left to cone_loop in this process."""
+        r, w = os.pipe()
+        cpu_before = sum(os.times()[:4])
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(r)
+                pin_carry(cpu_before)
+                done = cone_loop(todo)
+                out = {"done": {c: answers[c] for c in done if c in answers},
+                       "redo": [c for c in todo if c not in done]}
+                if DEBUG:
+                    out["debug"] = json.dumps({c: debug_rows[c] for c in done if c in debug_rows})
+                data = marshal.dumps(out)
+                while data:
+                    data = data[os.write(w, data):]
+            except BaseException as e:  # noqa: BLE001
+                try:
+                    log("cone holder failed", repr(e))
+                except BaseException:  # noqa: BLE001
+                    pass
+            finally:
+                os._exit(0)
+        os.close(w)
+        chunks = []
+        try:
+            while True:
+                left = deadline - time.monotonic() - 5.0
+                if left <= 0:
+                    break
+                ready, _, _ = select.select([r], [], [], left)
+                if not ready:
+                    break
+                chunk = os.read(r, 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(r)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0] > 0:
+                    pass
+            except ChildProcessError:
+                pass
+        try:
+            out = marshal.loads(b"".join(chunks))
+        except (EOFError, ValueError, TypeError):
+            log("cone holder: no report")
+            return set(), set()
+        done = set(out["done"])
+        for c, workers in out["done"].items():
+            answers[c] = workers
+        if DEBUG and "debug" in out:
+            debug_rows.update(json.loads(out["debug"]))
+        redo = set(out["redo"]) - done
+        log("cone holder:", len(todo), "commits,", len(done), "answered,", len(redo), "to import whole")
+        for c in redo:
+            plans[c].cone = []
+            plans[c].mode = "fresh"
+        return done, redo
+
+    if cone_first and _holder_pays():
+        if pandas_turn in cone_first and any(needs_pandas(c) for c in hot + [f for f in fresh if f not in set(cone_first)]):
+            # numpy and pandas are needed after the cone step too: loaded here, once, before
+            # the holder starts (it inherits them)
             load_pandas_here()
-        plan = plans[c]
-        plan.mode = "fresh_cone"
-        if execute_safe(c, plan, None) == "REDO":
-            plan.cone = []  # the checks failed: the whole tree is imported below
-            plan.mode = "fresh"
-        else:
-            cone_done.add(c)
+        held_done, held_redo = cone_in_holder(cone_first)
+        cone_done |= held_done
+        rest = [c for c in cone_first if c not in held_done and c not in held_redo]
+        if pandas_turn in cone_first and not pandas_here:
+            # the holder loaded numpy and pandas for itself: this process loads them before
+            # its own first commit that needs them
+            pandas_turn = next((c for c in rest + hot + [f for f in fresh if f not in held_done]
+                                if needs_pandas(c)), None)
+        cone_done |= cone_loop(rest)
+    else:
+        cone_done |= cone_loop(cone_first)
     if cone_done:
         fresh = [c for c in fresh if c not in cone_done]
     if hot:

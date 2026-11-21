@@ -363,12 +363,9 @@ def keep_shared_state(file_lines, shape, keep):
     return out
 
 
-def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled, pinned=None):
-    """Replaces the code of a test method by its reduced and/or small-scale form.
-
-    keep_stmts: set of statement indices to keep, or None for all. Returns True on success.
-    pinned: the pinned code object of the method, when its compile alone is known to give
-    an equal code object (the caller checks that): then it is not compiled again."""
+def reduction_codes(test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled, pinned=None, iters=None):
+    """The part of apply_reduction that only reads its arguments: (old code, new code) of the
+    method, or None. The parent can do it before the fork (selector.prepare_keeps)."""
     import engine
 
     _, class_name, method = test_id.split("::")
@@ -380,20 +377,32 @@ def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_na
     if scaled:
         new_lines = scale_lines(test_id, new_lines, keep_stmts is not None)
         if new_lines is None:
-            return False
+            return None
+    if iters is not None:
+        # loop-iteration parts (iterred.py): the kept loops iterate through _br_loop
+        import iterred
+
+        new_lines = iterred.rewrite_by_edits(new_lines, first, iters[2], iters[1])
+        if new_lines is None:
+            return None
     if pinned is not None:
         old = pinned
     else:
         old_mod = engine.compile_lines(old_lines, first, (class_name,), full_path, flags, import_names)
         if old_mod is None:
-            return False
+            return None
         old = find_code(old_mod, method, first)
     new_mod = engine.compile_lines(new_lines, first, (class_name,), full_path, flags, import_names)
     if new_mod is None:
-        return False
+        return None
     new = find_code(new_mod, method, first)
     if old is None or new is None:
-        return False
+        return None
+    return old, new
+
+
+def install_reduction(cls, method, old, new):
+    """The part of apply_reduction that changes the live test class. Returns True on success."""
     func = live_function(cls, method, old)
     if func is None or len(old.co_freevars) != len(new.co_freevars):
         return False
@@ -401,3 +410,15 @@ def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_na
         SWAPPED.append((func, func.__code__))
     func.__code__ = new
     return True
+
+
+def apply_reduction(cls, test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled, pinned=None, iters=None):
+    """Replaces the code of a test method by its reduced and/or small-scale form.
+
+    keep_stmts: set of statement indices to keep, or None for all. Returns True on success.
+    pinned: the pinned code object of the method, when its compile alone is known to give
+    an equal code object (the caller checks that): then it is not compiled again."""
+    got = reduction_codes(test_id, full_path, shape, file_lines, flags, import_names, keep_stmts, scaled, pinned, iters)
+    if got is None:
+        return False
+    return install_reduction(cls, test_id.split("::")[2], got[0], got[1])

@@ -65,6 +65,10 @@ ENV PYTHONHASHSEED=0 \
 #    DuckDB's answers to the SQL texts of the pinned tests are recorded too (build_duck_replay.py,
 #    duckreplay.py): a test that sends a recorded text gets the recorded answer, any other text
 #    runs in DuckDB. If the recording or its rehearsal fails, every query runs as before.
+#    Two more facts of the pinned tree are prepared here: whether any test file reads docstrings
+#    (build_docs_read.py; the selector otherwise reads all test files to find out), and the map
+#    files are stored without zlib compression (rawmaps.py; rawz.py reads both forms, and every
+#    converted file is read back and compared). If a step fails, the selector works as before.
 COPY app /app
 RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
@@ -73,6 +77,9 @@ RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "no DuckDB answer recording; every query runs" >&2; rm -f /app/cache/duck_replay.bin)) \
     && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
      || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
+    && (python /app/build_docs_read.py /repo /app/maps /app/cache/docs_read.json \
+     || (echo "no saved docs answer; the selector reads the test files" >&2; rm -f /app/cache/docs_read.json)) \
+    && (python /app/rawmaps.py /app/maps || echo "maps stay compressed" >&2) \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app
 

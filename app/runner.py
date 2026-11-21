@@ -9,6 +9,11 @@ from unittest.suite import _ErrorHolder
 
 from reduce import STATE
 
+try:
+    from iterred import LOOPS
+except ImportError:  # pragma: no cover
+    LOOPS = None
+
 
 class Verdicts(unittest.TestResult):
     """Records pass or fail for each test. A failing subtest ends its test at once."""
@@ -49,6 +54,11 @@ class Verdicts(unittest.TestResult):
             STATE.reset()
         else:
             STATE.reset(keep[0], keep[1])
+        if LOOPS is not None:
+            if keep is not None and len(keep) > 2:
+                LOOPS.reset(keep[2], keep[3])
+            else:
+                LOOPS.reset()
         STATE.in_test = True
 
     def stopTest(self, test):
