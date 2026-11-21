@@ -44,7 +44,9 @@ COMMIT_SECONDS = float(os.environ.get("BR_COMMIT", "8.0"))  # CPU limit of the t
 FRESH_SECONDS = float(os.environ.get("BR_FRESH", "3.0"))  # the same for a commit that needs a new import
 INERT_SECONDS = 1.0  # the same when the import state did not change at all
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
-QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
+QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "2.0"))
+UNSEEN_CLASS = 10  # more tests of one class without a verdict than this: the class is not verified
+UNSEEN_HOLD_SECONDS = 5.0  # in a class that is not verified, held tests up to this length are selected
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
@@ -177,7 +179,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect")
 
     def __init__(self, commit):
         self.commit = commit
@@ -203,6 +205,7 @@ class Plan:
         self.class_filter = None  # class ids: only parts that create one of these can read the change
         self.plain_lines = set()  # (path, line) of changed code itself: no class filter there
         self.unaffected = set()  # candidates that cannot read the changed value at all
+        self.protect = set()  # tests whose verdicts decide about long held tests
 
 
 CODING_RE = re.compile(r"coding[:=]\s*[-\w.]+")
@@ -1025,16 +1028,29 @@ def run(t_start, deadline, state):
         elif plan.broken or not verdicts or unknown:
             selected.update(held)
         else:
-            # tests selected without a verdict count as evidence too: they may fail
-            evidence = failing | set(blind)
-            fail_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in evidence}
+            # On labeled mutants, a long test fails together with another test of its class
+            # (or of its fixture file) in nearly every case, and almost never without one.
+            # The tests of its class did run (see protect below), so their verdicts decide.
+            class_of = lambda n: tests[n]["id"].rsplit("::", 1)[0]
+            fail_classes = {class_of(n) for n in failing}
             fail_fixtures = set()
-            for n in evidence:
+            for n in failing:
                 fail_fixtures.update(fixtures_of(n))
+            # tests of each class that have no verdict (held, or selected without a run)
+            unseen = {}
+            for n in selected | set(held):
+                if n not in verdicts:
+                    unseen[class_of(n)] = unseen.get(class_of(n), 0) + 1
             for n in held:
-                if seconds[n] <= QUIET_HOLD_SECONDS or len(evidence) >= MANY_FAILURES:
+                if seconds[n] <= QUIET_HOLD_SECONDS:
                     selected.add(n)
-                elif tests[n]["id"].rsplit("::", 1)[0] in fail_classes or fail_fixtures & fixtures_of(n):
+                elif class_of(n) in fail_classes or fail_fixtures & fixtures_of(n):
+                    selected.add(n)
+                elif len(failing) >= MANY_FAILURES:
+                    selected.add(n)  # a commit that breaks this much can break any test
+                elif unseen.get(class_of(n), 0) > UNSEEN_CLASS and seconds[n] <= UNSEEN_HOLD_SECONDS:
+                    # Many tests of the class have no verdict, so the passes of the others
+                    # say little about this class. Only the longest tests are still left out.
                     selected.add(n)
         for n in plan.pool_died:
             cls_id = tests[n]["id"].rsplit("::", 1)[0]
@@ -1072,13 +1088,26 @@ def run(t_start, deadline, state):
         budget = COMMIT_SECONDS if plan.mode == "hot" else FRESH_SECONDS
         if "import state unchanged" in plan.note:
             budget = INERT_SECONDS
+        # the verdicts of these tests decide about the long held tests: they run first
+        long_held = [n for n in held if seconds[n] > QUIET_HOLD_SECONDS]
+        protect_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in long_held}
+        protect_fixtures = set()
+        for n in long_held:
+            protect_fixtures.update(fixtures_of(n))
+        plan.protect = {
+            n for n in ran
+            if tests[n]["id"].rsplit("::", 1)[0] in protect_classes
+            or (protect_fixtures and protect_fixtures & fixtures_of(n) and cost[n] <= 2.0)
+        }
         if sum(cost[n] for n in ran) > budget:
-            # keep the cheapest tests up to the limit; the others are held
+            # The CPU limit does not allow every run. A held test is selected as it is, which
+            # costs its recorded seconds: so the runs that save the most recorded seconds per
+            # CPU second go first, and the tests that are cheap to select are the ones held.
             keep_set = set()
             acc = 0.0
-            for n in sorted(ran, key=lambda n: cost[n]):
+            for n in sorted(ran, key=lambda n: (n not in plan.protect, -(seconds[n] + 0.002) / (cost[n] + 0.002), cost[n])):
                 if acc + cost[n] > budget:
-                    break
+                    continue
                 acc += cost[n]
                 keep_set.add(n)
             held += [n for n in ran if n not in keep_set]
@@ -1095,7 +1124,9 @@ def run(t_start, deadline, state):
             # Once a test has failed, the commit is known to break something. A further
             # verdict then only saves the recorded seconds of a passing test, so only runs
             # that are cheap next to those seconds go on; the others are selected as they are.
-            skip = set() if RUN_ALL else {n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n])}
+            skip = set() if RUN_ALL else {
+                n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
+            }
             return ran, allowed, skip
 
         left = deadline - time.monotonic()
