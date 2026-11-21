@@ -1,115 +1,307 @@
-"""Coverage and data-read maps built from the pinned commit (see lab/build_maps.py).
-
-Layout of maps/:
-- index.marshal  marshal'd dict:
-    tests        list of test ids; bit i of every bitset is tests[i]
-    files        {path: (offset, length)} into cov.bin, one block per source file
-    preload      {path: [(qualname, firstlineno), ...]} code objects that ran
-                 while the warm state was built (imports, metaclasses, ...)
-    preload_mods [path, ...] modules imported while the warm state was built
-    reads        {path: bitset} tests that opened the file as data
-    lists        {dir: bitset} tests that listed the directory
-    subprocs     bitset of tests that started a subprocess
-    tokens_blob  (offset, length) of the zlib'd identifier set in cov.bin
-- cov.bin  zlib(marshal) blocks. A file block is a dict:
-    codes   {(qualname, firstlineno): bitset_id}   tests that started the code object
-    lines   {(qualname, firstlineno, line): bitset_id}  tests that ran that line in it
-    sets    [bitset, ...]  deduplicated bitsets (Python ints)
-
-Only the blocks of files a patch touches are decompressed.
-"""
-
+"""Lazy loader for maps/ (built by tools/buildmaps.py). Stdlib only."""
 from __future__ import annotations
 
-import marshal
+import array
+import json
 import os
+import sys
 import zlib
 
+_dir = None
+_index = {}
+_fh = None
+_cache = {}      # file -> _FileCov
+_meta = None
+_reads = None
+_EMPTY = frozenset()
 
-class Maps:
-    def __init__(self, directory: str):
-        self.directory = directory
-        with open(os.path.join(directory, "index.marshal"), "rb") as f:
-            index = marshal.load(f)
-        self.tests: list[str] = index["tests"]
-        self._files: dict = index["files"]
-        self.preload: dict = {path: set(codes) for path, codes in index["preload"].items()}
-        self.preload_mods: set = set(index["preload_mods"])
-        self.reads: dict = index["reads"]
-        self.lists: dict = index["lists"]
-        self.subprocs: int = index["subprocs"]
-        self.cpu = index.get("cpu")  # per test: CPU seconds of one isolated run here, or None
-        self._tokens_at = index.get("tokens_blob")
-        self._index_names_at = index.get("names_blob")
-        self._names = None
-        self._blocks: dict = {}
-        self._tokens = None
-        self._cov = None
 
-    def _read(self, offset: int, length: int) -> bytes:
-        if self._cov is None:
-            self._cov = open(os.path.join(self.directory, "cov.bin"), "rb")
-        self._cov.seek(offset)
-        return zlib.decompress(self._cov.read(length))
+class _FileCov:
+    __slots__ = ("lines", "fi", "ti", "data", "offs", "sets", "pos", "memo")
 
-    def has_file(self, path: str) -> bool:
-        return path in self._files
+    def __init__(self, blob):
+        raw = zlib.decompress(blob)
+        nsets, nlines = array.array("I", raw[:8])
+        p = 8
+        offs = array.array("I")
+        offs.frombytes(raw[p:p + 4 * (nsets + 1)])
+        p += 4 * (nsets + 1)
+        arrs = []
+        for _ in range(3):
+            a = array.array("I")
+            a.frombytes(raw[p:p + 4 * nlines])
+            p += 4 * nlines
+            arrs.append(a)
+        if sys.byteorder != "little":
+            offs.byteswap()
+            for a in arrs:
+                a.byteswap()
+        self.offs = offs
+        self.lines = arrs[0]
+        self.fi = arrs[1]
+        self.ti = arrs[2]
+        self.data = raw[p:]
+        self.sets = {}
+        self.pos = None
+        self.memo = {}
 
-    def block(self, path: str):
-        block = self._blocks.get(path)
-        if block is None:
-            where = self._files.get(path)
-            block = {"codes": {}, "lines": {}, "sets": []} if where is None else marshal.loads(self._read(*where))
-            self._blocks[path] = block
-        return block
+    def line_pos(self, line):
+        if self.pos is None:
+            self.pos = {ln: i for i, ln in enumerate(self.lines)}
+        return self.pos.get(line)
 
-    def code_tests(self, path: str, key) -> int:
-        block = self.block(path)
-        i = block["codes"].get(key)
-        return 0 if i is None else block["sets"][i]
+    def get_set(self, i):
+        if i == 0:
+            return _EMPTY
+        s = self.sets.get(i)
+        if s is None:
+            d = self.data
+            p = self.offs[i]
+            cnt = 0
+            shift = 0
+            while True:
+                b = d[p]
+                p += 1
+                cnt |= (b & 0x7F) << shift
+                if b < 0x80:
+                    break
+                shift += 7
+            vals = []
+            prev = 0
+            for _ in range(cnt):
+                v = 0
+                shift = 0
+                while True:
+                    b = d[p]
+                    p += 1
+                    v |= (b & 0x7F) << shift
+                    if b < 0x80:
+                        break
+                    shift += 7
+                prev += v
+                vals.append(prev)
+            s = self.sets[i] = frozenset(vals)
+        return s
 
-    def line_tests(self, path: str, key, lines) -> int:
-        block = self.block(path)
-        out = 0
-        get = block["lines"].get
-        sets = block["sets"]
-        for line in lines:
-            i = get((key[0], key[1], line))
-            if i is not None:
-                out |= sets[i]
-        return out
 
-    def file_tests(self, path: str) -> int:
-        """Tests that started any code object of the file."""
-        block = self.block(path)
-        out = 0
-        for i in set(block["codes"].values()):
-            out |= block["sets"][i]
-        return out
+def load(dir):
+    global _dir, _index, _fh, _cache, _meta, _reads, _cls, _uses
+    _cls = None
+    _uses = None
+    _dir = os.fspath(dir)
+    with open(os.path.join(_dir, "index.json")) as f:
+        _index = json.load(f)
+    if _fh is not None:
+        _fh.close()
+    _fh = None
+    _cache = {}
+    _meta = None
+    _reads = None
 
-    def readers(self, path: str) -> int:
-        """Tests that opened the file's content (a modification is visible to them)."""
-        return self.reads.get(path, 0)
 
-    def dir_listers(self, directory: str) -> int:
-        """Tests that listed the directory or an ancestor (a new or removed name is visible)."""
-        out = 0
+def _norm(file):
+    f = file.replace("\\", "/")
+    while f.startswith("./"):
+        f = f[2:]
+    return f
+
+
+def _cov(file):
+    global _fh
+    c = _cache.get(file)
+    if c is None:
+        ent = _index.get(file)
+        if ent is None:
+            return None
+        if _fh is None:
+            _fh = open(os.path.join(_dir, "cov.bin"), "rb")
+        _fh.seek(ent[0])
+        c = _cache[file] = _FileCov(_fh.read(ent[1]))
+    return c
+
+
+def known_file(file) -> bool:
+    return _norm(file) in _index
+
+
+def lines(file) -> set:
+    c = _cov(_norm(file))
+    return set(c.lines) if c else set()
+
+
+def tests_for(file, line, kind="any"):
+    c = _cov(_norm(file))
+    if c is None:
+        return _EMPTY
+    i = c.line_pos(line)
+    if i is None:
+        return _EMPTY
+    if kind == "fn":
+        return c.get_set(c.fi[i])
+    if kind == "top":
+        return c.get_set(c.ti[i])
+    key = (c.fi[i], c.ti[i])
+    r = c.memo.get(key)
+    if r is None:
+        a, b = c.get_set(key[0]), c.get_set(key[1])
+        r = c.memo[key] = (a | b) if (a and b) else (a or b)
+    return r
+
+
+def tests_for_file(file, kind="any"):
+    c = _cov(_norm(file))
+    if c is None:
+        return _EMPTY
+    ids = set()
+    if kind in ("any", "fn"):
+        ids.update(c.fi)
+    if kind in ("any", "top"):
+        ids.update(c.ti)
+    out = set()
+    for i in ids:
+        out |= c.get_set(i)
+    return frozenset(out)
+
+
+def _load_meta():
+    global _meta
+    if _meta is None:
+        with open(os.path.join(_dir, "meta.json")) as f:
+            _meta = json.load(f)
+    return _meta
+
+
+def tests_reading(path):
+    global _reads
+    if _reads is None:
+        with open(os.path.join(_dir, "reads.json.z"), "rb") as f:
+            _reads = json.loads(zlib.decompress(f.read()))
+    return frozenset(_reads.get(_norm(path), ()))
+
+
+def test_ids():
+    return list(_load_meta()["tests"])
+
+
+def isolated_failures():
+    m = _load_meta()
+    return set(m["failed_isolated"]) | set(m["not_recorded"])
+
+
+def test_cpu():
+    return list(_load_meta()["cpu"])
+
+
+# ---------------------------------------------------------------- class table / class usage
+_cls = None
+_uses = None
+
+
+def _decode_set(d, p):
+    cnt = 0
+    shift = 0
+    while True:
+        b = d[p]
+        p += 1
+        cnt |= (b & 0x7F) << shift
+        if b < 0x80:
+            break
+        shift += 7
+    vals = []
+    prev = 0
+    for _ in range(cnt):
+        v = 0
+        shift = 0
         while True:
-            out |= self.lists.get(directory, 0)
-            if not directory:
+            b = d[p]
+            p += 1
+            v |= (b & 0x7F) << shift
+            if b < 0x80:
                 break
-            directory = os.path.dirname(directory)
-        return out
+            shift += 7
+        prev += v
+        vals.append(prev)
+    return frozenset(vals)
 
-    def name_readers(self, name: str) -> int:
-        """Tests that ran a code object naming `name` (attribute, global or string constant)."""
-        if self._names is None:
-            at = self._index_names_at
-            self._names = marshal.loads(self._read(*at)) if at else {"names": {}, "sets": []}
-        i = self._names["names"].get(name)
-        return 0 if i is None else self._names["sets"][i]
 
-    def tokens(self) -> frozenset:
-        if self._tokens is None:
-            self._tokens = frozenset(marshal.loads(self._read(*self._tokens_at))) if self._tokens_at else frozenset()
-        return self._tokens
+def _load_cls():
+    global _cls
+    if _cls is None:
+        with open(os.path.join(_dir, "classes.json.z"), "rb") as f:
+            tab = json.loads(zlib.decompress(f.read()))
+        keys = tab["keys"]
+        rows = tab["rows"]
+        byfile = {}
+        for i, r in enumerate(rows):
+            byfile.setdefault(r[0], []).append((r[1], r[2], i))
+        fam_of = {}
+        for fi, fam in enumerate(tab["families"]):
+            for m in fam:
+                fam_of.setdefault(m, []).append(fi)
+        _cls = (keys, {k: i for i, k in enumerate(keys)}, rows, byfile, tab["families"], fam_of)
+    return _cls
+
+
+def class_at(file, line):
+    """Key of the innermost class whose span (decorators..last line) contains `line`, else None."""
+    keys, _, rows, byfile, _, _ = _load_cls()
+    best = None
+    for s, e, i in byfile.get(_norm(file), ()):
+        if s <= line <= e and (best is None or s >= best[0]):
+            best = (s, i)
+    return keys[best[1]] if best else None
+
+
+def class_span(key):
+    _, kid, rows, _, _, _ = _load_cls()
+    i = kid.get(key)
+    return (rows[i][1], rows[i][2]) if i is not None else None
+
+
+def class_tracked(key) -> bool:
+    _, kid, rows, _, _, _ = _load_cls()
+    i = kid.get(key)
+    return bool(rows[i][3]) if i is not None else False
+
+
+def class_family(key):
+    """Keys considered used together with `key` (including itself)."""
+    keys, kid, rows, _, fams, fam_of = _load_cls()
+    i = kid.get(key)
+    if i is None:
+        return {key}
+    s = {i}
+    for fi in fam_of.get(i, ()):
+        s.update(fams[fi])
+    return {keys[j] for j in s}
+
+
+def tests_using_class(key):
+    """Tests that instantiated any class whose root-MRO intersects {key} + its family mates."""
+    global _uses
+    keys, kid, rows, _, fams, fam_of = _load_cls()
+    i = kid.get(key)
+    if i is None:
+        return _EMPTY
+    if _uses is None:
+        with open(os.path.join(_dir, "uses.bin"), "rb") as f:
+            raw = zlib.decompress(f.read())
+        n = array.array("I", raw[:4])[0]
+        offs = array.array("I")
+        offs.frombytes(raw[4:4 + 4 * (n + 1)])
+        if sys.byteorder != "little":
+            offs.byteswap()
+        _uses = (offs, raw[4 + 4 * (n + 1):], {})
+    offs, data, memo = _uses
+    s = {i}
+    for fi in fam_of.get(i, ()):
+        s.update(fams[fi])
+    out = set()
+    for j in s:
+        u = rows[j][5]
+        if u:
+            t = memo.get(u)
+            if t is None:
+                t = memo[u] = _decode_set(data, offs[u])
+            out |= t
+    return frozenset(out)

@@ -1,8 +1,4 @@
-# Whitelist: only what the image needs.
-*
-!Dockerfile
-!requirements.lock
-!br/
-!maps/
-!legacy/
-br/**/__pycache__
+.git
+tests_br
+__pycache__
+*.pyc

@@ -1,229 +1,214 @@
-"""Pack selected tests onto at most 8 workers at minimum commit cost.
+"""Split tests over 1..8 workers minimizing  max worker load + 2000 ms * non-empty workers.
 
-Cost model (kit/SCORING.md): a test lasts round-half-up(seconds * 1000) ms; a
-commit with no worker costs 0, otherwise its largest worker load plus 2000 ms
-per non-empty worker. pack() tries every worker count k: longest-processing-
-time-first, then a move/swap local search on the most loaded worker, and an
-exact branch-and-bound when there are few tests. Fully deterministic.
+``best`` = LPT per worker count k, a bounded move/swap improvement pass, and an
+exact branch-and-bound for small inputs.  Pure stdlib, no recursion on input size.
 """
 
 from __future__ import annotations
 
-import bisect
 import heapq
 import math
-from collections.abc import Iterable, Mapping, Sequence
+import time
+from bisect import bisect_left
+from collections.abc import Mapping, Sequence
 
-__all__ = ["WORKER_COST_MS", "MAX_WORKERS", "EXACT_LIMIT", "duration_ms", "cost", "pack"]
-
-WORKER_COST_MS = 2_000
+WORKER_MS = 2000
 MAX_WORKERS = 8
-EXACT_LIMIT = 14
-_EXACT_NODE_LIMIT = 300_000
+_EXACT_N = 14  # exact search only when the input is this small
+_EXACT_NODES = 40000
+_IMPROVE_BUDGET_S = 0.0015
 
-Item = tuple[int, int]  # (milliseconds, test)
 
-
-def duration_ms(seconds: float) -> int:
-    """A test's duration in whole ms, rounded half up exactly like kit/score.py."""
+def _ms(seconds: float) -> int:
     return math.floor(seconds * 1000 + 0.5)
 
 
-def cost(workers: Iterable[Iterable[int]], ms: Mapping[int, int] | Sequence[int]) -> int:
-    """The scorer's cost of one commit; ms maps test number to milliseconds."""
-    occupied = [list(worker) for worker in workers]
-    occupied = [worker for worker in occupied if worker]
+def cost_ms(workers: Sequence[Sequence[int]], durations: Mapping[int, float]) -> int:
+    """Exact scorer arithmetic. durations: test number -> recorded SECONDS (as in tests.json).
+
+    load = sum of round(seconds*1000) (halves up); 0 if nothing runs, else
+    max load + 2000 per non-empty worker.
+    """
+    ms = {k: _ms(v) for k, v in durations.items()}
+    return cost_of_ms(workers, ms)
+
+
+def cost_of_ms(workers: Sequence[Sequence[int]], ms_by_number: Mapping[int, int]) -> int:
+    occupied = [w for w in workers if w]
     if not occupied:
         return 0
-    return max(sum(ms[test] for test in worker) for worker in occupied) + WORKER_COST_MS * len(occupied)
+    return max(sum(ms_by_number[t] for t in w) for w in occupied) + WORKER_MS * len(occupied)
 
 
-def pack(
-    durations: Mapping[int, int] | Iterable[tuple[int, int]], max_workers: int = MAX_WORKERS
-) -> tuple[int, list[list[int]]]:
-    """Return (cost_ms, workers) minimizing the commit cost; workers are non-empty lists."""
-    items = _items(durations)
-    if not items:
-        return 0, []
-    if not 1 <= max_workers:
-        raise ValueError("max_workers must be at least 1")
-    total = sum(ms for ms, _test in items)
-    biggest = items[0][0]
-    count = len(items)
-
-    def lower_bound(k: int) -> int:
-        return max(biggest, -(-total // k)) + WORKER_COST_MS * k
-
-    best_cost: int | None = None
-    best_bins: list[list[Item]] = []
-    for k in sorted(range(1, min(max_workers, count) + 1), key=lambda k: (lower_bound(k), k)):
-        if best_cost is not None and lower_bound(k) >= best_cost:
-            break
-        floor_makespan = lower_bound(k) - WORKER_COST_MS * k
-        bins, loads = _lpt(items, k)
-        if max(loads) > floor_makespan:
-            _local_search(bins, loads)
-        if count <= EXACT_LIMIT and max(loads) > floor_makespan:
-            exact = _exact(items, k, max(loads), floor_makespan)
-            if exact is not None:
-                bins, loads = exact
-        occupied = sum(1 for load_bin in bins if load_bin)
-        candidate = max(loads) + WORKER_COST_MS * occupied
-        if best_cost is None or candidate < best_cost:
-            best_cost, best_bins = candidate, bins
-    assert best_cost is not None
-    occupied_bins = [load_bin for load_bin in best_bins if load_bin]
-    occupied_bins.sort(key=lambda load_bin: (-sum(ms for ms, _test in load_bin), min(t for _ms, t in load_bin)))
-    return best_cost, [sorted(test for _ms, test in load_bin) for load_bin in occupied_bins]
-
-
-def _items(durations: Mapping[int, int] | Iterable[tuple[int, int]]) -> list[Item]:
-    pairs = durations.items() if isinstance(durations, Mapping) else durations
-    seen: set[int] = set()
-    items: list[Item] = []
-    for test, ms in pairs:
-        if isinstance(ms, bool) or not isinstance(ms, int) or ms < 0:
-            raise ValueError(f"duration of test {test!r} must be a non-negative int of ms")
-        if test in seen:
-            raise ValueError(f"test {test!r} listed twice")
-        seen.add(test)
-        items.append((ms, test))
-    items.sort(key=lambda item: (-item[0], item[1]))
-    return items
-
-
-def _lpt(items: list[Item], k: int) -> tuple[list[list[Item]], list[int]]:
-    """Longest first onto the least loaded worker (ties: lowest index)."""
-    heap = [(0, j) for j in range(k)]
-    bins: list[list[Item]] = [[] for _ in range(k)]
-    for item in items:
-        load, j = heapq.heappop(heap)
-        bins[j].append(item)
-        heapq.heappush(heap, (load + item[0], j))
+def _lpt(items: list[tuple[int, int]], k: int) -> tuple[list[list[tuple[int, int]]], list[int]]:
+    bins: list[list[tuple[int, int]]] = [[] for _ in range(k)]
+    heap = [(0, i) for i in range(k)]
     loads = [0] * k
-    for load, j in heap:
-        loads[j] = load
-    for load_bin in bins:
-        load_bin.sort()
+    for it in items:  # items sorted by duration desc
+        load, i = heap[0]
+        bins[i].append(it)
+        load += it[1]
+        loads[i] = load
+        heapq.heapreplace(heap, (load, i))
     return bins, loads
 
 
-def _local_search(bins: list[list[Item]], loads: list[int]) -> None:
-    """Moves and swaps out of the most loaded worker while its pair max drops."""
+def _improve(bins: list[list[tuple[int, int]]], loads: list[int], lb: int) -> None:
+    """Move/swap between the busiest and other workers while the makespan drops."""
+    deadline = time.perf_counter() + _IMPROVE_BUDGET_S
     k = len(bins)
-    if k < 2:
-        return
-    values = [[ms for ms, _test in load_bin] for load_bin in bins]
-    while True:
-        top = max(loads)
-        hi = loads.index(top)
-        source = values[hi]
-        best: tuple | None = None  # (pair max, kind, other, index in hi, index in other)
-        lo = min((j for j in range(k) if j != hi), key=lambda j: (loads[j], j))
-        gap = top - loads[lo]
-        if gap > 1:
-            # move x with 0 < x < gap, as close to gap / 2 as possible
-            at = bisect.bisect_left(source, gap // 2)
-            for index in _around(source, at):
-                x = source[index]
-                if 0 < x < gap:
-                    pair = max(top - x, loads[lo] + x)
-                    key = (pair, 0, lo, bins[hi][index][1], -1)
-                    if best is None or key < best[:5]:
-                        best = key + (index, -1)
-        distinct = sorted(set(source))
-        for other in range(k):
-            if other == hi:
-                continue
-            gap = top - loads[other]
-            target_values = values[other]
-            if gap <= 1 or not target_values:
-                continue
-            for a in distinct:
-                if a == 0:
-                    continue
-                # b with 0 < a - b < gap, a - b close to gap / 2
-                at = bisect.bisect_left(target_values, a - gap // 2)
-                for index in _around(target_values, at):
-                    b = target_values[index]
-                    if 0 < a - b < gap:
-                        pair = max(top - a + b, loads[other] + a - b)
-                        a_index = bisect.bisect_left(source, a)
-                        key = (pair, 1, other, bins[hi][a_index][1], bins[other][index][1])
-                        if best is None or key < best[:5]:
-                            best = key + (a_index, index)
-        if best is None or best[0] >= top:
+    for _ in range(200):
+        if max(loads) <= lb or time.perf_counter() > deadline:
             return
-        _pair, kind, other, _t1, _t2, hi_index, other_index = best
-        item = bins[hi].pop(hi_index)
-        source.pop(hi_index)
-        loads[hi] -= item[0]
-        if kind == 1:
-            swapped = bins[other].pop(other_index)
-            values[other].pop(other_index)
-            loads[other] -= swapped[0]
-            _insert(bins, values, loads, hi, swapped)
-        _insert(bins, values, loads, other, item)
-
-
-def _around(sorted_values: list[int], at: int) -> range:
-    return range(max(0, at - 2), min(len(sorted_values), at + 2))
-
-
-def _insert(bins: list[list[Item]], values: list[list[int]], loads: list[int], j: int, item: Item) -> None:
-    index = bisect.bisect_left(bins[j], item)
-    bins[j].insert(index, item)
-    values[j].insert(index, item[0])
-    loads[j] += item[0]
-
-
-def _exact(
-    items: list[Item], k: int, upper: int, floor_makespan: int
-) -> tuple[list[list[Item]], list[int]] | None:
-    """Branch and bound for a makespan below `upper`; None when none is found."""
-    count = len(items)
-    sizes = [ms for ms, _test in items]
-    suffix = [0] * (count + 1)
-    for i in range(count - 1, -1, -1):
-        suffix[i] = suffix[i + 1] + sizes[i]
-    loads = [0] * k
-    assign = [0] * count
-    best = {"makespan": upper, "assign": None}
-    nodes = 0
-
-    def search(i: int, current: int) -> bool:
-        nonlocal nodes
-        if i == count:
-            best["makespan"], best["assign"] = current, assign[:]
-            return current <= floor_makespan
-        nodes += 1
-        if nodes > _EXACT_NODE_LIMIT:
-            return True
-        cap = best["makespan"] - 1
-        if sum(cap - load for load in loads if load < cap) < suffix[i]:
-            return False
-        size = sizes[i]
-        tried: set[int] = set()
-        for j in range(k):
-            load = loads[j]
-            if load in tried or load + size > cap:
+        b = max(range(k), key=loads.__getitem__)
+        lb_load = loads[b]
+        best_gain = 0
+        best_move = None
+        bsorted = sorted(bins[b], key=lambda t: t[1])
+        bvals = [t[1] for t in bsorted]
+        for w in range(k):
+            if w == b:
                 continue
-            tried.add(load)
-            loads[j] = load + size
-            assign[i] = j
-            stop = search(i + 1, max(current, load + size))
-            loads[j] = load
-            if stop:
-                return True
-            cap = best["makespan"] - 1
-        return False
+            gap = lb_load - loads[w]
+            if gap <= 1:
+                continue
+            half = gap / 2
+            # candidate x to move: duration < gap, closest to gap/2
+            j = bisect_left(bvals, half)
+            for jj in (j - 1, j):
+                if 0 <= jj < len(bvals):
+                    x = bvals[jj]
+                    if 0 < x < gap:
+                        new_max = max(lb_load - x, loads[w] + x)
+                        gain = lb_load - new_max
+                        if gain > best_gain:
+                            best_gain, best_move = gain, (w, bsorted[jj], None)
+            # swap x (in b) with y (in w): 0 < x - y < gap, x - y closest to gap/2
+            wsorted = sorted(bins[w], key=lambda t: t[1])
+            wvals = [t[1] for t in wsorted]
+            if not wvals:
+                continue
+            # bound the work on huge workers: look at a window of candidates
+            step = max(1, len(bsorted) // 64)
+            for ix in range(0, len(bsorted), step):
+                x = bvals[ix]
+                target = x - half
+                jy = bisect_left(wvals, target)
+                for jj in (jy - 1, jy, jy + 1):
+                    if 0 <= jj < len(wvals):
+                        d = x - wvals[jj]
+                        if 0 < d < gap:
+                            new_max = max(lb_load - d, loads[w] + d)
+                            gain = lb_load - new_max
+                            if gain > best_gain:
+                                best_gain, best_move = gain, (w, bsorted[ix], wsorted[jj])
+        if best_move is None:
+            return
+        w, xi, yi = best_move
+        bins[b].remove(xi)
+        bins[w].append(xi)
+        loads[b] -= xi[1]
+        loads[w] += xi[1]
+        if yi is not None:
+            bins[w].remove(yi)
+            bins[b].append(yi)
+            loads[w] -= yi[1]
+            loads[b] += yi[1]
 
-    search(0, 0)
-    if best["assign"] is None:
+
+def _exact(items: list[tuple[int, int]], k: int, ub: int) -> list[list[tuple[int, int]]] | None:
+    """Branch and bound for min makespan with <= k bins; returns a strictly better packing or None."""
+    n = len(items)
+    loads = [0] * k
+    assign = [0] * n
+    best: list[int] | None = None
+    best_mk = ub
+    suffix = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + items[i][1]
+    total = suffix[0]
+    nodes = 0
+    # iterative DFS
+    stack = [(0, 0)]  # (item index, next bin to try)
+    choice = [-1] * n
+    while stack:
+        i, start = stack.pop()
+        if i == n:
+            mk = max(loads)
+            if mk < best_mk:
+                best_mk = mk
+                best = assign[:]
+            continue
+        if start > 0:  # undo previous placement of item i
+            p = choice[i]
+            loads[p] -= items[i][1]
+        d = items[i][1]
+        for bi in range(start, k):
+            nodes += 1
+            if nodes > _EXACT_NODES:
+                return _materialize(items, best, k)
+            # symmetry: skip bins whose load equals an earlier bin's load
+            if any(loads[bj] == loads[bi] for bj in range(bi)):
+                continue
+            nl = loads[bi] + d
+            if nl >= best_mk:
+                continue
+            # lower bound: remaining work spread over all bins
+            if (total_remaining_lb(loads, suffix[i + 1], nl, bi, k)) >= best_mk:
+                continue
+            loads[bi] = nl
+            assign[i] = bi
+            choice[i] = bi
+            stack.append((i, bi + 1))
+            stack.append((i + 1, 0))
+            break
+    return _materialize(items, best, k)
+
+
+def total_remaining_lb(loads: list[int], rest: int, nl: int, bi: int, k: int) -> int:
+    s = rest + sum(loads) - loads[bi] + nl
+    return -(-s // k)
+
+
+def _materialize(items, assign, k):
+    if assign is None:
         return None
-    bins: list[list[Item]] = [[] for _ in range(k)]
-    result_loads = [0] * k
-    for item, j in zip(items, best["assign"]):
-        bins[j].append(item)
-        result_loads[j] += item[0]
-    return bins, result_loads
+    bins: list[list[tuple[int, int]]] = [[] for _ in range(k)]
+    for it, a in zip(items, assign):
+        bins[a].append(it)
+    return bins
+
+
+def _cost(bins: list[list[tuple[int, int]]]) -> int:
+    occ = [sum(t[1] for t in b) for b in bins if b]
+    return (max(occ) + WORKER_MS * len(occ)) if occ else 0
+
+
+def best(tests: Sequence[tuple[int, int]], exact: bool = True) -> list[list[int]]:
+    """tests: (test number, duration ms) -> list of workers (lists of test numbers)."""
+    if not tests:
+        return []
+    items = sorted(((int(a), int(b)) for a, b in tests), key=lambda t: (-t[1], t[0]))
+    n = len(items)
+    total = sum(t[1] for t in items)
+    top = items[0][1]
+    kmax = min(MAX_WORKERS, n)
+    lbs = {k: max(top, -(-total // k)) + WORKER_MS * k for k in range(1, kmax + 1)}
+    best_cost = None
+    best_bins = None
+    for k in sorted(lbs, key=lambda k: (lbs[k], k)):
+        if best_cost is not None and lbs[k] >= best_cost:
+            continue
+        bins, loads = _lpt(items, k)
+        lb = max(top, -(-total // k))
+        if max(loads) > lb:
+            _improve(bins, loads, lb)
+        if exact and n <= _EXACT_N and max(loads) > lb:
+            ex = _exact(items, k, max(loads))
+            if ex is not None:
+                bins = ex
+        c = _cost(bins)
+        if best_cost is None or c < best_cost or (c == best_cost and sum(1 for b in bins if b) < sum(1 for b in best_bins if b)):
+            best_cost, best_bins = c, bins
+    assert best_bins is not None
+    return [[t[0] for t in b] for b in best_bins if b]
