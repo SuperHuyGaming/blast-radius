@@ -63,6 +63,8 @@ class Map:
         self.qderive = d.get("qderive", {})
         self.str_names = set(d.get("str_names", []))
         self.classes_import = set(d.get("classes_import", []))
+        self.cmp_differ = d.get("cmp_differ", {})
+        self.cmp_seen = set(d.get("cmp_seen", []))
         self.by_file: dict[str, set[int]] = {}
         for i, t in enumerate(self.tests):
             self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
@@ -252,6 +254,12 @@ def locate(tree, ln):
     return walk(tree.body, False, None)
 
 
+def is_docstring(stmt):
+    """A bare string statement: never evaluated for its value (sqlglot doesn't read
+    docstrings, and pytest doesn't collect its doctests)."""
+    return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
+
+
 def func_body_lines(node):
     """Line ranges of every function body inside node (or node itself if a function)."""
     out = []
@@ -336,7 +344,10 @@ class ImportCheck:
         if key in self.cache:
             return self.cache[key]
         if self.baseline is None:
-            self.baseline = self.run({})
+            try:
+                self.baseline = set(json.loads((APP / "import_baseline.json").read_text()))
+            except Exception:  # noqa: BLE001 - not built in: compute it now
+                self.baseline = self.run({})
         if self.baseline is None:
             return False
         import tempfile
@@ -492,6 +503,8 @@ class PyFile:
         if r is None:
             return set()
         stmt, in_func, is_header, _owner = r
+        if is_docstring(stmt):
+            return set()
         if not in_func:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
                 return set()
@@ -509,6 +522,8 @@ class PyFile:
         if r is None:
             return set()
         stmt, in_func, is_header, _owner = r
+        if is_docstring(stmt):
+            return set()
         if not in_func:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
                 return set()
@@ -535,6 +550,113 @@ class PyFile:
                 lo, hi = ra[0].lineno, ra[0].end_lineno
                 acc = self.m.span(self.path, lo, hi)
         return acc
+
+
+# Operator swaps the map's probes can prove harmless for a test, by fact kind:
+#   isq: `is` <-> `==`, `is not` <-> `!=`   differs only where `a is b` != `a == b`
+#   tie: `<` <-> `<=`, `>` <-> `>=`         differs only where a == b
+#   and/or: 2-operand `and` <-> `or` in a condition: same truth value unless some
+#           operand was falsy (for `and`) / truthy (for `or`) in that evaluation
+_CMP_CLASS = {ast.Is: ("isq", ast.Eq), ast.Eq: ("isq", ast.Eq), ast.IsNot: ("isq", ast.NotEq),
+              ast.NotEq: ("isq", ast.NotEq), ast.Lt: ("tie", ast.Lt), ast.LtE: ("tie", ast.Lt),
+              ast.Gt: ("tie", ast.Gt), ast.GtE: ("tie", ast.Gt)}
+
+
+def _bool_context(tree):
+    """ids of BoolOp nodes whose value is only used for its truth value."""
+    out = set()
+
+    def mark(e):
+        if isinstance(e, ast.BoolOp):
+            out.add(id(e))
+            for v in e.values:
+                mark(v)
+        elif isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.Not):
+            mark(e.operand)
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            mark(n.test)
+        elif isinstance(n, ast.comprehension):
+            for c in n.ifs:
+                mark(c)
+        elif isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            mark(n.operand)
+    return out
+
+
+_PURE_CALLS = {"isinstance", "len", "type", "bool", "issubclass"}
+
+
+def _pure(e):
+    """No side effects when evaluated (calls only to a few builtins)."""
+    if isinstance(e, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(e, ast.Attribute):
+        return _pure(e.value)
+    if isinstance(e, ast.Subscript):
+        return _pure(e.value) and _pure(e.slice)
+    if isinstance(e, ast.Compare):
+        return _pure(e.left) and all(_pure(c) for c in e.comparators)
+    if isinstance(e, ast.UnaryOp):
+        return _pure(e.operand)
+    if isinstance(e, ast.BoolOp):
+        return all(_pure(v) for v in e.values)
+    if isinstance(e, (ast.Tuple, ast.List)):
+        return all(_pure(v) for v in e.elts)
+    if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id in _PURE_CALLS:
+        return not e.keywords and all(_pure(a) for a in e.args)
+    return False
+
+
+def probe_swaps(path, old_tree, new_text):
+    """If the change only swaps operators the map's probes cover, return the fact keys
+    ("kind|path:line:col" at pinned positions) whose recorded tests are the only ones
+    that can behave differently; else None."""
+    try:
+        new_tree = ast.parse(new_text)
+    except SyntaxError:
+        return None
+    boolctx = _bool_context(old_tree)
+    keys = []
+    for x, y in zip(ast.walk(old_tree), ast.walk(new_tree)):
+        if type(x) is not type(y):
+            if isinstance(x, (ast.cmpop, ast.boolop)) and isinstance(y, (ast.cmpop, ast.boolop)):
+                continue  # operator nodes: judged at their Compare / BoolOp below
+            return None
+        if isinstance(x, ast.Compare):
+            ox, oy = [type(o) for o in x.ops], [type(o) for o in y.ops]
+            if ox != oy:
+                if len(ox) != 1 or len(oy) != 1 or ox[0] not in _CMP_CLASS or oy[0] not in _CMP_CLASS:
+                    return None
+                (kx, nx), (ky, ny) = _CMP_CLASS[ox[0]], _CMP_CLASS[oy[0]]
+                if kx != ky or nx is not ny:
+                    return None
+                keys.append(f"{kx}|{path}:{x.lineno}:{x.col_offset}")
+        elif isinstance(x, ast.BoolOp) and type(x.op) is not type(y.op):
+            # Flipping the operator also changes whether the second operand runs at
+            # all, so it must have no side effects.
+            if len(x.values) != 2 or len(y.values) != 2 or id(x) not in boolctx or not _pure(x.values[1]):
+                return None
+            kind = "and" if isinstance(x.op, ast.And) else "or"
+            keys.append(f"{kind}|{path}:{x.lineno}:{x.col_offset}")
+    if not keys:
+        return None
+
+    class Norm(ast.NodeTransformer):
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            node.ops = [(_CMP_CLASS[type(o)][1] if type(o) in _CMP_CLASS else type(o))() for o in node.ops]
+            return node
+
+        def visit_BoolOp(self, node):
+            self.generic_visit(node)
+            node.op = ast.And()
+            return node
+
+    if ast.dump(Norm().visit(ast.parse(ast.unparse(old_tree)))) != ast.dump(Norm().visit(ast.parse(new_text))):
+        return None
+    return keys
 
 
 def select_file(m: Map, f) -> set | None:
@@ -576,6 +698,24 @@ def select_file(m: Map, f) -> set | None:
         return ALL
     pf = PyFile(m, path, old_text, new_text)
     dels, adds = changed_lines(f["hunks"])
+    if path.startswith("sqlglot/") and m.cmp_seen:
+        keys = probe_swaps(path, pf.old_tree, new_text)
+        if keys and all(k in m.cmp_seen for k in keys):
+            # Only operator swaps at spots the map probed: a test can only behave
+            # differently if, in some evaluation it made, the recorded fact held there.
+            acc = set()
+            for ln in dels:
+                acc = add(acc, pf.old_line(ln))
+                if acc is ALL:
+                    break
+            differ: set | None = set()
+            for k in keys:
+                sid = m.cmp_differ.get(k)
+                if sid is not None:
+                    differ = add(differ, m.set_of(sid))
+            if acc is ALL:
+                return ALL if differ is ALL else differ
+            return acc if differ is ALL else acc & differ
     acc: set[int] = set()
     for ln in dels:
         acc = add(acc, pf.old_line(ln))
@@ -625,6 +765,11 @@ def best_split(tests):
 
 
 def main() -> None:
+    if "--import-baseline" in sys.argv:
+        # Run at image build time: which sqlglot modules fail to import pristine.
+        r = IMPORTS.run({})
+        print(json.dumps(sorted(r) if r is not None else None))
+        return
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     number = {t["id"]: t["number"] for t in tests}
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}

@@ -11,5 +11,5 @@ RUN mkdir -p /app/src \
  && rm /tmp/sqlglot.tar.gz
 
 COPY selector.py map.json.gz /app/
-RUN chmod -R a+rX /app
+RUN python /app/selector.py --import-baseline > /app/import_baseline.json  && cat /app/import_baseline.json && chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]

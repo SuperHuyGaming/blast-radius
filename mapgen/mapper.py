@@ -10,6 +10,8 @@ import coverage
 import pytest
 
 ROOT = os.path.realpath(os.environ.get("MAP_ROOT", "/src"))
+PROBES = os.environ.get("MAP_PROBES") == "1"      # operator probes (no coverage)
+COVER = os.environ.get("MAP_COVERAGE", "1") == "1"  # coverage, class use, opens
 OUT = os.environ.get("MAP_OUT", "/out")
 cov = coverage.Coverage(data_file=None, branch=False,
                         source=[os.path.join(ROOT, "sqlglot"), os.path.join(ROOT, "tests")])
@@ -21,7 +23,8 @@ order: list = []
 
 def _set(ctx):
     current[0] = ctx
-    cov.switch_context(ctx)
+    if COVER:
+        cov.switch_context(ctx)
 
 
 def _audit(event, args):
@@ -117,9 +120,156 @@ def _exec_module(self, module):
 
 _be._LoaderBasics.exec_module = _exec_module
 
-sys.setprofile(_prof)
-threading.setprofile(_prof)
-cov.start()
+
+# Comparison probes: every single-operator `is` / `is not` / `==` / `!=` in sqlglot
+# is compiled as a call that evaluates it exactly as before and records, per
+# context, whether `a is b` and `a == b` ever disagreed at that comparison.
+import ast as _ast
+import builtins as _builtins
+
+cmp_differ: dict = {}
+cmp_seen: set = set()
+_CMP_OPS = {_ast.Is: 0, _ast.IsNot: 1, _ast.Eq: 2, _ast.NotEq: 3}
+
+
+def _mark(key):
+    s = cmp_differ.get(key)
+    if s is None:
+        s = cmp_differ[key] = set()
+    s.add(current[0])
+
+
+def blast_tie_probe_(key, a, b, op):
+    """< <= > >= exactly as written; records evaluations where a == b (where < and <= differ)."""
+    cmp_seen.add("tie|" + key)
+    r = a < b if op == 0 else a <= b if op == 1 else a > b if op == 2 else a >= b
+    if _sqlglot_defined(type(a), "__eq__") or _sqlglot_defined(type(b), "__eq__"):
+        _mark("tie|" + key)
+        return r
+    try:
+        if a == b:
+            _mark("tie|" + key)
+    except Exception:
+        _mark("tie|" + key)
+    return r
+
+
+def blast_bool_probe_(key, kind, value):
+    """Operand of a 2-operand and/or, returned unchanged. For `and` records a falsy
+    operand, for `or` a truthy one: the evaluations where flipping the operator could
+    change the condition's truth value."""
+    k = kind + "|" + key
+    cmp_seen.add(k)
+    if _sqlglot_defined(type(value), "__bool__", "__len__"):
+        _mark(k)
+        return value
+    try:
+        t = bool(value)
+    except Exception:
+        _mark(k)
+        return value
+    if (kind == "and" and not t) or (kind == "or" and t):
+        _mark(k)
+    return value
+
+
+def _sqlglot_defined(t, *names):
+    """True if class t gets one of these dunders from sqlglot code (deep or stateful:
+    e.g. Expr.__eq__ computes and caches a tree hash). Probes don't call those."""
+    for n in names:
+        f = getattr(t, n, None)
+        if f is not None and getattr(f, "__module__", "") and str(getattr(f, "__module__", "")).startswith("sqlglot"):
+            return True
+    return False
+
+
+def _blast_cmp(key, a, b, op):
+    cmp_seen.add("isq|" + key)
+    same = a is b
+    if same:
+        agree, eq = True, None
+    elif _sqlglot_defined(type(a), "__eq__") or _sqlglot_defined(type(b), "__eq__"):
+        agree, eq = False, None  # not evaluated: counted as "may differ"
+    else:
+        try:
+            eq = a == b
+            agree = bool(eq) == same
+        except Exception:
+            eq = None
+            agree = False
+    if not agree:
+        key = "isq|" + key
+        s = cmp_differ.get(key)
+        if s is None:
+            s = cmp_differ[key] = set()
+        s.add(current[0])
+    if op == 0:
+        return same
+    if op == 1:
+        return not same
+    if op == 2:
+        return a == b if eq is None else eq
+    return a != b
+
+
+_builtins.blast_cmp_probe_ = _blast_cmp
+_builtins.blast_tie_probe_ = blast_tie_probe_
+_builtins.blast_bool_probe_ = blast_bool_probe_
+_TIE_OPS = {_ast.Lt: 0, _ast.LtE: 1, _ast.Gt: 2, _ast.GtE: 3}
+
+
+class _Probe(_ast.NodeTransformer):
+    def __init__(self, rel):
+        self.rel = rel
+
+    def visit_BoolOp(self, node):
+        self.generic_visit(node)
+        if len(node.values) != 2:
+            return node
+        key = f"{self.rel}:{node.lineno}:{node.col_offset}"
+        kind = "and" if isinstance(node.op, _ast.And) else "or"
+        node.values = [_ast.copy_location(_ast.Call(func=_ast.Name("blast_bool_probe_", _ast.Load()),
+                                                    args=[_ast.Constant(key), _ast.Constant(kind), v], keywords=[]), v)
+                       for v in node.values]
+        return node
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and type(node.ops[0]) in _TIE_OPS:
+            key = f"{self.rel}:{node.lineno}:{node.col_offset}"
+            call = _ast.Call(func=_ast.Name("blast_tie_probe_", _ast.Load()),
+                             args=[_ast.Constant(key), node.left, node.comparators[0],
+                                   _ast.Constant(_TIE_OPS[type(node.ops[0])])], keywords=[])
+            return _ast.copy_location(call, node)
+        if len(node.ops) != 1 or type(node.ops[0]) not in _CMP_OPS:
+            return node
+        key = f"{self.rel}:{node.lineno}:{node.col_offset}"
+        call = _ast.Call(func=_ast.Name("blast_cmp_probe_", _ast.Load()),
+                         args=[_ast.Constant(key), node.left, node.comparators[0],
+                               _ast.Constant(_CMP_OPS[type(node.ops[0])])], keywords=[])
+        return _ast.copy_location(call, node)
+
+
+_orig_source_to_code = _be.SourceLoader.source_to_code
+
+
+def _source_to_code(self, data, path, *, _optimize=-1):
+    rp = os.path.realpath(str(path))
+    if not rp.startswith(SQLROOT) or not rp.endswith(".py"):
+        return _orig_source_to_code(self, data, path, _optimize=_optimize)
+    tree = _ast.parse(data, filename=str(path))
+    tree = _ast.fix_missing_locations(_Probe(os.path.relpath(rp, ROOT).replace(os.sep, "/")).visit(tree))
+    return compile(tree, path, "exec", dont_inherit=True, optimize=_optimize)
+
+
+if PROBES:
+    _be.SourceLoader.source_to_code = _source_to_code
+sys.dont_write_bytecode = True
+
+if COVER:
+    sys.setprofile(_prof)
+    threading.setprofile(_prof)
+    cov.start()
 _set("<import>")
 
 
@@ -165,6 +315,18 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    os.makedirs(OUT, exist_ok=True)
+    if PROBES:
+        wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
+        json.dump({"differ": {k: sorted(v) for k, v in cmp_differ.items()}, "seen": sorted(cmp_seen)},
+                  open(os.path.join(OUT, f"cmp_{wid}.json"), "w"))
+        json.dump(outcomes, open(os.path.join(OUT, f"probe_outcomes_{wid}.json"), "w"))
+    if not COVER:
+        return
+    _session_finish_cover()
+
+
+def _session_finish_cover():
     cov.stop()
     data = cov.get_data()
     ctx_ids: dict = {}

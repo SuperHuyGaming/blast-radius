@@ -285,6 +285,27 @@ for top in ("sqlglot", "tests"):
                     if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
                         str_names.add(n.value)
 
+# Comparisons where `a is b` and `a == b` disagreed, per test (missing = never).
+cmp_out, cmp_seen = {}, []
+import glob
+merged_differ, merged_seen = defaultdict(set), set()
+for cmp_path in glob.glob(os.path.join(raw, "cmp_*.json")):  # one file per pytest-xdist worker
+    cd = json.load(open(cmp_path))
+    merged_seen.update(cd["seen"])
+    for key, ctxs in cd["differ"].items():
+        merged_differ[key].update(ctxs)
+if merged_seen:
+    cmp_seen = sorted(merged_seen)
+    for key, ctxs in merged_differ.items():
+        acc = set()
+        for c in ctxs:
+            t = translate(c)
+            if t is ALL:
+                acc = ALL
+                break
+            acc |= t
+        cmp_out[key] = sid(acc)
+
 refs_out = {n: sid(s) for n, s in refs.items()}
 for n in refs_all:
     refs_out[n] = -1
@@ -301,6 +322,8 @@ data = {
     "qrefs": {**{k: sid(v) for k, v in qrefs.items()}, **{k: -1 for k in qrefs_all}},
     "qderive": {k: sorted(v) for k, v in qderive.items()},
     "str_names": sorted(str_names),
+    "cmp_differ": cmp_out,
+    "cmp_seen": cmp_seen,
     "class_uses": class_uses,
 }
 with gzip.open(out, "wt", encoding="utf-8") as f:
