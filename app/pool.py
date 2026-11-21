@@ -76,10 +76,7 @@ class LazyFuture(Future):
             self._exception = BrokenProcessPool("A process in the process pool was terminated abruptly")
             return
         try:
-            hook = STATE.task_hook if self._tag is None else None
-            # stages.py: a task of the long executor test may end where its input is known
-            # to equal the pinned one
-            value = fn(*args, **kwargs) if hook is None else hook(self._index, fn, args, kwargs)
+            value = fn(*args, **kwargs)
         except SystemExit:
             pool._broken = True
             if pool._class_level:
