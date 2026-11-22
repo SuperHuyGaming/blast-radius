@@ -1364,7 +1364,7 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             for cls_obj, tlist in grouped.items():
                 suite = unittest.TestSuite([cls_obj(meth) for _, meth, _ in tlist])
                 rec = RecordingResult()
-                alarm_sec = max(6, int(len(tlist) * 0.35 + 4)) if mode == "swap" else max(3, min(8, int(len(tlist) * 0.02 + 4)))
+                alarm_sec = max(6, int(len(tlist) * 0.35 + 4)) if mode == "swap" else max(4, min(10, int(len(tlist) * 0.04 + 3)))
                 signal.alarm(alarm_sec)
                 try:
                     suite.run(rec)
@@ -1385,7 +1385,7 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             os.close(w_fd)
             os._exit(0)
     os.close(w_fd)
-    parent_timeout = float(max(10, int(len(runnable) * 0.35 + 8))) if mode == "swap" else float(max(5, min(10, int(len(runnable) * 0.02 + 5))))
+    parent_timeout = float(max(10, int(len(runnable) * 0.35 + 8))) if mode == "swap" else float(max(10, int(len(runnable) * 0.05 + 10)))
     r_list, _, _ = sys_select.select([r_fd], [], [], parent_timeout)
     if not r_list:
         log(f"child timed out; killing pid {pid}")
