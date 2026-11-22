@@ -1275,14 +1275,18 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
         mode = "swap"
         child_cpu_est = 0.04 + 0.002 * len(runnable)
         gate_threshold = child_cpu_est * 1.5
+        if potential_savings < gate_threshold:
+            log(f"  cost gate skipped ({mode}): savings {potential_savings:.3f}s < threshold {gate_threshold:.3f}s")
+            return cand_nums
     else:
         mode = "import"
-        child_cpu_est = 0.20 + 0.012 * len(runnable)
-        gate_threshold = max(2.0, child_cpu_est * 1.8)
-
-    if potential_savings < gate_threshold:
-        log(f"  cost gate skipped ({mode}): savings {potential_savings:.3f}s < threshold {gate_threshold:.3f}s")
-        return cand_nums
+        if potential_savings < 2.0:
+            log(f"  cost gate skipped (import): savings {potential_savings:.3f}s < 2.0s")
+            return cand_nums
+        req = 0.5 + 0.02 * len(runnable)
+        if len(runnable) > 40 and potential_savings < req:
+            log(f"  cost gate skipped (import): savings {potential_savings:.3f}s < req {req:.3f}s (len {len(runnable)})")
+            return cand_nums
 
     try:
         r_fd, w_fd = os.pipe()
@@ -1295,6 +1299,12 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
         try:
             failing = set()
             concurrent.futures.ProcessPoolExecutor = InlineSynchronousPool
+
+            def timeout_handler(signum, frame):
+                raise TimeoutError("timeout")
+
+            signal.signal(signal.SIGALRM, timeout_handler)
+
             if mode == "swap":
                 for fn, code in swaps:
                     fn.__code__ = code
@@ -1304,21 +1314,26 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
                 for num, cls_obj, method_name, tid in runnable:
                     grouped.setdefault(cls_obj, []).append((num, method_name, tid))
             else:  # mode == "import"
-                for k in list(sys.modules.keys()):
-                    if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
-                        del sys.modules[k]
-                sys.meta_path.insert(0, PatchedFinder(patched_sources))
+                signal.alarm(3)
                 try:
+                    for k in list(sys.modules.keys()):
+                        if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
+                            del sys.modules[k]
+                    sys.meta_path.insert(0, PatchedFinder(patched_sources))
                     import sqlglot  # noqa: F401
                 except BaseException as e:
+                    signal.alarm(0)
                     log(f"child re-import sqlglot failed: {e!r}")
                     os.write(w_fd, json.dumps(sorted(n for n, *_ in runnable)).encode("utf-8"))
                     os._exit(0)
+                finally:
+                    signal.alarm(0)
 
                 grouped = {}
                 for num, _cls_obj, method_name, tid in runnable:
                     file_part, cls_part, _ = tid.split("::")
                     mod_name = file_part[:-3].replace("/", ".")
+                    signal.alarm(2)
                     try:
                         test_mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
                         if hasattr(test_mod, "ProcessPoolExecutor"):
@@ -1328,11 +1343,8 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
                     except BaseException as e:
                         log(f"child test import error {tid}: {e!r}")
                         failing.add(num)
-
-            def timeout_handler(signum, frame):
-                raise TimeoutError("test timed out")
-
-            signal.signal(signal.SIGALRM, timeout_handler)
+                    finally:
+                        signal.alarm(0)
 
             for cls_obj, tlist in grouped.items():
                 suite = unittest.TestSuite([cls_obj(meth) for _, meth, _ in tlist])
@@ -1358,7 +1370,7 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             os.close(w_fd)
             os._exit(0)
     os.close(w_fd)
-    r_list, _, _ = sys_select.select([r_fd], [], [], 20.0)
+    r_list, _, _ = sys_select.select([r_fd], [], [], 10.0)
     if not r_list:
         log(f"child timed out; killing pid {pid}")
         try:
