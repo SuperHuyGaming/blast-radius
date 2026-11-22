@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import enum
 import marshal
+import os
 import re
 import sys
 import types
@@ -24,6 +25,34 @@ _PLAIN = frozenset((dict, list, tuple, set, frozenset, types.FunctionType, class
                     types.MethodType, type, types.BuiltinFunctionType))
 
 
+def _load_c():
+    """The C version of Fingerprinter.fp (native/_statefpc.c, built into the image next to this
+    file): the same walk building the same tuples, so the same fingerprints; the build checks
+    that on the pinned state (build_cfp_check.py) and removes the module on any difference.
+    None (the Python code runs) when it is missing, fails to load, or BR_NO_CFP=1."""
+    if os.environ.get("BR_NO_CFP") == "1":
+        return None
+    try:
+        import importlib.machinery
+        import importlib.util
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            path = os.path.join(here, "_statefpc" + suffix)
+            if os.path.exists(path):
+                spec = importlib.util.spec_from_file_location("_statefpc", path)
+                m = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(m)
+                m.setup(_PRIM_NAME, enum.Enum, marshal.dumps)
+                return m
+    except Exception:  # noqa: BLE001  (no C walk: the Python one)
+        pass
+    return None
+
+
+_cfp = _load_c()
+
+
 class Fingerprinter:
     def __init__(self, code_alias=None, base_codes=None):
         self.memo = {}
@@ -40,6 +69,16 @@ class Fingerprinter:
             values = base_codes[1]
             if not any(k != v and k in values for k, v in self.code_alias.items()):
                 self.base = base_codes[0]
+        if _cfp is not None and type(self.code_alias) is dict and (self.base is None or type(self.base) is dict):
+            # fp and code in C (instance attributes, so self.fp, f.fp, f.code and the recursion
+            # of the branches left to Python all use them); they share memo, busy, code_memo,
+            # code_objects, base and code_alias with the Python code
+            self.fp = _cfp.FP(self, self.memo, self.busy, self.code_memo, self.base, self.code_alias, self.code_objects)
+            self.code = self.fp.code
+            # (the Python branches that the C fp calls, _fp_plain, _fp and _fp_rest, then look up the
+            # memo of the C walk in _seq and _dict, as the Python ones look up self.memo)
+            self._seq = self.fp.seq
+            self._dict = self.fp.dict
 
     def base_codes(self):
         """What a later Fingerprinter needs to reuse the code hashes of this one (base_codes=).
@@ -109,6 +148,18 @@ class Fingerprinter:
         self.memo[key] = out
         return out
 
+    def _fp_head(self, v, t):
+        """fp's step after the memo and busy tests, for the C fp when the metaclass of t compares
+        or hashes in its own way (its __eq__ / __hash__ then run here, as in fp): None when t is
+        not in _MARSHAL_OK (fp calls _fp next), False when it is and marshal raised ValueError
+        (fp calls _fp_plain next), else the hash that fp stores."""
+        if t in _MARSHAL_OK:
+            try:
+                return hash(("m", t.__name__, marshal.dumps(v, 2)))
+            except ValueError:
+                return False
+        return None
+
     def _fp_plain(self, v, t, depth):
         """_fp of a dict, list, tuple, set or frozenset that marshal cannot write."""
         if t is dict:
@@ -168,6 +219,10 @@ class Fingerprinter:
             return ("prop", self.fp(v.fget, depth + 1), self.fp(v.fset, depth + 1), self.fp(v.fdel, depth + 1))
         if t is types.MethodType:
             return ("meth", self.fp(v.__func__, depth + 1), self.fp(v.__self__, depth + 1))
+        return self._fp_rest(v, t, depth)
+
+    def _fp_rest(self, v, t, depth):
+        """The branches of _fp after the method one (the C fp calls this one for them)."""
         if t is types.BuiltinFunctionType or t is types.MethodDescriptorType or t is types.WrapperDescriptorType:
             return ("B", getattr(v, "__qualname__", repr(v)))
         if t is re.Pattern:
@@ -450,11 +505,7 @@ def snapshot(code_alias=None, base_codes=None, only=None):
             add_value(("A", mod, path, name), v)
         out[("A", mod, path, "__bases__")] = f.fp(cls.__bases__)
 
-    for mod_name, m in sorted(sys.modules.items()):
-        if m is None or not (mod_name == "sqlglot" or mod_name.startswith("sqlglot.")):
-            continue
-        if only is not None and mod_name not in only:
-            continue
+    def add_module(mod_name, m):
         for name, v in list(vars(m).items()):
             if name in SKIP_ATTRS:
                 continue
@@ -468,6 +519,20 @@ def snapshot(code_alias=None, base_codes=None, only=None):
                 out[("G", mod_name, name)] = ("M", v.__name__)
                 continue
             add_value(("G", mod_name, name), v)
+
+    if _cfp is not None and type(f.fp) is _cfp.FP:
+        # the three steps above in C (native/_statefpc.c): the same calls in the same order; a
+        # value whose type's metaclass compares or hashes in its own way goes to the Python
+        # add_value above
+        adder = _cfp.Adder(f, out, seen_classes, f.function_keys, f.objects, SKIP_ATTRS, add_value)
+        add_value, add_class, add_module = adder.add_value, adder.add_class, adder.add_module
+
+    for mod_name, m in sorted(sys.modules.items()):
+        if m is None or not (mod_name == "sqlglot" or mod_name.startswith("sqlglot.")):
+            continue
+        if only is not None and mod_name not in only:
+            continue
+        add_module(mod_name, m)
     # classes of the hooked trees that no module global names (the dialect metaclass makes
     # them): their attributes are compared too, under the name of the dialect attribute
     for c, mod, path in class_paths().values():

@@ -1,4 +1,13 @@
 # Blast Radius entry image. Base: the pinned image the organizers labeled in.
+# Build stage for the one C module of statefp (app/native/_statefpc.c, the walk of
+# statefp.Fingerprinter.fp): the slim image has no compiler. CPython 3.13.18 headers, as both
+# interpreters of the run image. If the compile fails, /out stays empty and statefp.py runs its
+# Python walk. (A stage of its own: its failure path empties only its own /out.)
+FROM python:3.13@sha256:9ffe84122ce74ebdffe2e0e6b946c9dd95d0bf3463f6eb1006b4dc6fefe36d01 AS cfp
+COPY app/native/_statefpc.c /src/_statefpc.c
+RUN mkdir -p /out && (gcc -O2 -DNDEBUG -shared -fPIC -I/usr/local/include/python3.13 \
+        -o /out/_statefpc.cpython-313-x86_64-linux-gnu.so /src/_statefpc.c || (echo "no C module" >&2; rm -f /out/*))
+
 # Build stage for the C pass of procmodel._immortalize (app/native/_cimm.c): the slim image has no
 # compiler. CPython 3.13.18 headers, as both interpreters of the run image. If the compile fails,
 # /out stays empty and procmodel.py runs its Python pass.
@@ -85,7 +94,12 @@ COPY app /app
 # objects); else removed, and procmodel.py runs the Python pass.
 COPY --from=cimm /out/ /app/
 RUN (cd /repo && SKIP_INTEGRATION=0 timeout 120 python /app/build_cimm_check.py /repo) \
-    || (echo "C immortal pass removed" >&2; rm -f /app/_cimm*.so); rm -rf /app/native
+    || (echo "C immortal pass removed" >&2; rm -f /app/_cimm*.so)
+# The C fingerprint walk: kept only when its snapshots of the pinned state equal those of the
+# Python walk (build_cfp_check.py); else removed, and statefp.py runs the Python walk.
+COPY --from=cfp /out/ /app/
+RUN (cd /repo && SKIP_INTEGRATION=0 timeout 120 python /app/build_cfp_check.py /repo) \
+    || (echo "C fingerprint walk removed" >&2; rm -f /app/_statefpc*.so); rm -rf /app/native
 # The step memo of the stage check of test_execute_tpcds (build_memo.py, memo.py): the outputs of
 # the executor steps of every TPC-DS query on the pinned commit. Which outputs are stored and the step
 # costs come from a fixed file (app/maps/memo_fixed.bin), not from this machine's timing. If it fails,
