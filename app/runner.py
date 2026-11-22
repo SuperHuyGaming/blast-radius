@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import importlib
 import os
+import sys
 import unittest
 from unittest.suite import _ErrorHolder
 
@@ -100,16 +101,18 @@ def load_case(test_id: str, number: int):
         # pytest imports a test file once: when that fails, all its tests fail. Trying again
         # for each test would import the whole package again each time (seconds per file).
         raise _FAILED_IMPORTS[name]
-    try:
-        mod = importlib.import_module(name)
-    except BaseException as e:
-        if not isinstance(e, (KeyboardInterrupt, SystemExit)):
-            _FAILED_IMPORTS[name] = e
-        raise
-    if ON_IMPORT:
-        hook = ON_IMPORT.pop(name, None)
-        if hook is not None:
-            hook(mod)
+    mod = sys.modules.get(name)
+    if mod is None:
+        try:
+            mod = importlib.import_module(name)
+        except BaseException as e:
+            if not isinstance(e, (KeyboardInterrupt, SystemExit)):
+                _FAILED_IMPORTS[name] = e
+            raise
+        if ON_IMPORT:
+            hook = ON_IMPORT.pop(name, None)
+            if hook is not None:
+                hook(mod)
     case = getattr(mod, cls_name)(meth)
     case._br_number = number
     return case

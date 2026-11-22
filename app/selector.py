@@ -118,12 +118,12 @@ AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
 # least SHORT_MIN packed seconds in the answer, a second child runs them anyway (the most
 # recorded seconds per CPU second first, as far as the expected saving pays for the CPU): a
 # failing one stays selected, a passing one leaves the answer. BR_SHORT_RERUN=0 turns it off.
-SHORT_RERUN = os.environ.get("BR_SHORT_RERUN", "1") == "1"
-SHORT_MIN = float(os.environ.get("BR_SHORT_MIN", "2.0"))  # packed seconds of those tests at least
+SHORT_RERUN = os.environ.get("BR_SHORT_RERUN", "0") == "1"
+SHORT_MIN = float(os.environ.get("BR_SHORT_MIN", "4.0"))  # packed seconds of those tests at least
 SHORT_PASS = float(os.environ.get("BR_SHORT_PASS", "0.75"))  # share of them that pass (labeled mutants: 0.77)
 # charged seconds per estimated CPU second (a run costs about 0.7 of its estimate in local CPU,
 # and the scoring machine charges about 0.6 of that)
-SHORT_PRICE = float(os.environ.get("BR_SHORT_PRICE", "0.3"))
+SHORT_PRICE = float(os.environ.get("BR_SHORT_PRICE", "1.0"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 # A plain pytest run stops at collection when a test file cannot be imported (see finish()).
 # BR_STOP_AT_COLLECTION=0: such a commit also gets the tests that fail when they run.
@@ -131,11 +131,11 @@ STOP_AT_COLLECTION = os.environ.get("BR_STOP_AT_COLLECTION", "1") == "1"
 # The stage check of the long executor test (stages.py), for a commit that would select that
 # test without a run: "1" on, "0" off. For validation: "always" = whenever the test is held,
 # "force" = the test is always held and checked.
-STAGE = os.environ.get("BR_STAGE", "1")
+STAGE = os.environ.get("BR_STAGE", "0")
 # CPU seconds (as measured when the stage map was built) that a check may cost for each
 # second that leaving the test out of the answer saves. A check that proves a pass costs CPU
 # for all its tasks; at 1.3 it still pays when a CPU second is charged at 0.6 score seconds.
-STAGE_GAIN = float(os.environ.get("BR_STAGE_GAIN", "1.7"))
+STAGE_GAIN = float(os.environ.get("BR_STAGE_GAIN", "0.8"))
 STAGE_STATE_SECONDS = 0.6  # the snapshots of the module state for a check that proves a pass
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
@@ -148,9 +148,9 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded
 # ever shortens the time that a test may take (TEST_TIMEOUT and 25 times its usual time): a
 # test with a small estimate keeps that limit as it is.
 GUARD = os.environ.get("BR_NO_GUARD") != "1"
-GUARD_MIN = float(os.environ.get("BR_GUARD_MIN", "4.0"))  # (= TEST_TIMEOUT)
-GUARD_FACTOR = float(os.environ.get("BR_GUARD_FACTOR", "6.0"))
-GUARD_ADD = float(os.environ.get("BR_GUARD_ADD", "1.5"))
+GUARD_MIN = float(os.environ.get("BR_GUARD_MIN", "0.8"))  # tightened CPU guard limit
+GUARD_FACTOR = float(os.environ.get("BR_GUARD_FACTOR", "4.0"))
+GUARD_ADD = float(os.environ.get("BR_GUARD_ADD", "0.3"))
 GUARD_PRICE = float(os.environ.get("BR_GUARD_PRICE", "1.0"))  # charged seconds per CPU second of a run
 GUARD_RESTARTS = 3  # new children per commit after stopped tests; then the rest is selected unrun
 CPU_GUARD = {}  # in a child: test -> CPU seconds that its run may cost (the parent's plan.guard)
@@ -2532,7 +2532,7 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
     budget = STAGE_GAIN * saving - st["est"]
     if STAGE == "force":
         budget = float("inf")
-    if budget < 0.0:
+    if budget <= 0.0 or st["est"] >= saving:
         os.write(wfd, b"X " + json.dumps({"n": n, "verdict": None, "skip": "saves %.1f s, costs %.1f" % (saving, st["est"])}).encode() + b"\n")
         return
     import reduce
@@ -3007,7 +3007,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             # before the fork).
             gc.freeze()
         t_setup = time.process_time()
-        settings[0] = _interpreter_settings()
+        settings[0] = _interpreter_settings() if plan.settings else None
         runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
@@ -4662,14 +4662,9 @@ def run(t_start, deadline, state):
         # a run selects every later reader of the watched containers: no guard there.
         plan.guard = {}
         if GUARD and not RUN_ALL and not plan.watch:
-            long_secs = [seconds[t] for t in held if seconds[t] > QUIET_HOLD_SECONDS]
             for n in ran:
-                stake = seconds[n] + WORKER_COST
-                if n in plan.protect and long_secs:
-                    stake += max(long_secs)
-                limit = max(GUARD_MIN, GUARD_FACTOR * cost[n] + GUARD_ADD, stake / GUARD_PRICE)
-                if limit < allowed[n] / SLOWDOWN:
-                    plan.guard[n] = limit
+                limit = max(GUARD_MIN, min(allowed[n] / SLOWDOWN, GUARD_FACTOR * cost[n] + GUARD_ADD))
+                plan.guard[n] = limit
         # Once a test has failed, the commit is known to break something. A further
         # verdict then only saves the recorded seconds of a passing test, so only runs
         # that are cheap next to those seconds go on; the others are selected as they are.
@@ -4901,7 +4896,7 @@ def run(t_start, deadline, state):
         stops where SHORT_PASS times the packed seconds saved no longer pays for the CPU. Their
         verdicts join 'verdicts': a passing test leaves the answer, a failing one stays. A test
         that does not end in the new child (and the ones after it) stays selected unrun."""
-        if plan.mode != "hot" or RUN_ALL or plan.watch or plan.prep is None or plan.all_fail or plan.pool_died:
+        if not SHORT_RERUN or plan.mode != "hot" or RUN_ALL or plan.watch or plan.prep is None or plan.all_fail or plan.pool_died:
             return
         if not any(verdicts.values()):
             return
@@ -5119,9 +5114,8 @@ def run(t_start, deadline, state):
     if lazy_pandas:
         # the commits that need them run last, so that the forks before them are cheaper
         hot = [c for c in hot if not needs_pandas(c)] + [c for c in hot if needs_pandas(c)]
-        needers = [c for c in hot + fresh if needs_pandas(c)]
-        if len(needers) >= 2:
-            pandas_turn = needers[0]  # with one, its child loads them (same cost, smaller forks)
+        # Keep parent memory lean: child processes load numpy/pandas on-demand via lazymods
+        pandas_turn = None
 
     def exec_prebuild(hot_commits):
         """TestExecutor attributes that more than one child may read are built once here
@@ -5189,13 +5183,7 @@ def run(t_start, deadline, state):
     pandas_here = []
 
     def load_pandas_here():
-        if pandas_here:
-            return
-        pandas_here.append(True)
-        import lazymods
-
-        lazymods.load()
-        gc.freeze()  # (no collection first: it would walk every object, and little is garbage)
+        return  # Keep parent memory lean: child processes load numpy/pandas on-demand via lazymods
 
     preimported = []
 
