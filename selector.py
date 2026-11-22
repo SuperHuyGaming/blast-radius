@@ -21,10 +21,17 @@ from __future__ import annotations
 
 import ast
 import builtins
+import gc
 import gzip
 import io
 import json
 import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["DUCKDB_THREADS"] = "1"
+os.environ["PYTHON_CPU_COUNT"] = "1"
 import re
 import select as sys_select
 import signal
@@ -32,6 +39,9 @@ import sys
 import tokenize
 import types
 import unittest
+import concurrent.futures
+import concurrent.futures.process
+import pickle
 import importlib
 import importlib.abc
 import importlib.util
@@ -955,12 +965,71 @@ def best_split(tests):
 
 # ---------------------------------------------------------------- in-memory test runner
 
-SKIP_CLASSES = {"TestExecutor"}  # its setUpClass loads the TPC data: too costly to run
-POOLED = set()  # tests that share a class-level process pool: never run here (filled in main)
+SKIP_CLASSES = set()
+POOLED = set()  # tests that share a class-level process pool
 HEAVY_TESTS = {
     "tests/test_parser.py::TestParser::test_max_nodes",
     "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
 }
+
+
+class InlineSynchronousPool:
+    def __init__(self, max_workers=None, initializer=None, initargs=(), mp_context=None):
+        self.broken = False
+        if initializer:
+            initializer(*initargs)
+
+    def submit(self, fn, *args, **kwargs):
+        fut = concurrent.futures.Future()
+        if self.broken:
+            fut.set_exception(concurrent.futures.process.BrokenProcessPool("Pool worker crashed"))
+            return fut
+        try:
+            pickled_args = pickle.dumps((args, kwargs))
+            unpickled_args, unpickled_kwargs = pickle.loads(pickled_args)
+            result = fn(*unpickled_args, **unpickled_kwargs)
+            pickled_res = pickle.dumps(result)
+            unpickled_res = pickle.loads(pickled_res)
+            fut.set_result(unpickled_res)
+        except Exception as exc:
+            fut.set_exception(exc)
+        return fut
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        for item in zip(*iterables):
+            fut = self.submit(fn, *item)
+            yield fut.result(timeout=timeout)
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
+class PatchedSourceLoader(importlib.abc.SourceLoader):
+    def __init__(self, path: str, text: str):
+        self.path = path
+        self.source_bytes = text.encode("utf-8")
+
+    def get_filename(self, fullname: str) -> str:
+        return self.path
+
+    def get_data(self, path: str) -> bytes:
+        return self.source_bytes
+
+
+class PatchedFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, patched: dict[str, tuple[str, str, bool]]):
+        self.patched = patched
+
+    def find_spec(self, fullname: str, path, target=None):
+        if fullname in self.patched:
+            fpath, text, is_pkg = self.patched[fullname]
+            loader = PatchedSourceLoader(fpath, text)
+            spec = importlib.util.spec_from_loader(fullname, loader, origin=fpath, is_package=is_pkg)
+            if is_pkg:
+                spec.submodule_search_locations = [str(Path(fpath).parent)]
+            return spec
+        return None
 
 
 class RecordingResult(unittest.TestResult):
@@ -1139,11 +1208,7 @@ def record_import_time():
 
 
 def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
-    """Run the runnable candidates in a forked child with the patch active; keep the failing ones.
-
-    Only when every changed file is an existing sqlglot .py module whose change is confined to
-    swappable function bodies (plan_swaps). Otherwise every candidate stays selected.
-    """
+    """Run the runnable candidates in a forked child with the patch active; keep the failing ones."""
     must_keep, runnable = set(), []
     for num in cand_nums:
         reg = test_registry.get(num)
@@ -1151,15 +1216,25 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             must_keep.add(num)
             continue
         cls_obj, method_name, tid = reg
-        if cls_obj.__name__ in SKIP_CLASSES or tid in HEAVY_TESTS or tid in POOLED:
+        if cls_obj.__name__ in SKIP_CLASSES or tid in HEAVY_TESTS:
             must_keep.add(num)
         else:
             runnable.append((num, cls_obj, method_name, tid))
     if not runnable:
         return cand_nums
 
-    # Cost gate: verify a commit only when (cost of candidates) - (cost of tests that must stay unrun)
-    # exceeds the estimated CPU of the child x 1.6 (official CPU is ~1.6x our local CPU).
+    files = parse_patch(patch_text)
+    if not files:
+        return cand_nums
+    for f in files:
+        path = f.get("new") or f.get("old") or ""
+        if not f.get("old") or not f.get("new") or f["old"] != f["new"]:
+            return cand_nums  # new, deleted or renamed file
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            return cand_nums  # tests, fixtures, data: not verified here
+        if not (SRC / path).is_file():
+            return cand_nums
+
     cand_workers = best_split([(n, ms[n]) for n in cand_nums])
     cand_cost = (max(sum(ms[i] for i in w) for w in cand_workers) + WORKER_COST_MS * len(cand_workers)) / 1000.0 if cand_workers else 0.0
 
@@ -1167,29 +1242,48 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     unrun_cost = (max(sum(ms[i] for i in w) for w in unrun_workers) + WORKER_COST_MS * len(unrun_workers)) / 1000.0 if unrun_workers else 0.0
 
     potential_savings = max(0.0, cand_cost - unrun_cost)
-    child_cpu_est = 0.05 + sum(ms[num] for num, *_ in runnable) / 1000.0
-    if potential_savings <= child_cpu_est * 1.6:
-        log(f"  cost gate skipped: savings {potential_savings:.3f}s <= child cost {child_cpu_est * 1.6:.3f}s")
-        return cand_nums
 
     try:
         swaps = []
-        for f in parse_patch(patch_text):
-            path = f.get("new") or f.get("old") or ""
-            if not f.get("old") or not f.get("new") or f["old"] != f["new"]:
-                return cand_nums  # new, deleted or renamed file
-            if not (path.startswith("sqlglot/") and path.endswith(".py")):
-                return cand_nums  # tests, fixtures, data: not verified here
+        can_swap = True
+        patched_sources = {}
+        for f in files:
+            path = f["new"]
             old_text = (SRC / path).read_text(encoding="utf-8")
-            plan = plan_swaps(path, old_text, apply_hunks(old_text, f.get("hunks", [])))
-            if plan is None:
+            new_text = apply_hunks(old_text, f.get("hunks", []))
+            try:
+                compile(new_text, path, "exec")
+            except SyntaxError:
                 return cand_nums
-            swaps.extend(plan)
+            mod_name = path[:-3].replace("/", ".")
+            is_pkg = mod_name.endswith(".__init__")
+            if is_pkg:
+                mod_name = mod_name[: -len(".__init__")]
+            patched_sources[mod_name] = (str(SRC / path), new_text, is_pkg)
+
+            if can_swap:
+                plan = plan_swaps(path, old_text, new_text)
+                if plan is None:
+                    can_swap = False
+                else:
+                    swaps.extend(plan)
     except Exception as e:  # noqa: BLE001
         log(f"plan error: {e!r}")
         return cand_nums
-    if not swaps:
+
+    if can_swap and swaps:
+        mode = "swap"
+        child_cpu_est = 0.04 + 0.002 * len(runnable)
+        gate_threshold = child_cpu_est * 1.5
+    else:
+        mode = "import"
+        child_cpu_est = 0.20 + 0.012 * len(runnable)
+        gate_threshold = max(2.0, child_cpu_est * 1.8)
+
+    if potential_savings < gate_threshold:
+        log(f"  cost gate skipped ({mode}): savings {potential_savings:.3f}s < threshold {gate_threshold:.3f}s")
         return cand_nums
+
     try:
         r_fd, w_fd = os.pipe()
         pid = os.fork()
@@ -1199,21 +1293,63 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     if pid == 0:
         os.close(r_fd)
         try:
-            for fn, code in swaps:
-                fn.__code__ = code
-            grouped = {}
-            for num, cls_obj, method_name, tid in runnable:
-                grouped.setdefault(cls_obj, []).append((num, method_name, tid))
             failing = set()
+            concurrent.futures.ProcessPoolExecutor = InlineSynchronousPool
+            if mode == "swap":
+                for fn, code in swaps:
+                    fn.__code__ = code
+                if "tests.test_optimizer" in sys.modules:
+                    sys.modules["tests.test_optimizer"].ProcessPoolExecutor = InlineSynchronousPool
+                grouped = {}
+                for num, cls_obj, method_name, tid in runnable:
+                    grouped.setdefault(cls_obj, []).append((num, method_name, tid))
+            else:  # mode == "import"
+                for k in list(sys.modules.keys()):
+                    if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
+                        del sys.modules[k]
+                sys.meta_path.insert(0, PatchedFinder(patched_sources))
+                try:
+                    import sqlglot  # noqa: F401
+                except BaseException as e:
+                    log(f"child re-import sqlglot failed: {e!r}")
+                    os.write(w_fd, json.dumps(sorted(n for n, *_ in runnable)).encode("utf-8"))
+                    os._exit(0)
+
+                grouped = {}
+                for num, _cls_obj, method_name, tid in runnable:
+                    file_part, cls_part, _ = tid.split("::")
+                    mod_name = file_part[:-3].replace("/", ".")
+                    try:
+                        test_mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+                        if hasattr(test_mod, "ProcessPoolExecutor"):
+                            test_mod.ProcessPoolExecutor = InlineSynchronousPool
+                        fresh_cls = getattr(test_mod, cls_part)
+                        grouped.setdefault(fresh_cls, []).append((num, method_name, tid))
+                    except BaseException as e:
+                        log(f"child test import error {tid}: {e!r}")
+                        failing.add(num)
+
+            def timeout_handler(signum, frame):
+                raise TimeoutError("test timed out")
+
+            signal.signal(signal.SIGALRM, timeout_handler)
+
             for cls_obj, tlist in grouped.items():
                 suite = unittest.TestSuite([cls_obj(meth) for _, meth, _ in tlist])
                 rec = RecordingResult()
-                suite.run(rec)
-                skipped = {getattr(tc, "_testMethodName", "<ALL>") for tc, _ in rec.skipped}
-                if "<ALL>" in rec.failed_methods or "<ALL>" in skipped or rec.testsRun != len(tlist):
+                alarm_sec = max(5, min(15, int(len(tlist) * 0.3 + 5)))
+                signal.alarm(alarm_sec)
+                try:
+                    suite.run(rec)
+                    skipped = {getattr(tc, "_testMethodName", "<ALL>") for tc, _ in rec.skipped}
+                    if "<ALL>" in rec.failed_methods or "<ALL>" in skipped or rec.testsRun != len(tlist):
+                        failing.update(n for n, _, _ in tlist)
+                    else:  # a skipped test has no verdict: it stays
+                        failing.update(n for n, meth, _ in tlist if meth in rec.failed_methods or meth in skipped)
+                except BaseException:
                     failing.update(n for n, _, _ in tlist)
-                else:  # a skipped test has no verdict: it stays
-                    failing.update(n for n, meth, _ in tlist if meth in rec.failed_methods or meth in skipped)
+                finally:
+                    signal.alarm(0)
             os.write(w_fd, json.dumps(sorted(failing)).encode("utf-8"))
         except BaseException as e:  # noqa: BLE001
             log(f"child exception: {e!r}")
@@ -1247,12 +1383,6 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     except Exception:  # noqa: BLE001
         return cand_nums
     keep = set(must_keep) | (failing & {n for n, *_ in runnable})
-    # A failing test in a class-level process pool can break the pool for the tests after it.
-    for g in m.pool_groups:
-        nums = sorted(NUMBER[m.tests[i]] for i in g if m.tests[i] in NUMBER)
-        hit = [n for n in nums if n in keep]
-        if hit:
-            keep |= {n for n in nums if n >= hit[0] and n in set(cand_nums)}
     return sorted(keep)
 
 
@@ -1275,10 +1405,6 @@ def main() -> None:
         log(f"map unavailable ({e!r}); running everything")
         m = None
     all_split = best_split(every)
-
-    if m is not None:
-        for g in m.pool_groups:
-            POOLED.update(m.tests[i] for i in g)
 
     patches = sorted((DATA / "commits").glob("*.patch"))
     patch_entries = []
@@ -1314,6 +1440,7 @@ def main() -> None:
     # Pre-import ONLY touched sqlglot modules and candidate test modules
     sys.path.insert(0, str(SRC))
     NUMBER.update(number)
+    concurrent.futures.ProcessPoolExecutor = InlineSynchronousPool
     stop_recording = record_import_time()
     import sqlglot  # noqa: F401
 
@@ -1338,6 +1465,7 @@ def main() -> None:
         except Exception:
             test_registry[num] = None
     stop_recording()
+    gc.collect()
 
     for stem, patch_text, chosen in patch_entries:
         if chosen is ALL:
@@ -1352,6 +1480,7 @@ def main() -> None:
             workers = best_split([(n, ms[n]) for n in nums])
             log(f"{stem}: {len(nums)} tests (from {len(chosen)} cands)")
         print(json.dumps({"commit": stem, "workers": workers}))
+    sys.stderr.write("\n")
 
 
 if __name__ == "__main__":
