@@ -5,7 +5,7 @@
 # Python walk. (A stage of its own: its failure path empties only its own /out.)
 FROM python:3.13@sha256:9ffe84122ce74ebdffe2e0e6b946c9dd95d0bf3463f6eb1006b4dc6fefe36d01 AS cfp
 COPY app/native/_statefpc.c /src/_statefpc.c
-RUN mkdir -p /out && (gcc -O2 -DNDEBUG -shared -fPIC -I/usr/local/include/python3.13 \
+RUN mkdir -p /out && (gcc -O3 -DNDEBUG -shared -fPIC -I/usr/local/include/python3.13 \
         -o /out/_statefpc.cpython-313-x86_64-linux-gnu.so /src/_statefpc.c || (echo "no C module" >&2; rm -f /out/*))
 
 # Build stage for the C pass of procmodel._immortalize (app/native/_cimm.c): the slim image has no
@@ -13,7 +13,7 @@ RUN mkdir -p /out && (gcc -O2 -DNDEBUG -shared -fPIC -I/usr/local/include/python
 # /out stays empty and procmodel.py runs its Python pass.
 FROM python:3.13@sha256:9ffe84122ce74ebdffe2e0e6b946c9dd95d0bf3463f6eb1006b4dc6fefe36d01 AS cimm
 COPY app/native/_cimm.c /src/_cimm.c
-RUN mkdir -p /out && (gcc -O2 -shared -fPIC -I/usr/local/include/python3.13 \
+RUN mkdir -p /out && (gcc -O3 -shared -fPIC -I/usr/local/include/python3.13 \
         -o /out/_cimm.cpython-313-x86_64-linux-gnu.so /src/_cimm.c || (echo "no C immortal pass" >&2; rm -f /out/*))
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
@@ -74,7 +74,8 @@ ENV PYTHONHASHSEED=0 \
     MIMALLOC_LARGE_OS_PAGES=1 \
     MIMALLOC_RESERVE_OS_MEMORY=256MiB \
     MIMALLOC_ARENA_EAGER_COMMIT=1 \
-    MIMALLOC_PURGE_DELAY=-1
+    MIMALLOC_PURGE_DELAY=-1 \
+    BR_FRESH=4.5
 
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real

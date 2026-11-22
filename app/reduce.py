@@ -39,7 +39,8 @@ class State:
         self.keep_tasks = keep_tasks
         self.current = None
         self.task_counter = 0
-        self.files_seen = {}
+        if self.files_seen:
+            self.files_seen.clear()
         self.tasks_seen = 0
 
     def enter(self, tag):

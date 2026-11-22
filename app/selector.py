@@ -7,8 +7,10 @@ that fail. Logs go to stderr; only the answers go to stdout.
 from __future__ import annotations
 
 import collections
+import decimal
 import gc
 import json
+import logging
 import marshal
 import os
 import re
@@ -81,6 +83,7 @@ ITERS_ON = os.environ.get("BR_ITERS", "1") != "0"  # loop-iteration parts (iterr
 ITERS_WHOLE = os.environ.get("BR_ITERS_WHOLE") == "1"
 MAPS_OBJ = None
 ANSWER_FD = None
+DEVNULL_FD = None
 BASE_STATE = None
 SMALL_PLAN = float(os.environ.get("BR_SMALL_PLAN", "0.2"))  # CPU s; see small_plan in run()
 BASE_FUNCTION_KEYS = frozenset()
@@ -694,10 +697,25 @@ def _line_groups(old_text, new_text):
     import difflib
 
     a, b = old_text.split("\n"), new_text.split("\n")
+    len_a, len_b = len(a), len(b)
+    min_len = len_a if len_a < len_b else len_b
+    prefix = 0
+    while prefix < min_len and a[prefix] == b[prefix]:
+        prefix += 1
+    suffix = 0
+    max_suffix = min_len - prefix
+    while suffix < max_suffix and a[len_a - 1 - suffix] == b[len_b - 1 - suffix]:
+        suffix += 1
+    a_mid = a[prefix : len_a - suffix]
+    b_mid = b[prefix : len_b - suffix]
+    if not a_mid and not b_mid:
+        return []
     out = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a_mid, b_mid, autojunk=False).get_opcodes():
         if tag != "equal":
-            out.append([i1 + 1, i2 - i1, j1 + 1, j2 - j1, a[i1:i2], b[j1:j2]])
+            ai1, ai2 = prefix + i1, prefix + i2
+            aj1, aj2 = prefix + j1, prefix + j2
+            out.append([ai1 + 1, ai2 - ai1, aj1 + 1, aj2 - aj1, a[ai1:ai2], b[aj1:aj2]])
     return out
 
 
@@ -2807,7 +2825,11 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
             test_id, rel, cls_name, meth, old, new, keep_files, keep_tasks, it = item
             if old is not None:
                 try:
-                    cls = getattr(importlib.import_module(rel[:-3].replace("/", ".")), cls_name)
+                    mod_name = rel[:-3].replace("/", ".")
+                    mod = sys.modules.get(mod_name)
+                    if mod is None:
+                        mod = importlib.import_module(mod_name)
+                    cls = getattr(mod, cls_name)
                 except Exception:  # noqa: BLE001
                     continue
                 if not reduce.install_reduction(cls, meth, old, new):
@@ -2886,9 +2908,6 @@ def _environ_copy():
 
 def _interpreter_settings():
     """Interpreter-wide settings that a test run should leave as it found them."""
-    import decimal
-    import logging
-
     root = logging.getLogger()
     return (
         sys.getrecursionlimit(), sys.getswitchinterval(), os.getcwd(), len(sys.path), sys.path[:3],
@@ -3629,10 +3648,12 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         CPU_GUARD.update(plan.guard)
         if ANSWER_FD is not None:
             os.close(ANSWER_FD)
-        devnull = os.open(os.devnull, os.O_WRONLY)
+        devnull = DEVNULL_FD if DEVNULL_FD is not None else os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         if not DEBUG:
             os.dup2(devnull, 2)
+        if DEVNULL_FD is None:
+            os.close(devnull)
         if DEBUG:
             import faulthandler
 
@@ -4110,10 +4131,12 @@ def fixture_batch_child(batch, tests, wfd):
     try:
         if ANSWER_FD is not None:
             os.close(ANSWER_FD)
-        devnull = os.open(os.devnull, os.O_WRONLY)
+        devnull = DEVNULL_FD if DEVNULL_FD is not None else os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         if not DEBUG:
             os.dup2(devnull, 2)
+        if DEVNULL_FD is None:
+            os.close(devnull)
         if DEBUG:
             import faulthandler
 
@@ -5064,6 +5087,11 @@ def release_pin_if_slow():
 def main():
     procmodel.install()
     pin_to_one_cpu()
+    global DEVNULL_FD
+    try:
+        DEVNULL_FD = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        DEVNULL_FD = None
     t_start = time.monotonic()
     deadline = t_start + wall_limit()
     # Only the answers may reach stdout. Everything else that writes to fd 1 goes to stderr.
@@ -5234,6 +5262,7 @@ def run(t_start, deadline, state):
         CONE_MAP = None
     tests = align_tests(tests, maps.meta["test_ids"], state)
     seconds = [t["seconds"] for t in tests]
+    test_classes = [t["id"].rsplit("::", 1)[0] for t in tests]
     state["tests"] = tests
     REGISTRY_CLEAR_AT = registry_clear_at([t["id"] for t in tests])
     all_tests = list(range(len(tests)))
@@ -5285,7 +5314,7 @@ def run(t_start, deadline, state):
         """The long held tests that the tests in evidence (failing tests) select: those of the
         same test class or the same .sql fixture file, or all of them with many failures.
         more: failing tests that may exist unseen (see marginal_holds)."""
-        class_of = lambda n: tests[n]["id"].rsplit("::", 1)[0]
+        class_of = lambda n: test_classes[n]
         fail_classes = {class_of(n) for n in evidence}
         fail_fixtures = set()
         for n in evidence:
@@ -5469,13 +5498,13 @@ def run(t_start, deadline, state):
             budget = COLL_BUDGET  # the runs are priced beside the dead tests below
         # the verdicts of these tests decide about the long held tests: they run first
         long_held = [n for n in held if seconds[n] > QUIET_HOLD_SECONDS]
-        protect_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in long_held}
+        protect_classes = {test_classes[n] for n in long_held}
         protect_fixtures = set()
         for n in long_held:
             protect_fixtures.update(fixtures_of(n))
         plan.protect = {
             n for n in ran
-            if tests[n]["id"].rsplit("::", 1)[0] in protect_classes
+            if test_classes[n] in protect_classes
             or (protect_fixtures and protect_fixtures & fixtures_of(n) and cost[n] <= 2.0)
         }
         if sum(cost[n] for n in ran) > budget:
@@ -5686,10 +5715,10 @@ def run(t_start, deadline, state):
             left_cost = sum(cost[n] for n in ran)
             for n in ran:
                 left_cost -= cost[n]
-                n_class, n_fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
+                n_class, n_fixtures = test_classes[n], fixtures_of(n)
                 decides = {
                     t for t in long_held
-                    if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & fixtures_of(t)
+                    if test_classes[t] == n_class or n_fixtures & fixtures_of(t)
                 }
                 if decides:
                     plan.enders[n] = (decides, left_cost > WORKER_COST)
