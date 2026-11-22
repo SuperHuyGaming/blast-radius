@@ -1232,6 +1232,8 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             return cand_nums  # new, deleted or renamed file
         if not (path.startswith("sqlglot/") and path.endswith(".py")):
             return cand_nums  # tests, fixtures, data: not verified here
+        if path.startswith("sqlglot/typing/"):
+            return cand_nums  # typing metadata: import verification triggers heavy multi-module run that times out
         if not (SRC / path).is_file():
             return cand_nums
 
@@ -1283,6 +1285,15 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
         if len(runnable) < 2 or potential_savings < 2.0:
             log(f"  cost gate skipped (import): len {len(runnable)} < 2 or savings {potential_savings:.3f}s < 2.0s")
             return cand_nums
+        is_dialect_family = any(
+            f["new"].startswith("sqlglot/dialects/")
+            or f["new"].startswith("sqlglot/generators/")
+            or f["new"].startswith("sqlglot/parsers/")
+            for f in files
+        )
+        if not is_dialect_family and len(runnable) > 50:
+            log(f"  cost gate skipped (import non-dialect): len {len(runnable)} > 50")
+            return cand_nums
         req = 0.5 + 0.02 * len(runnable)
         if len(runnable) > 40 and potential_savings < req:
             log(f"  cost gate skipped (import): savings {potential_savings:.3f}s < req {req:.3f}s (len {len(runnable)})")
@@ -1301,7 +1312,11 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             concurrent.futures.ProcessPoolExecutor = InlineSynchronousPool
 
             def timeout_handler(signum, frame):
-                raise TimeoutError("timeout")
+                try:
+                    os.write(w_fd, json.dumps(sorted(n for n, *_ in runnable)).encode("utf-8"))
+                except Exception:
+                    pass
+                os._exit(0)
 
             signal.signal(signal.SIGALRM, timeout_handler)
 
@@ -1349,7 +1364,7 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             for cls_obj, tlist in grouped.items():
                 suite = unittest.TestSuite([cls_obj(meth) for _, meth, _ in tlist])
                 rec = RecordingResult()
-                alarm_sec = max(5, min(15, int(len(tlist) * 0.3 + 5)))
+                alarm_sec = max(6, int(len(tlist) * 0.35 + 4)) if mode == "swap" else max(3, min(8, int(len(tlist) * 0.02 + 4)))
                 signal.alarm(alarm_sec)
                 try:
                     suite.run(rec)
@@ -1370,7 +1385,8 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             os.close(w_fd)
             os._exit(0)
     os.close(w_fd)
-    r_list, _, _ = sys_select.select([r_fd], [], [], 10.0)
+    parent_timeout = float(max(10, int(len(runnable) * 0.35 + 8))) if mode == "swap" else float(max(5, min(10, int(len(runnable) * 0.02 + 5))))
+    r_list, _, _ = sys_select.select([r_fd], [], [], parent_timeout)
     if not r_list:
         log(f"child timed out; killing pid {pid}")
         try:
