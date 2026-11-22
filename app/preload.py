@@ -449,6 +449,8 @@ def refresh_class_fixtures(root: str, files) -> list:
     raises; otherwise a costly but safe answer). The parent's objects stay referenced: a
     forked child that drops the last reference to a duckdb connection of the parent can die.
     Returns [(module of the class, True when its setUpClass now raises)]."""
+    if not any(rel.startswith("tests/") for rel in files):
+        return []
     changed = {os.path.join(root, rel) for rel in files}
     helpers = sys.modules.get("tests.helpers")
     done = []
