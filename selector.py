@@ -1211,6 +1211,9 @@ class TestTimeout(BaseException):
     pass
 
 
+CPU_CAP_FACTOR = float(os.environ.get("OWN_CPU_CAP_FACTOR", "1.5"))
+
+
 def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     """Run the runnable candidates in a forked child with the patch active; keep the failing ones."""
     must_keep, runnable = set(), []
@@ -1311,6 +1314,15 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
         return cand_nums
     if pid == 0:
         os.close(r_fd)
+        # CPU cap: a verification may cost at most what it can save (and 3 s at least); past that
+        # the kernel stops the child (SIGXCPU) and the commit keeps every candidate.
+        try:
+            import resource
+
+            cap = int(max(3.0, CPU_CAP_FACTOR * potential_savings)) + 1
+            resource.setrlimit(resource.RLIMIT_CPU, (cap, cap + 1))
+        except Exception:  # noqa: BLE001
+            pass
         try:
             failing = set()
             concurrent.futures.ProcessPoolExecutor = InlineSynchronousPool
@@ -1512,7 +1524,9 @@ def main() -> None:
             workers = []
             log(f"{stem}: 0 tests")
         else:
+            _t0 = sum(os.times()[:4])
             verified = verify_candidates(chosen, patch_text, test_registry, m, ms)
+            log(f"  CPUCOST {stem} {sum(os.times()[:4]) - _t0:.2f}")
             nums = sorted(verified)
             workers = best_split([(n, ms[n]) for n in nums])
             log(f"{stem}: {len(nums)} tests (from {len(chosen)} cands)")
