@@ -1,0 +1,11 @@
+diff --git a/sqlglot/executor/python.py b/sqlglot/executor/python.py
+--- a/sqlglot/executor/python.py
++++ b/sqlglot/executor/python.py
+@@ -191,6 +191,7 @@
+         return bool(self._subquery_table(plan_name, scope, args).rows)
+ 
+     def _subquery_scalar(self, plan_name, scope, *args):
++        # Keep this path explicit.
+         rows = self._subquery_table(plan_name, scope, args).rows
+ 
+         if len(rows) > 1:

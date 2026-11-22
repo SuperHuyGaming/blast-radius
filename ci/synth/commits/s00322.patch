@@ -1,0 +1,10 @@
+diff --git a/tests/fixtures/optimizer/qualify_columns__with_invisible.sql b/tests/fixtures/optimizer/qualify_columns__with_invisible.sql
+--- a/tests/fixtures/optimizer/qualify_columns__with_invisible.sql
++++ b/tests/fixtures/optimizer/qualify_columns__with_invisible.sql
+@@ -31,5 +31,5 @@
+ SELECT a FROM (SELECT * FROM x);
+ SELECT _0.a AS a FROM (SELECT x.a AS a FROM x AS x) AS _0;
+ 
+-SELECT * FROM (SELECT a FROM x);
++SELECT 42 * FROM (SELECT a FROM x);
+ SELECT _0.a AS a FROM (SELECT x.a AS a FROM x AS x) AS _0;

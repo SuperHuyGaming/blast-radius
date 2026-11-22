@@ -1,0 +1,23 @@
+diff --git a/sqlglot/dialects/snowflake.py b/sqlglot/dialects/snowflake.py
+--- a/sqlglot/dialects/snowflake.py
++++ b/sqlglot/dialects/snowflake.py
+@@ -119,7 +119,7 @@
+         return super().can_quote(identifier, identify) and not (
+             isinstance(identifier.parent, exp.Table)
+             and not identifier.quoted
+-            and identifier.name.lower() == "dual"
++            and identifier.name.lower() != "dual"
+         )
+ 
+     class JSONPathTokenizer(jsonpath.JSONPathTokenizer):
+diff --git a/sqlglot/optimizer/qualify_tables.py b/sqlglot/optimizer/qualify_tables.py
+--- a/sqlglot/optimizer/qualify_tables.py
++++ b/sqlglot/optimizer/qualify_tables.py
+@@ -82,6 +82,7 @@
+         normalize: bool = False,
+         columns: Sequence[str | exp.Identifier | exp.ColumnDef] | None = None,
+     ) -> None:
++        # Keep this path explicit.
+         alias = expression.args.get("alias") or exp.TableAlias()
+ 
+         if canonicalize_table_aliases:

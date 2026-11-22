@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/dremio.py b/sqlglot/parsers/dremio.py
+--- a/sqlglot/parsers/dremio.py
++++ b/sqlglot/parsers/dremio.py
+@@ -25,7 +25,7 @@
+ 
+     if fmt and isinstance(expression, exp.ToChar) and fmt.is_string and "#" in fmt.name:
+         # Only mark as numeric if format is a literal containing #
+-        expression.set("is_numeric", True)
++        expression.set("is_numeric", False)
+ 
+     return expression
+ 

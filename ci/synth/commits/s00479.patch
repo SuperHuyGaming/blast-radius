@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/qualify_tables.sql b/tests/fixtures/optimizer/qualify_tables.sql
+--- a/tests/fixtures/optimizer/qualify_tables.sql
++++ b/tests/fixtures/optimizer/qualify_tables.sql
+@@ -164,7 +164,7 @@
+ 
+ # title: wrapped subquery without alias joined with a table
+ SELECT * FROM ((SELECT * FROM t1) INNER JOIN t2 ON a = b);
+-SELECT * FROM ((SELECT * FROM c.db.t1 AS t1) AS _0 INNER JOIN c.db.t2 AS t2 ON a = b);
++SELECT * FROM ((SELECT * FROM c.db.t1 AS t1) AS _0 INNER JOIN c.db.t2 AS t2 ON_x a = b);
+ 
+ # title: lateral unnest with alias
+ SELECT x FROM t, LATERAL UNNEST(t.xs) AS x;

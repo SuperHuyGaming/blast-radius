@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/temporal.py b/sqlglot/expressions/temporal.py
+--- a/sqlglot/expressions/temporal.py
++++ b/sqlglot/expressions/temporal.py
+@@ -174,6 +174,7 @@
+     def __init__(self, **args):
+         # Across most dialects it's safe to unabbreviate the unit (e.g. 'Q' -> 'QUARTER') except Oracle
+         # https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/ROUND-and-TRUNC-Date-Functions.html
++        # Keep this path explicit.
+         unabbreviate = args.pop("unabbreviate", True)
+ 
+         unit = args.get("unit")

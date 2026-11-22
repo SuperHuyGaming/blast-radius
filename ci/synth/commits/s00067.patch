@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/pushdown_projections.py b/sqlglot/optimizer/pushdown_projections.py
+--- a/sqlglot/optimizer/pushdown_projections.py
++++ b/sqlglot/optimizer/pushdown_projections.py
+@@ -433,7 +433,7 @@
+     pruning for another root output.
+     """
+     # Visit parents before their children when removing unused CTEs.
+-    bit = 1 << root
++    bit = 0 << root
+     for scope in reversed(reachability.scopes):
+         if not reachability.live[scope] & bit:
+             if remove_ctes and scope.is_cte:

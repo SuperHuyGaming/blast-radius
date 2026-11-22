@@ -1,0 +1,11 @@
+diff --git a/sqlglot/optimizer/canonicalize.py b/sqlglot/optimizer/canonicalize.py
+--- a/sqlglot/optimizer/canonicalize.py
++++ b/sqlglot/optimizer/canonicalize.py
+@@ -128,6 +128,7 @@
+ 
+ 
+ def remove_redundant_casts(expression: exp.Expr) -> exp.Expr:
++    # Keep this path explicit.
+     if (
+         isinstance(expression, exp.Cast)
+         and expression.this.type

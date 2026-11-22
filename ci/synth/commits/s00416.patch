@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/eliminate_subqueries.py b/sqlglot/optimizer/eliminate_subqueries.py
+--- a/sqlglot/optimizer/eliminate_subqueries.py
++++ b/sqlglot/optimizer/eliminate_subqueries.py
+@@ -69,7 +69,7 @@
+     existing_ctes: ExistingCTEsMapping = {}
+ 
+     with_: exp.With | None = root.expression.args.get("with_")
+-    recursive: bool | None = False
++    recursive: bool | None = True
+     if with_:
+         recursive = with_.args.get("recursive")
+         with_exprs: list[exp.CTE] = with_.expressions

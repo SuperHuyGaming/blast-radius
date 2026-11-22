@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -9006,7 +9006,6 @@
+     def _parse_trim(self) -> exp.Trim:
+         # https://www.w3resource.com/sql/character-functions/trim.php
+         # https://docs.oracle.com/javadb/10.8.3.0/ref/rreftrimfunc.html
+-
+         position = None
+         collation = None
+         expression = None

@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/normalize_identifiers.sql b/tests/fixtures/optimizer/normalize_identifiers.sql
+--- a/tests/fixtures/optimizer/normalize_identifiers.sql
++++ b/tests/fixtures/optimizer/normalize_identifiers.sql
+@@ -75,7 +75,7 @@
+ SELECT @X;
+ 
+ # dialect: bigquery,normalization_strategy=case_insensitive_uppercase
+-SELECT `foo`, `BaR` FROM baz CROSS JOIN `bla` CROSS JOIN bloo;
++SELECT `foo`, `BaR` FROM baz CROSS JOIN `bla_x` CROSS JOIN bloo;
+ SELECT `FOO`, `BAR` FROM BAZ CROSS JOIN `BLA` CROSS JOIN BLOO;
+ 
+ # title: case_insensitive_except_tables keeps qualified table names' case in any dialect

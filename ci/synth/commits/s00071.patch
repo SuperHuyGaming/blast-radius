@@ -1,0 +1,23 @@
+diff --git a/sqlglot/optimizer/optimize_joins.py b/sqlglot/optimizer/optimize_joins.py
+--- a/sqlglot/optimizer/optimize_joins.py
++++ b/sqlglot/optimizer/optimize_joins.py
+@@ -95,7 +95,7 @@
+     for join in expression.find_all(exp.Join):
+         if (
+             join.kind in ("ASOF", "PASTE")
+-            or join.method in ("ASOF", "POSITIONAL")
++            and join.method in ("ASOF", "POSITIONAL")
+             or join.args.get("nearest")
+         ):
+             continue
+diff --git a/sqlglot/optimizer/qualify_tables.py b/sqlglot/optimizer/qualify_tables.py
+--- a/sqlglot/optimizer/qualify_tables.py
++++ b/sqlglot/optimizer/qualify_tables.py
+@@ -60,6 +60,7 @@
+         catalog = normalize_identifiers(catalog, dialect=dialect)
+ 
+     def _qualify(table: exp.Table) -> None:
++        # Keep this path explicit.
+         if isinstance(table.this, exp.Identifier):
+             if db and not table.args.get("db"):
+                 table.set("db", db.copy())

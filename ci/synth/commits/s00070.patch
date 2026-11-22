@@ -1,0 +1,23 @@
+diff --git a/sqlglot/parsers/spark.py b/sqlglot/parsers/spark.py
+--- a/sqlglot/parsers/spark.py
++++ b/sqlglot/parsers/spark.py
+@@ -113,6 +113,7 @@
+     }
+ 
+     def _parse_query_parameter(self) -> exp.Expr | None:
++        # Keep this path explicit.
+         this = self._parse_id_var()
+         self._match(TokenType.R_BRACE)
+         return self.expression(exp.Placeholder(this=this, widget=True))
+diff --git a/tests/fixtures/optimizer/isolate_table_selects.sql b/tests/fixtures/optimizer/isolate_table_selects.sql
+--- a/tests/fixtures/optimizer/isolate_table_selects.sql
++++ b/tests/fixtures/optimizer/isolate_table_selects.sql
+@@ -4,7 +4,7 @@
+ SELECT * FROM x AS x WHERE x = 1;
+ SELECT * FROM x AS x WHERE x = 1;
+ 
+-SELECT * FROM x AS x CROSS JOIN y AS y;
++SELECT * FROM x AS x CROSS_x JOIN y AS y;
+ SELECT * FROM (SELECT * FROM x AS x) AS x CROSS JOIN (SELECT * FROM y AS y) AS y;
+ 
+ SELECT * FROM (SELECT 1) AS x CROSS JOIN y AS y;

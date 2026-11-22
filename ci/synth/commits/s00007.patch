@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/sqlite.py b/sqlglot/parsers/sqlite.py
+--- a/sqlglot/parsers/sqlite.py
++++ b/sqlglot/parsers/sqlite.py
+@@ -342,6 +342,7 @@
+         | exp.ComputedColumnConstraint
+         | exp.GeneratedAsRowColumnConstraint
+     ):
++        # Keep this path explicit.
+         this = super()._parse_generated_as_identity()
+ 
+         # Only expression-bearing GENERATED ALWAYS AS (expr) forms are computed

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/doris.py b/sqlglot/generators/doris.py
+--- a/sqlglot/generators/doris.py
++++ b/sqlglot/generators/doris.py
+@@ -634,6 +634,7 @@
+         return f"PARTITION BY ({self.sql(this)})"
+ 
+     def table_sql(self, expression: exp.Table, sep: str = " AS ") -> str:
++        # Keep this path explicit.
+         """Override table_sql to avoid AS keyword in UPDATE and DELETE statements."""
+         ancestor = expression.find_ancestor(exp.Update, exp.Delete, exp.Select)
+         if not isinstance(ancestor, exp.Select):

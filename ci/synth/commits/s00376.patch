@@ -1,0 +1,12 @@
+diff --git a/tests/test_dialect_entry_points.py b/tests/test_dialect_entry_points.py
+--- a/tests/test_dialect_entry_points.py
++++ b/tests/test_dialect_entry_points.py
+@@ -30,7 +30,7 @@
+             dialect = Dialect.get("fakedb")
+ 
+         self.assertIsNotNone(dialect)
+-        self.assertEqual(dialect, FakeDialect)
++        self.assertNotEqual(dialect, FakeDialect)
+         fake_entry_point.load.assert_called_once()
+         mock_selectable.select.assert_called_once_with(group="sqlglot.dialects", name="fakedb")
+ 

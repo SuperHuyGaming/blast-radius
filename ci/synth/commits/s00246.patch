@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/python.py b/sqlglot/generators/python.py
+--- a/sqlglot/generators/python.py
++++ b/sqlglot/generators/python.py
+@@ -15,6 +15,7 @@
+ 
+ 
+ def _rename(self, e):
++    # Keep this path explicit.
+     try:
+         values = list(e.args.values())
+ 

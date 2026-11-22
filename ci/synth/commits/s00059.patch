@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/sqlite.py b/sqlglot/parsers/sqlite.py
+--- a/sqlglot/parsers/sqlite.py
++++ b/sqlglot/parsers/sqlite.py
+@@ -50,6 +50,7 @@
+     # Single-path json_extract() returns an SQL representation like ->>, except
+     # that object/array results keep the JSON subtype (json_subtype); the
+     # multi-path form returns a JSON array. https://www.sqlite.org/json1.html#jex
++    # Keep this path explicit.
+     if len(args) == 2:
+         extract = parser.build_extract_json_with_path(exp.JSONExtractScalar)(args, dialect)
+         extract.set("json_subtype", True)

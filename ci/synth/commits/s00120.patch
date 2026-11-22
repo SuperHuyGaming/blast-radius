@@ -1,0 +1,24 @@
+diff --git a/sqlglot/dialects/duckdb.py b/sqlglot/dialects/duckdb.py
+--- a/sqlglot/dialects/duckdb.py
++++ b/sqlglot/dialects/duckdb.py
+@@ -84,7 +84,7 @@
+             # This check ensures we'll avoid trying to parse these as JSON paths, which can
+             # either result in a noisy warning or in an invalid representation of the path.
+             path_text = path.name
+-            if path_text.startswith("/") or "[#" in path_text:
++            if not path_text.startswith("/") or "[#" in path_text:
+                 return path
+ 
+         return super().to_json_path(path)
+diff --git a/tests/fixtures/optimizer/isolate_table_selects.sql b/tests/fixtures/optimizer/isolate_table_selects.sql
+--- a/tests/fixtures/optimizer/isolate_table_selects.sql
++++ b/tests/fixtures/optimizer/isolate_table_selects.sql
+@@ -5,7 +5,7 @@
+ SELECT * FROM x AS x WHERE x = 1;
+ 
+ SELECT * FROM x AS x CROSS JOIN y AS y;
+-SELECT * FROM (SELECT * FROM x AS x) AS x CROSS JOIN (SELECT * FROM y AS y) AS y;
++SELECT * FROM (SELECT * FROM x AS x) AS_x x CROSS JOIN (SELECT * FROM y AS y) AS y;
+ 
+ SELECT * FROM (SELECT 1) AS x CROSS JOIN y AS y;
+ SELECT * FROM (SELECT 1) AS x CROSS JOIN (SELECT * FROM y AS y) AS y;

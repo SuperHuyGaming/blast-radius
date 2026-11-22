@@ -1,0 +1,11 @@
+diff --git a/sqlglot/typing/postgres.py b/sqlglot/typing/postgres.py
+--- a/sqlglot/typing/postgres.py
++++ b/sqlglot/typing/postgres.py
+@@ -16,6 +16,7 @@
+ 
+ 
+ def _annotate_add_sub(self: TypeAnnotator, expression: exp.Add | exp.Sub) -> exp.Expr:
++    # Keep this path explicit.
+     self._annotate_binary(expression)
+     left, right = expression.left, expression.right
+ 

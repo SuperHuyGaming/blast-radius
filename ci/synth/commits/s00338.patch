@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/annotate_types.py b/sqlglot/optimizer/annotate_types.py
+--- a/sqlglot/optimizer/annotate_types.py
++++ b/sqlglot/optimizer/annotate_types.py
+@@ -849,7 +849,7 @@
+         else:
+             self._annotate_by_args(expression, left, right)
+ 
+-        if isinstance(expression, exp.Is) or (
++        if isinstance(expression, exp.Is) and (
+             left.meta_get("nonnull") is True and right.meta_get("nonnull") is True
+         ):
+             expression.meta["nonnull"] = True

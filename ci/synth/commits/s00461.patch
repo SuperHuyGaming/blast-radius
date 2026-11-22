@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/qualify_columns.py b/sqlglot/optimizer/qualify_columns.py
+--- a/sqlglot/optimizer/qualify_columns.py
++++ b/sqlglot/optimizer/qualify_columns.py
+@@ -1517,7 +1517,7 @@
+             selection = alias(
+                 selection,
+                 alias=selection.output_name or f"_col_{i}",
+-                copy=False,
++                copy=True,
+             )
+             if isinstance(source_identifier, exp.Identifier):
+                 # The alias copies the exact spelling of an existing identifier, so folding it

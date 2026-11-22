@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/clickhouse.py b/sqlglot/parsers/clickhouse.py
+--- a/sqlglot/parsers/clickhouse.py
++++ b/sqlglot/parsers/clickhouse.py
+@@ -748,7 +748,7 @@
+             skip_join_token=skip_join_token, parse_bracket=True, alias_tokens=alias_tokens
+         )
+         if join:
+-            if join.method == "GLOBAL":
++            if join.method != "GLOBAL":
+                 join.set("method", None)
+                 join.set("global_", "GLOBAL")
+ 

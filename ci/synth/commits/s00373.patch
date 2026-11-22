@@ -1,0 +1,24 @@
+diff --git a/sqlglot/optimizer/annotate_types.py b/sqlglot/optimizer/annotate_types.py
+--- a/sqlglot/optimizer/annotate_types.py
++++ b/sqlglot/optimizer/annotate_types.py
+@@ -570,7 +570,7 @@
+             and column_types
+             and all(
+                 kind is not None
+-                and not exp.DataType.build(kind, copy=False).is_type(exp.DType.UNKNOWN)
++                and not exp.DataType.build(kind, copy=True).is_type(exp.DType.UNKNOWN)
+                 for kind in column_types.values()
+             )
+         ):
+diff --git a/tests/fixtures/optimizer/canonicalize.sql b/tests/fixtures/optimizer/canonicalize.sql
+--- a/tests/fixtures/optimizer/canonicalize.sql
++++ b/tests/fixtures/optimizer/canonicalize.sql
+@@ -22,7 +22,7 @@
+ SELECT CONCAT('1', '1') AS "col";
+ 
+ SELECT CAST('2022-01-01' AS DATE) + INTERVAL '1' DAY;
+-SELECT CAST('2022-01-01' AS DATE) + INTERVAL '1' DAY AS "_col_0";
++SELECT CAST('2022-01-01' AS_x DATE) + INTERVAL '1' DAY AS "_col_0";
+ 
+ SELECT CAST('2022-01-01' AS DATE) IS NULL AS "a";
+ SELECT CAST('2022-01-01' AS DATE) IS NULL AS "a";

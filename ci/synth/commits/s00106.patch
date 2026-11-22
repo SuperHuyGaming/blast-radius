@@ -1,0 +1,12 @@
+diff --git a/sqlglot/serde.py b/sqlglot/serde.py
+--- a/sqlglot/serde.py
++++ b/sqlglot/serde.py
+@@ -58,7 +58,7 @@
+                 payload[META] = node._meta
+             if node.args:
+                 for k, vs in reversed(node.args.items()):
+-                    if type(vs) is list:
++                    if type(vs) == list:
+                         for v in reversed(vs):
+                             stack.append((v, i, k, True))
+                     elif vs is not None:

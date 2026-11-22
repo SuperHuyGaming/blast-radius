@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/annotate_functions.sql b/tests/fixtures/optimizer/annotate_functions.sql
+--- a/tests/fixtures/optimizer/annotate_functions.sql
++++ b/tests/fixtures/optimizer/annotate_functions.sql
+@@ -2742,7 +2742,7 @@
+ DOUBLE;
+ 
+ # dialect: snowflake
+-AI_AGG('foo', 'bar');
++AI_AGG('foo', 'barx');
+ VARCHAR;
+ 
+ # dialect: snowflake

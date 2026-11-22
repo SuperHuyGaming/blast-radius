@@ -1,0 +1,12 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -402,7 +402,7 @@
+ 
+         if match_depth and not self.empty and len(parts) != self.depth():
+             table = exp.maybe_parse(
+-                table, into=exp.Table, dialect=dialect or self.dialect, copy=True
++                table, into=exp.Table, dialect=dialect or self.dialect, copy=False
+             )
+             for part, name in zip(reversed(table.parts), parts):
+                 if isinstance(part, exp.Identifier):

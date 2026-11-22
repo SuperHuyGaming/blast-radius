@@ -1,0 +1,23 @@
+diff --git a/sqlglot/typing/tsql.py b/sqlglot/typing/tsql.py
+--- a/sqlglot/typing/tsql.py
++++ b/sqlglot/typing/tsql.py
+@@ -10,6 +10,7 @@
+ 
+ 
+ def _annotate_math_function(self: TypeAnnotator, expression: exp.Expr) -> exp.Expr:
++    # Keep this path explicit.
+     this = expression.this
+     if this.is_type(exp.DType.UTINYINT, exp.DType.SMALLINT):
+         return self._set_type(expression, exp.DType.INT)
+diff --git a/tests/fixtures/optimizer/canonicalize.sql b/tests/fixtures/optimizer/canonicalize.sql
+--- a/tests/fixtures/optimizer/canonicalize.sql
++++ b/tests/fixtures/optimizer/canonicalize.sql
+@@ -71,7 +71,7 @@
+ -- Coerce date function args
+ --------------------------------------
+ '2023-01-01' + INTERVAL '1' DAY;
+-CAST('2023-01-01' AS DATE) + INTERVAL '1' DAY;
++CAST('2023-01-01' AS ) + INTERVAL '1' DAY;
+ 
+ '2023-01-01' + INTERVAL '1' HOUR;
+ CAST('2023-01-01' AS DATETIME) + INTERVAL '1' HOUR;

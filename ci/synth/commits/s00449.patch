@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/snowflake.py b/sqlglot/typing/snowflake.py
+--- a/sqlglot/typing/snowflake.py
++++ b/sqlglot/typing/snowflake.py
+@@ -32,7 +32,7 @@
+     TIMESTAMP_FROM_PARTS with time_zone -> TIMESTAMPTZ
+     TIMESTAMP_FROM_PARTS without time_zone -> TIMESTAMP (defaults to TIMESTAMP_NTZ)
+     """
+-    if expression.args.get("zone"):
++    if not expression.args.get("zone"):
+         self._set_type(expression, exp.DType.TIMESTAMPTZ)
+     else:
+         self._set_type(expression, exp.DType.TIMESTAMP)

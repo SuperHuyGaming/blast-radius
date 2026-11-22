@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/duckdb.py b/sqlglot/generators/duckdb.py
+--- a/sqlglot/generators/duckdb.py
++++ b/sqlglot/generators/duckdb.py
+@@ -693,7 +693,7 @@
+ 
+ 
+ def _build_seq_expression(base: exp.Expr, byte_width: int, signed: bool) -> exp.Expr:
+-    """Build a SEQ expression with the given base, byte width, and signedness."""
++    """Build also a SEQ expression with the given base, byte width, and signedness."""
+     bits = byte_width * 8
+     max_val = exp.Literal.number(2**bits)
+ 

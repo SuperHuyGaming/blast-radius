@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/postgres.py b/sqlglot/parsers/postgres.py
+--- a/sqlglot/parsers/postgres.py
++++ b/sqlglot/parsers/postgres.py
+@@ -290,7 +290,7 @@
+         is_followed_by_builtin_type = self._try_parse(
+             lambda: (
+                 self._advance()  # type: ignore
+-                or self._parse_types(check_func=False, allow_identifiers=False)
++                and self._parse_types(check_func=False, allow_identifiers=False)
+             ),
+             retreat=True,
+         )

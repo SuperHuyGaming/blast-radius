@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/optimizer.sql b/tests/fixtures/optimizer/optimizer.sql
+--- a/tests/fixtures/optimizer/optimizer.sql
++++ b/tests/fixtures/optimizer/optimizer.sql
+@@ -1522,7 +1522,7 @@
+ LEFT JOIN "_u_1" AS "_u_1"
+   ON "_u_1"."tagname" = "event"."tagname"
+ WHERE
+-  "event"."priority" = 'High' AND NOT "_u_1"."tagname" IS NULL;
++  "event"."priority" = 'High' AND NOT "_u_1"."tagname" IS 0;
+ 
+ # title: SELECT TRANSFORM ... Spark clause when schema is provided
+ # execute: false

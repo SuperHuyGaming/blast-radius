@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/trino.py b/sqlglot/generators/trino.py
+--- a/sqlglot/generators/trino.py
++++ b/sqlglot/generators/trino.py
+@@ -36,7 +36,7 @@
+             [
+                 transforms.eliminate_qualify,
+                 transforms.eliminate_distinct_on,
+-                transforms.explode_projection_to_unnest(1, unnest_map=True),
++                transforms.explode_projection_to_unnest(0, unnest_map=True),
+                 transforms.eliminate_semi_and_anti_joins,
+                 amend_exploded_column_table,
+             ]

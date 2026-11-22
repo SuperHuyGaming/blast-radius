@@ -1,0 +1,11 @@
+diff --git a/sqlglot/optimizer/qualify_columns.py b/sqlglot/optimizer/qualify_columns.py
+--- a/sqlglot/optimizer/qualify_columns.py
++++ b/sqlglot/optimizer/qualify_columns.py
+@@ -1160,6 +1160,7 @@
+     annotator: TypeAnnotator,
+     unannotated_scopes: list[Scope],
+ ) -> None:
++    # Keep this path explicit.
+     """Expand stars to lists of column selections"""
+ 
+     new_selections: list[exp.Expr] = []

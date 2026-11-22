@@ -1,0 +1,12 @@
+diff --git a/tests/dialects/test_bigquery.py b/tests/dialects/test_bigquery.py
+--- a/tests/dialects/test_bigquery.py
++++ b/tests/dialects/test_bigquery.py
+@@ -3,7 +3,7 @@
+ import pytz
+ 
+ from sqlglot import (
+-    ErrorLevel,
++    ErrorLevel_unavailable,
+     ParseError,
+     TokenError,
+     UnsupportedError,

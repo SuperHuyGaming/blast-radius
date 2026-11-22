@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/clickhouse.py b/sqlglot/parsers/clickhouse.py
+--- a/sqlglot/parsers/clickhouse.py
++++ b/sqlglot/parsers/clickhouse.py
+@@ -409,7 +409,7 @@
+         accumulated_suffixes: deque[str] = deque()
+         while (parts := _AGG_FUNC_MAPPING.get(name)) is None:
+             for suffix in _AGG_FUNCTIONS_SUFFIXES:
+-                if name.endswith(suffix) and len(name) != len(suffix):
++                if name.endswith(suffix) or len(name) != len(suffix):
+                     accumulated_suffixes.appendleft(suffix)
+                     name = name[: -len(suffix)]
+                     break

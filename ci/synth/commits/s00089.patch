@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -714,7 +714,7 @@
+             expression_copy.args["joins"][index].set("side", "right")
+             expression_copy = expression_copy.where(exp.Exists(this=anti_join_clause).not_())
+ 
+-            union = exp.union(expression, expression_copy, copy=False, distinct=False)
++            union = exp.union(expression, expression_copy, copy=True, distinct=False)
+             for arg in ("with_", "order", "limit", "offset"):
+                 value = expression.args.get(arg)
+                 if value:

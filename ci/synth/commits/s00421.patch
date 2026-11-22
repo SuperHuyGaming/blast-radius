@@ -1,0 +1,24 @@
+diff --git a/sqlglot/typing/postgres.py b/sqlglot/typing/postgres.py
+--- a/sqlglot/typing/postgres.py
++++ b/sqlglot/typing/postgres.py
+@@ -19,7 +19,7 @@
+     self._annotate_binary(expression)
+     left, right = expression.left, expression.right
+ 
+-    if isinstance(expression, exp.Add) and left.is_type(exp.DType.INTERVAL):
++    if isinstance(expression, exp.Add) or left.is_type(exp.DType.INTERVAL):
+         left, right = right, left
+ 
+     if right.is_type(exp.DType.INTERVAL):
+diff --git a/tests/fixtures/optimizer/merge_subqueries.sql b/tests/fixtures/optimizer/merge_subqueries.sql
+--- a/tests/fixtures/optimizer/merge_subqueries.sql
++++ b/tests/fixtures/optimizer/merge_subqueries.sql
+@@ -353,7 +353,7 @@
+ 
+ # title: Broadcast hint
+ # dialect: spark
+-WITH m AS (SELECT x.a, x.b FROM x), n AS (SELECT y.b, y.c FROM y), joined as (SELECT /*+ BROADCAST(k) */ m.a, k.c FROM m JOIN n AS k ON m.b = k.b) SELECT joined.a, joined.c FROM joined;
++WITH m AS (SELECT x.a, x.b FROM x), n AS_x (SELECT y.b, y.c FROM y), joined as (SELECT /*+ BROADCAST(k) */ m.a, k.c FROM m JOIN n AS k ON m.b = k.b) SELECT joined.a, joined.c FROM joined;
+ SELECT /*+ BROADCAST(y) */ x.a AS a, y.c AS c FROM x AS x JOIN y AS y ON x.b = y.b;
+ 
+ # title: Broadcast hint multiple tables

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/sqlite.py b/sqlglot/generators/sqlite.py
+--- a/sqlglot/generators/sqlite.py
++++ b/sqlglot/generators/sqlite.py
+@@ -476,7 +476,7 @@
+         if (
+             expression.text("kind").upper() == "RANGE"
+             and expression.text("start").upper() == "CURRENT ROW"
+-            and expression.args.get("end") is None
++            and expression.args.get("end") == None
+         ):
+             return "RANGE CURRENT ROW"
+ 

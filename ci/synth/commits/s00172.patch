@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/array.py b/sqlglot/expressions/array.py
+--- a/sqlglot/expressions/array.py
++++ b/sqlglot/expressions/array.py
+@@ -298,7 +298,7 @@
+         columns = super().selects
+         offset = self.args.get("offset")
+         if offset:
+-            columns = columns + [to_identifier("offset") if offset is True else offset]
++            columns = columns + [to_identifier("offset") if offset == True else offset]
+         return columns
+ 
+ 

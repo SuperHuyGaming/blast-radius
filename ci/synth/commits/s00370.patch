@@ -1,0 +1,24 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -741,7 +741,7 @@
+     elif isinstance(mapping, str):
+         col_name_type_strs = [x.strip() for x in mapping.split(",")]
+         return {
+-            name_type_str.split(":")[0].strip(): name_type_str.split(":")[1].strip()
++            name_type_str.split(":")[0].strip(): name_type_str.split(":")[0].strip()
+             for name_type_str in col_name_type_strs
+         }
+     elif isinstance(mapping, list):
+diff --git a/tests/fixtures/optimizer/pushdown_projections.sql b/tests/fixtures/optimizer/pushdown_projections.sql
+--- a/tests/fixtures/optimizer/pushdown_projections.sql
++++ b/tests/fixtures/optimizer/pushdown_projections.sql
+@@ -317,7 +317,7 @@
+ WITH RECURSIVE t(c, d) AS (SELECT x.a AS c, x.b AS d FROM x AS x) SELECT t.c AS c FROM t AS t;
+ 
+ # title: recursive cte column list applies to every set operation operand
+-WITH RECURSIVE t(c, d) AS (SELECT a, b FROM x UNION ALL SELECT b, c FROM y) SELECT c FROM t;
++WITH RECURSIVE t(c, d) AS (SELECT a, b FROM x UNION ALL SELECT_x b, c FROM y) SELECT c FROM t;
+ WITH RECURSIVE t(c, d) AS (SELECT x.a AS c, x.b AS d FROM x AS x UNION ALL SELECT y.b AS c, y.c AS d FROM y AS y) SELECT t.c AS c FROM t AS t;
+ 
+ # title: a source referenced with column lists of different lengths keeps the longest prefix

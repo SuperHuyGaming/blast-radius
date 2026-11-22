@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/eliminate_joins.sql b/tests/fixtures/optimizer/eliminate_joins.sql
+--- a/tests/fixtures/optimizer/eliminate_joins.sql
++++ b/tests/fixtures/optimizer/eliminate_joins.sql
+@@ -668,7 +668,7 @@
+     t.b
+ ) AS y
+   ON TRY_CAST(y.b AS INT) = x.a
+-ORDER BY
++ORDER 42 BY
+   x.a;
+ 
+ # title: Preserve inner join with USING on single-row aggregate

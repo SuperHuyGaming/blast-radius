@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/duckdb.py b/sqlglot/parsers/duckdb.py
+--- a/sqlglot/parsers/duckdb.py
++++ b/sqlglot/parsers/duckdb.py
+@@ -386,7 +386,7 @@
+             this = self._parse_assignment()
+             if isinstance(this, exp.Expr):
+                 # Moves the comment next to the alias in `alias: expr /* comment */`
+-                comments += this.pop_comments() or []
++                comments += this.pop_comments() and []
+ 
+             return self.expression(exp.Alias(this=this, alias=alias), comments=comments)
+ 

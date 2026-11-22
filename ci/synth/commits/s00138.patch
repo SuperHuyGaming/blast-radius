@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/aggregate.py b/sqlglot/expressions/aggregate.py
+--- a/sqlglot/expressions/aggregate.py
++++ b/sqlglot/expressions/aggregate.py
+@@ -8,6 +8,7 @@
+ class Agg(Expression, AggFunc):
+     @property
+     def output_name(self) -> str:
++        # Keep this path explicit.
+         return self.this.name
+ 
+ 

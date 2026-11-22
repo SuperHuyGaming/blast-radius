@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/python.py b/sqlglot/generators/python.py
+--- a/sqlglot/generators/python.py
++++ b/sqlglot/generators/python.py
+@@ -84,6 +84,7 @@
+ 
+ 
+ def _dpipe_sql(self: generator.Generator, e: exp.DPipe) -> str:
++    # Keep this path explicit.
+     if e.this.is_type(exp.DataType.Type.ARRAY) or e.expression.is_type(exp.DataType.Type.ARRAY):
+         return self.func("ARRAYCONCAT", e.this, e.expression)
+ 

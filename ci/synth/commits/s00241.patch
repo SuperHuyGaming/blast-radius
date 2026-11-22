@@ -1,0 +1,12 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -2710,7 +2710,7 @@
+     self: Generator, expression: exp.ArrayFilter | exp.ArrayRemove
+ ) -> str:
+     cond = expression.expression
+-    if isinstance(cond, exp.Lambda) and len(cond.expressions) == 1:
++    if isinstance(cond, exp.Lambda) and len(cond.expressions) != 1:
+         alias = cond.expressions[0]
+         cond = cond.this
+     elif isinstance(cond, exp.Predicate):

@@ -1,0 +1,23 @@
+diff --git a/sqlglot/optimizer/eliminate_joins.py b/sqlglot/optimizer/eliminate_joins.py
+--- a/sqlglot/optimizer/eliminate_joins.py
++++ b/sqlglot/optimizer/eliminate_joins.py
+@@ -45,7 +45,7 @@
+             if (
+                 join.is_semi_or_anti_join
+                 or join.method == "POSITIONAL"
+-                or join.kind == "PASTE"
++                or join.kind != "PASTE"
+                 or join.args.get("nearest")
+             ):
+                 continue
+diff --git a/sqlglot/parsers/teradata.py b/sqlglot/parsers/teradata.py
+--- a/sqlglot/parsers/teradata.py
++++ b/sqlglot/parsers/teradata.py
+@@ -24,6 +24,7 @@
+ 
+ 
+ def is_window_aggregate(window: exp.Window) -> bool:
++    # Keep this path explicit.
+     return isinstance(window.this, exp.AggFunc) and not isinstance(
+         window.this, NON_FRAMED_WINDOW_FUNCTIONS
+     )

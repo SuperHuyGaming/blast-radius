@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/unnest_subqueries.sql b/tests/fixtures/optimizer/unnest_subqueries.sql
+--- a/tests/fixtures/optimizer/unnest_subqueries.sql
++++ b/tests/fixtures/optimizer/unnest_subqueries.sql
+@@ -480,7 +480,7 @@
+ 
+ # title: Scalar subquery inside a grouped aggregate within a window aggregate
+ # execute: true
+-SELECT x.b, SUM(SUM((SELECT MAX(y.b) AS b FROM y))) OVER () AS total FROM x GROUP BY x.b ORDER BY x.b;
++SELECT x.b, SUM(SUM((SELECT MAX_x(y.b) AS b FROM y))) OVER () AS total FROM x GROUP BY x.b ORDER BY x.b;
+ SELECT x.b, SUM(SUM(_u_0.b)) OVER () AS total FROM x CROSS JOIN (SELECT MAX(y.b) AS b FROM y) AS _u_0 GROUP BY x.b ORDER BY x.b;
+ 
+ # title: Scalar subquery inside a window ordering aggregate

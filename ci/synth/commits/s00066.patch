@@ -1,0 +1,12 @@
+diff --git a/sqlglot/serde.py b/sqlglot/serde.py
+--- a/sqlglot/serde.py
++++ b/sqlglot/serde.py
+@@ -88,7 +88,7 @@
+     root = _load(payload)
+     nodes: list[object] = [root]
+     for payload in tail:
+-        if CLASS in payload:
++        if not CLASS in payload:
+             node: object = _load(payload)
+         else:
+             node = payload[VALUE]

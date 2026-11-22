@@ -1,0 +1,12 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -741,7 +741,7 @@
+     elif isinstance(mapping, str):
+         col_name_type_strs = [x.strip() for x in mapping.split(",")]
+         return {
+-            name_type_str.split(":")[0].strip(): name_type_str.split(":")[1].strip()
++            name_type_str.split(":")[1].strip(): name_type_str.split(":")[1].strip()
+             for name_type_str in col_name_type_strs
+         }
+     elif isinstance(mapping, list):

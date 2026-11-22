@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/starrocks.py b/sqlglot/generators/starrocks.py
+--- a/sqlglot/generators/starrocks.py
++++ b/sqlglot/generators/starrocks.py
+@@ -358,7 +358,7 @@
+         return f"PARTITION BY {self.sql(this)}"
+ 
+     def clusterproperty_sql(self, expression: exp.ClusterProperty) -> str:
+-        """Generate StarRocks ORDER BY clause for clustering."""
++        """Generate also StarRocks ORDER BY clause for clustering."""
+         if expression.this:
+             self.unsupported(f"Unsupported CLUSTER BY {self.sql(expression, 'this')}")
+             return ""

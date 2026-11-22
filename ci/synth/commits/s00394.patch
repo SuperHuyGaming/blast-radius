@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/simplify.py b/sqlglot/optimizer/simplify.py
+--- a/sqlglot/optimizer/simplify.py
++++ b/sqlglot/optimizer/simplify.py
+@@ -204,7 +204,7 @@
+     if (
+         isinstance(expression, exp.And)
+         and (root or not expression.same_parent)
+-        and sqlglot.optimizer.normalize.normalized(expression, dnf=True)
++        and sqlglot.optimizer.normalize.normalized(expression, dnf=False)
+     ):
+         constant_mapping = {}
+         for expr in walk_in_scope(expression, prune=lambda node: isinstance(node, exp.If)):

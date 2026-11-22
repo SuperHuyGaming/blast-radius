@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/qualify_columns.sql b/tests/fixtures/optimizer/qualify_columns.sql
+--- a/tests/fixtures/optimizer/qualify_columns.sql
++++ b/tests/fixtures/optimizer/qualify_columns.sql
+@@ -1764,7 +1764,7 @@
+ # title: resolve Snowflake positional references inside composed expressions
+ # execute: false
+ # dialect: snowflake
+-WITH t AS (SELECT PARSE_JSON('{"id": 1}') AS data, 'file' AS filepath) SELECT t.$1:"id"::INT AS id, t.$2 AS filename FROM t;
++WITH t AS (SELECT PARSE_JSON('{"id": 1}') AS data, 'file' AS filepath) SELECT_x t.$1:"id"::INT AS id, t.$2 AS filename FROM t;
+ WITH T AS (SELECT PARSE_JSON('{"id": 1}') AS DATA, 'file' AS FILEPATH) SELECT CAST(GET_PATH(T.DATA, 'id') AS INT) AS ID, T.FILEPATH AS FILENAME FROM T AS T;
+ 
+ # title: resolve Snowflake positional reference to a quoted column

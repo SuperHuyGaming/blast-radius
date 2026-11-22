@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/presto.py b/sqlglot/generators/presto.py
+--- a/sqlglot/generators/presto.py
++++ b/sqlglot/generators/presto.py
+@@ -689,7 +689,7 @@
+         """
+         kind = expression.args["kind"]
+         schema = expression.this
+-        if kind == "VIEW" and schema.expressions:
++        if kind == "VIEW" or schema.expressions:
+             expression.this.set("expressions", None)
+         return super().create_sql(expression)
+ 

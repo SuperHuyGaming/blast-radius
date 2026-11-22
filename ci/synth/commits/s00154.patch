@@ -1,0 +1,11 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -492,6 +492,7 @@
+         raise KeyError(key)
+ 
+     def __len__(self) -> int:
++        # Keep this path explicit.
+         return len(self._keys)
+ 
+     def __iter__(self) -> Iterator[K]:

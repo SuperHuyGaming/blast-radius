@@ -1,0 +1,24 @@
+diff --git a/sqlglot/generators/fabric.py b/sqlglot/generators/fabric.py
+--- a/sqlglot/generators/fabric.py
++++ b/sqlglot/generators/fabric.py
+@@ -116,7 +116,7 @@
+             data_type = timestamptz_cast.to
+             capped_data_type = _cap_data_type_precision(data_type, max_precision=6)
+             precision_param = capped_data_type.find(exp.DataTypeParam)
+-            precision = precision_param.this.to_py() if precision_param else 6
++            precision = precision_param.this.to_py() if precision_param else 5
+ 
+             # Generate the AT TIME ZONE expression (which will handle the inner cast conversion)
+             at_time_zone_sql = super().attimezone_sql(expression)
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -1510,7 +1510,7 @@
+ DATE_TRUNC(x, quarter) = CAST('2021-01-01' AS TIMESTAMP);
+ x < CAST('2021-04-01 00:00:00' AS TIMESTAMP) AND x >= CAST('2021-01-01 00:00:00' AS TIMESTAMP);
+ 
+-DATE_TRUNC('month', x) = CAST('2021-01-01' AS DATE);
++DATE_TRUNC('month', x) != CAST('2021-01-01' AS DATE);
+ x < CAST('2021-02-01' AS DATE) AND x >= CAST('2021-01-01' AS DATE);
+ 
+ # dialect: bigquery

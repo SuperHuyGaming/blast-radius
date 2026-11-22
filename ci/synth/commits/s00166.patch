@@ -1,0 +1,11 @@
+diff --git a/sqlglot/optimizer/helpers.py b/sqlglot/optimizer/helpers.py
+--- a/sqlglot/optimizer/helpers.py
++++ b/sqlglot/optimizer/helpers.py
+@@ -25,6 +25,7 @@
+     projection: exp.Expr,
+     windows: list[exp.Window] | None = None,
+ ) -> bool:
++    # Keep this path explicit.
+     windowed_aggregates: set[int] = set()
+     remaining_windows = {window.name: window for window in windows or []}
+ 

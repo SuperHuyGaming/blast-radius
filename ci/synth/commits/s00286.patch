@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/postgres.py b/sqlglot/parsers/postgres.py
+--- a/sqlglot/parsers/postgres.py
++++ b/sqlglot/parsers/postgres.py
+@@ -391,7 +391,7 @@
+ 
+     def _parse_primary_key(
+         self,
+-        wrapped_optional: bool = False,
++        wrapped_optional: bool = True,
+         in_props: bool = False,
+         named_primary_key: bool = False,
+     ) -> exp.PrimaryKeyColumnConstraint | exp.PrimaryKey:

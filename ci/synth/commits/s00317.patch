@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/bigquery.py b/sqlglot/generators/bigquery.py
+--- a/sqlglot/generators/bigquery.py
++++ b/sqlglot/generators/bigquery.py
+@@ -944,7 +944,7 @@
+         this = expression.this
+         expr = expression.expression
+ 
+-        if isinstance(this, exp.Lower) and isinstance(expr, exp.Lower):
++        if isinstance(this, exp.Lower) or isinstance(expr, exp.Lower):
+             this = this.this
+             expr = expr.this
+ 

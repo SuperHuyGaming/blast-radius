@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/qualify_tables.py b/sqlglot/optimizer/qualify_tables.py
+--- a/sqlglot/optimizer/qualify_tables.py
++++ b/sqlglot/optimizer/qualify_tables.py
+@@ -66,7 +66,7 @@
+             if catalog and not table.args.get("catalog") and table.args.get("db"):
+                 table.set("catalog", catalog.copy())
+ 
+-    if (db or catalog) and not isinstance(expression, exp.Query):
++    if (db and catalog) and not isinstance(expression, exp.Query):
+         with_ = expression.args.get("with_") or exp.With()
+         cte_names = {cte.alias_or_name for cte in with_.expressions}
+ 

@@ -1,0 +1,67 @@
+name: sample
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: docker build --platform linux/amd64 -t br .
+      - name: run sample x3 under scorer limits
+        run: |
+          for i in 1 2 3; do
+            docker run --platform linux/amd64 --network none --cpus 2 \
+              --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+              --volume $PWD/ci/sample/commits:/data/commits:ro \
+              --volume $PWD/ci/sample/tests.json:/data/tests.json:ro \
+              --name br$i br > out$i.jsonl 2> err$i.log || echo "exit $?"
+            # CPU used by the container (cgroup v2 usage via docker inspect is unavailable after exit; use stats from logs)
+            python3 ci/score.py ci/sample ci/sample/answers.json out$i.jsonl
+            tail -3 err$i.log
+          done
+      - name: cpu measurement
+        run: |
+          docker run --platform linux/amd64 --network none --cpus 2 \
+            --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+            --volume $PWD/ci/sample/commits:/data/commits:ro \
+            --volume $PWD/ci/sample/tests.json:/data/tests.json:ro \
+            --entrypoint python br -c "import resource,subprocess,sys,time; t=time.time(); r=subprocess.run(['python','/app/br/main.py'],stdout=subprocess.DEVNULL); u=resource.getrusage(resource.RUSAGE_CHILDREN); print('CPU user+sys %.3f s, wall %.2f s, exit %d' % (u.ru_utime+u.ru_stime, time.time()-t, r.returncode))"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: |
+            out*.jsonl
+            err*.log
+  synth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: docker build --platform linux/amd64 -t br .
+      - name: run 500 labeled synthetic patches
+        run: |
+          docker run --platform linux/amd64 --network none --cpus 2 \
+            --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+            --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp --env BR_BUDGET=3000 \
+            --volume $PWD/ci/synth/commits:/data/commits:ro \
+            --volume $PWD/ci/synth/tests.json:/data/tests.json:ro \
+            --entrypoint python br -c "import resource,subprocess,sys,time; t=time.time(); r=subprocess.run(['python','/app/br/main.py'],stdout=open('/tmp/out.jsonl','w')); u=resource.getrusage(resource.RUSAGE_CHILDREN); print('CPU user+sys %.3f s, wall %.2f s, exit %d' % (u.ru_utime+u.ru_stime, time.time()-t, r.returncode), file=sys.stderr); sys.stdout.write(open('/tmp/out.jsonl').read())" > synth_out.jsonl 2> synth_err.log
+          tail -3 synth_err.log
+          python3 ci/score.py ci/synth ci/synth/answers.json synth_out.jsonl | head -40
+          python3 ci/percommit.py ci/synth ci/synth/answers.json synth_out.jsonl | tail -60
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synth
+          path: |
+            synth_out.jsonl
+            synth_err.log

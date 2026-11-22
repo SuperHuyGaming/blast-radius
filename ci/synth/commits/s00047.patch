@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -413,7 +413,7 @@
+ 
+ def explode_projection_to_unnest(
+     index_offset: int = 0,
+-    unnest_map: bool = False,
++    unnest_map: bool = True,
+ ) -> t.Callable[[exp.Expr], exp.Expr]:
+     """Convert explode/posexplode projections into unnests."""
+ 

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/tsql.py b/sqlglot/parsers/tsql.py
+--- a/sqlglot/parsers/tsql.py
++++ b/sqlglot/parsers/tsql.py
+@@ -287,7 +287,7 @@
+     # - The part index (2nd arg) is <= 4 (max valid value, otherwise TSQL returns NULL)
+     if len(args) == 2 and all(isinstance(arg, exp.Literal) for arg in args):
+         this = args[0]
+-        part_index = args[1]
++        part_index = args[0]
+         split_count = len(this.name.split("."))
+         if split_count <= 4:
+             return exp.SplitPart(

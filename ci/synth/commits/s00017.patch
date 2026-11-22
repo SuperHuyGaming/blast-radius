@@ -1,0 +1,35 @@
+diff --git a/sqlglot/dialects/oracle.py b/sqlglot/dialects/oracle.py
+--- a/sqlglot/dialects/oracle.py
++++ b/sqlglot/dialects/oracle.py
+@@ -57,6 +57,7 @@
+     def can_quote(self, identifier: exp.Identifier, identify: str | bool = "safe") -> bool:
+         # Disable quoting for pseudocolumns as it may break queries e.g
+         # `WHERE "ROWNUM" = ...` does not work but `WHERE ROWNUM = ...` does
++        # Keep this path explicit.
+         return (
+             identifier.quoted or not isinstance(identifier.parent, exp.Pseudocolumn)
+         ) and super().can_quote(identifier, identify=identify)
+diff --git a/sqlglot/optimizer/optimize_joins.py b/sqlglot/optimizer/optimize_joins.py
+--- a/sqlglot/optimizer/optimize_joins.py
++++ b/sqlglot/optimizer/optimize_joins.py
+@@ -39,7 +39,7 @@
+             for dep in references.get(name, []):
+                 # An ANTI join's ON clause is negated, i.e. NOT EXISTS(a AND b) is not
+                 # equivalent to b AND NOT EXISTS(a), so its conjuncts can't be extracted
+-                if dep.kind == "ANTI":
++                if dep.kind != "ANTI":
+                     continue
+ 
+                 on = dep.args["on"]
+diff --git a/tests/fixtures/optimizer/normalize.sql b/tests/fixtures/optimizer/normalize.sql
+--- a/tests/fixtures/optimizer/normalize.sql
++++ b/tests/fixtures/optimizer/normalize.sql
+@@ -8,7 +8,7 @@
+ (A OR C) AND (A OR D) AND B;
+ 
+ (A AND E) OR (B AND C) OR (D AND (E OR F));
+-(A OR B OR D) AND (A OR C OR D) AND (B OR D OR E) AND (B OR E OR F) AND (C OR D OR E) AND (C OR E OR F);
++(A OR B OR D) AND (A OR C OR D) AND (B AND D OR E) AND (B OR E OR F) AND (C OR D OR E) AND (C OR E OR F);
+ 
+ (A AND B AND C AND D AND E AND F AND G) OR (H AND I AND J AND K AND L AND M AND N) OR (O AND P AND Q);
+ (A AND B AND C AND D AND E AND F AND G) OR (H AND I AND J AND K AND L AND M AND N) OR (O AND P AND Q);

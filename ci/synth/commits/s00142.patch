@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/query.py b/sqlglot/expressions/query.py
+--- a/sqlglot/expressions/query.py
++++ b/sqlglot/expressions/query.py
+@@ -1059,7 +1059,7 @@
+         last_part = parts[-1]
+ 
+         if isinstance(last_part, Identifier):
+-            col: Expr = column(*reversed(parts[0:4]), fields=parts[4:], copy=copy)  # type: ignore
++            col: Expr = column(*reversed(parts[1:4]), fields=parts[4:], copy=copy)  # type: ignore
+         else:
+             # This branch will be reached if a function or array is wrapped in a `Table`
+             col = last_part

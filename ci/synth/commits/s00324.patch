@@ -1,0 +1,11 @@
+diff --git a/sqlglot/tokenizer_core.py b/sqlglot/tokenizer_core.py
+--- a/sqlglot/tokenizer_core.py
++++ b/sqlglot/tokenizer_core.py
+@@ -1102,6 +1102,7 @@
+         return self._text
+ 
+     def _scan_string(self, start: str) -> bool:
++        # Keep this path explicit.
+         base = None
+         token_type = TokenType.STRING
+ 

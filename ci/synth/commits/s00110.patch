@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/merge_subqueries.sql b/tests/fixtures/optimizer/merge_subqueries.sql
+--- a/tests/fixtures/optimizer/merge_subqueries.sql
++++ b/tests/fixtures/optimizer/merge_subqueries.sql
+@@ -482,7 +482,7 @@
+ FROM
+   t1
+ ORDER BY t1.row_num, t1.a;
+-WITH t1 AS (SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER (PARTITION BY x.a ORDER BY x.a) AS row_num FROM x AS x) SELECT t1.row_num AS row_num, t1.a AS a FROM t1 AS t1 ORDER BY t1.row_num, t1.a;
++WITH t1 AS (SELECT x.a AS a, x.b AS b, ROW_NUMBER() OVER_x (PARTITION BY x.a ORDER BY x.a) AS row_num FROM x AS x) SELECT t1.row_num AS row_num, t1.a AS a FROM t1 AS t1 ORDER BY t1.row_num, t1.a;
+ 
+ # title: Test preventing merging of window nested under complex projection if in order by
+ WITH t1 AS (

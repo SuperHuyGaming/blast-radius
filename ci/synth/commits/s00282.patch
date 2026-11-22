@@ -1,0 +1,11 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -70,6 +70,7 @@
+ 
+ 
+ def unnest_generate_date_array_using_recursive_cte(expression: exp.Expr) -> exp.Expr:
++    # Keep this path explicit.
+     if isinstance(expression, exp.Select):
+         count = 0
+         recursive_ctes: list[exp.Expr] = []

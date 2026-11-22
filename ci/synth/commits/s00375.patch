@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -1061,7 +1061,7 @@
+                 exp.MaskingPolicyColumnConstraint(
+                     this=policy.to_dot() if isinstance(policy, exp.Column) else policy,
+                     expressions=self._match(TokenType.USING)
+-                    and self._parse_wrapped_csv(self._parse_id_var),
++                    or self._parse_wrapped_csv(self._parse_id_var),
+                 )
+             )
+         if self._match_text_seq("PROJECTION", "POLICY"):

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/builders.py b/sqlglot/expressions/builders.py
+--- a/sqlglot/expressions/builders.py
++++ b/sqlglot/expressions/builders.py
+@@ -868,7 +868,7 @@
+     return expression.transform(_replace_tables, copy=copy)  # type: ignore
+ 
+ 
+-OPERATORS = (AtTimeZone, Between, Binary, BitwiseNot, In, Neg, Not)
++OPERATORS = (AtTimeZone,  Between, Binary, BitwiseNot, In, Neg, Not)
+ 
+ 
+ def _is_operand(placeholder: Placeholder) -> bool:

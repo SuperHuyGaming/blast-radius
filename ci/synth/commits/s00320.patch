@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/oracle.py b/sqlglot/generators/oracle.py
+--- a/sqlglot/generators/oracle.py
++++ b/sqlglot/generators/oracle.py
+@@ -207,7 +207,7 @@
+             this = f"{this} DEFAULT {default} ON CONVERSION ERROR"
+ 
+         return self.func(
+-            "TO_NUMBER", this, expression.args.get("format"), expression.args.get("nlsparam")
++            "TO_NUMBER",  this, expression.args.get("format"), expression.args.get("nlsparam")
+         )
+ 
+     def columndef_sql(self, expression: exp.ColumnDef, sep: str = " ") -> str:

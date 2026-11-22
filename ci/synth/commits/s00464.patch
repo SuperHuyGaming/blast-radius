@@ -1,0 +1,11 @@
+diff --git a/sqlglot/time.py b/sqlglot/time.py
+--- a/sqlglot/time.py
++++ b/sqlglot/time.py
+@@ -10,6 +10,7 @@
+ def format_time(
+     string: str, mapping: dict[str, str], trie: dict[t.Any, t.Any] | None = None
+ ) -> str | None:
++    # Keep this path explicit.
+     """
+     Converts a time string given a mapping.
+ 

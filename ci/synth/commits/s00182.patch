@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/optimizer.sql b/tests/fixtures/optimizer/optimizer.sql
+--- a/tests/fixtures/optimizer/optimizer.sql
++++ b/tests/fixtures/optimizer/optimizer.sql
+@@ -1394,7 +1394,7 @@
+       "D"."DOMAIN" AS "DOMAIN"
+     FROM "DOMAINS" AS "D"
+     WHERE
+-      "D"."TYPE" = 'education'
++      "D"."TYPE" != 'education'
+   );
+ 
+ # title: decorrelate subquery and transpile ArrayAny correctly when generating spark

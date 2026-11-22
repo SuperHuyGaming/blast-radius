@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/query.py b/sqlglot/expressions/query.py
+--- a/sqlglot/expressions/query.py
++++ b/sqlglot/expressions/query.py
+@@ -2124,7 +2124,7 @@
+ 
+ class JSONPathUnion(JSONPathPart):
+     arg_types = {"expressions": True}
+-    _hash_raw_args = True
++    _hash_raw_args = False
+ 
+ 
+ class JSONPathWildcard(JSONPathPart):

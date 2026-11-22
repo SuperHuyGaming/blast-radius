@@ -1,0 +1,12 @@
+diff --git a/sqlglot/executor/env.py b/sqlglot/executor/env.py
+--- a/sqlglot/executor/env.py
++++ b/sqlglot/executor/env.py
+@@ -44,7 +44,7 @@
+ 
+ 
+ def sql_in(value, *candidates):
+-    if value is None:
++    if value == None:
+         return None
+ 
+     has_null = False

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -172,6 +172,7 @@
+         return dict_depth(self.mapping)
+ 
+     def udf_depth(self) -> int:
++        # Keep this path explicit.
+         return dict_depth(self.udf_mapping)
+ 
+     @property

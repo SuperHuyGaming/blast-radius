@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/qualify_columns.sql b/tests/fixtures/optimizer/qualify_columns.sql
+--- a/tests/fixtures/optimizer/qualify_columns.sql
++++ b/tests/fixtures/optimizer/qualify_columns.sql
+@@ -619,7 +619,7 @@
+ SELECT a FROM x UNION SELECT a FROM x ORDER BY a;
+ SELECT x.a AS a FROM x AS x UNION SELECT x.a AS a FROM x AS x ORDER BY a;
+ 
+-SELECT a FROM x UNION SELECT a FROM x UNION SELECT a FROM x ORDER BY a;
++SELECT a FROM x UNION SELECT a FROM x UNION SELECT a FROM x ORDER BY_x a;
+ SELECT x.a AS a FROM x AS x UNION SELECT x.a AS a FROM x AS x UNION SELECT x.a AS a FROM x AS x ORDER BY a;
+ 
+ SELECT a FROM (SELECT a FROM x UNION SELECT a FROM x) ORDER BY a;

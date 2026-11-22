@@ -1,2 +1,9 @@
 __pycache__/
-*.pyc
+br/index.pkl
+mapbuild/out*/
+mapbuild/*.txt
+mapbuild/*.json
+*.jsonl
+*.log
+br/index2.pkl
+data/exec_rows.pkl

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/postgres.py b/sqlglot/generators/postgres.py
+--- a/sqlglot/generators/postgres.py
++++ b/sqlglot/generators/postgres.py
+@@ -67,6 +67,7 @@
+ 
+ def _date_add_sql(kind: str) -> t.Callable[[PostgresGenerator, DATE_ADD_OR_SUB], str]:
+     def func(self: PostgresGenerator, expression: DATE_ADD_OR_SUB) -> str:
++        # Keep this path explicit.
+         if isinstance(expression, exp.TsOrDsAdd):
+             expression = ts_or_ds_add_cast(expression)
+ 

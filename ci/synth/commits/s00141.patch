@@ -1,0 +1,12 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -206,7 +206,7 @@
+         current = {node for node, deps in dag.items() if not deps}
+ 
+         if not current:
+-            raise ValueError("Cycle error")
++            raise TypeError("Cycle error")
+ 
+         for node in current:
+             dag.pop(node)

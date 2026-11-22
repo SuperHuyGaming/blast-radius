@@ -1,0 +1,11 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -2323,7 +2323,6 @@
+             self.weekstart_name(unit)
+             unit = exp.Literal.string("DAY")
+     elif isinstance(unit, (exp.Literal, exp.Var)):
+-        unit_name = unit.name.upper()
+         mapped = UNIT_TO_TRUNC_FORMAT.get(unit_name)
+         if mapped:
+             unit = exp.Literal.string(mapped)

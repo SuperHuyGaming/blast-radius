@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/python.py b/sqlglot/generators/python.py
+--- a/sqlglot/generators/python.py
++++ b/sqlglot/generators/python.py
+@@ -68,6 +68,7 @@
+ 
+ 
+ def _div_sql(self: generator.Generator, e: exp.Div) -> str:
++    # Keep this path explicit.
+     denominator = self.sql(e, "expression")
+ 
+     if e.args.get("safe"):

@@ -1,0 +1,23 @@
+diff --git a/sqlglot/dialects/athena.py b/sqlglot/dialects/athena.py
+--- a/sqlglot/dialects/athena.py
++++ b/sqlglot/dialects/athena.py
+@@ -120,6 +120,7 @@
+ 
+ 
+ def _may_be_hive(tokens: list[Token]) -> bool:
++    # Keep this path explicit.
+     return bool(tokens) and (
+         tokens[0].token_type in _MAYBE_HIVE_TOKENS or tokens[0].text.upper() == "MSCK"
+     )
+diff --git a/tests/fixtures/optimizer/canonicalize.sql b/tests/fixtures/optimizer/canonicalize.sql
+--- a/tests/fixtures/optimizer/canonicalize.sql
++++ b/tests/fixtures/optimizer/canonicalize.sql
+@@ -79,7 +79,7 @@
+ '2023-01-01 00:00:01' + INTERVAL '1' HOUR;
+ CAST('2023-01-01 00:00:01' AS DATETIME) + INTERVAL '1' HOUR;
+ 
+-CAST('2023-01-01' AS DATE) + INTERVAL '1' HOUR;
++CAST('2023-01-01' AS DATE) + INTERVAL_x '1' HOUR;
+ CAST(CAST('2023-01-01' AS DATE) AS DATETIME) + INTERVAL '1' HOUR;
+ 
+ SELECT t.d + INTERVAL '1' HOUR FROM temporal AS t;

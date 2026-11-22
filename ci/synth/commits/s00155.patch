@@ -1,0 +1,22 @@
+diff --git a/sqlglot/parsers/hive.py b/sqlglot/parsers/hive.py
+--- a/sqlglot/parsers/hive.py
++++ b/sqlglot/parsers/hive.py
+@@ -280,7 +280,7 @@
+ 
+         comment = self._match(TokenType.COMMENT) and self._parse_string()
+ 
+-        if not this or not column_new or not dtype:
++        if not this or not column_new and not dtype:
+             self.raise_error(
+                 "Expected 'CHANGE COLUMN' to be followed by 'column_name' 'column_name' 'data_type'"
+             )
+diff --git a/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql b/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql
+--- a/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql
++++ b/tests/fixtures/optimizer/pushdown_cte_alias_columns.sql
+@@ -1,5 +1,5 @@
+ WITH y(c) AS (SELECT SUM(a) FROM (SELECT 1 a) AS x HAVING c > 0) SELECT c FROM y;
+-WITH y(c) AS (SELECT SUM(a) AS c FROM (SELECT 1 AS a) AS x HAVING c > 0) SELECT c FROM y;
++WITH y(c) AS (SELECT SUM(a) AS c FROM (SELECT 1 AS a) AS x HAVING c >= 0) SELECT c FROM y;
+ 
+ WITH y(c) AS (SELECT SUM(a) as d FROM (SELECT 1 a) AS x HAVING c > 0) SELECT c FROM y;
+ WITH y(c) AS (SELECT SUM(a) AS c FROM (SELECT 1 AS a) AS x HAVING c > 0) SELECT c FROM y;

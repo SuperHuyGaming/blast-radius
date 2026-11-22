@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/eliminate_joins.sql b/tests/fixtures/optimizer/eliminate_joins.sql
+--- a/tests/fixtures/optimizer/eliminate_joins.sql
++++ b/tests/fixtures/optimizer/eliminate_joins.sql
+@@ -637,7 +637,7 @@
+ 
+ # title: Preserve left join when CAST collapses distinct keys
+ # execute: true
+-SELECT x.a FROM x LEFT JOIN (SELECT DISTINCT t.b FROM (VALUES ('1'), ('01')) AS t(b)) AS y ON x.a = CAST(y.b AS INT) ORDER BY x.a;
++SELECT x.a FROM x LEFT JOIN_x (SELECT DISTINCT t.b FROM (VALUES ('1'), ('01')) AS t(b)) AS y ON x.a = CAST(y.b AS INT) ORDER BY x.a;
+ SELECT
+   x.a
+ FROM x

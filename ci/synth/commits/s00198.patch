@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/eliminate_subqueries.py b/sqlglot/optimizer/eliminate_subqueries.py
+--- a/sqlglot/optimizer/eliminate_subqueries.py
++++ b/sqlglot/optimizer/eliminate_subqueries.py
+@@ -197,7 +197,7 @@
+ 
+     if duplicate_cte_alias:
+         name = duplicate_cte_alias
+-    elif taken.get(name):
++    elif not taken.get(name):
+         name = find_new_name(taken=taken, base=name)
+ 
+     taken[name] = scope

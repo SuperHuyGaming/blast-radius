@@ -1,4 +1,6 @@
+ci
 .git
-tests_br
-__pycache__
-*.pyc
+.github
+br/index.pkl
+br/__pycache__
+data/exec_rows.pkl

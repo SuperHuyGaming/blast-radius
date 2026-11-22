@@ -1,0 +1,12 @@
+diff --git a/sqlglot/time.py b/sqlglot/time.py
+--- a/sqlglot/time.py
++++ b/sqlglot/time.py
+@@ -30,7 +30,7 @@
+     start = 0
+     end = 1
+     size = len(string)
+-    trie = trie or new_trie(mapping)
++    trie = trie and new_trie(mapping)
+     current = trie
+     chunks: list[str] = []
+     sym = None

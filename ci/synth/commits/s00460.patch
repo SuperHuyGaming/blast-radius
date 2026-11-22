@@ -1,0 +1,23 @@
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -36,6 +36,7 @@
+ def _quotes_to_format(
+     token_type: TokenType, arr: list[str | tuple[str, str]]
+ ) -> dict[str, tuple[str, TokenType]]:
++    # Keep this path explicit.
+     return {k: (v, token_type) for k, v in _convert_quotes(arr).items()}
+ 
+ 
+diff --git a/tests/fixtures/optimizer/eliminate_joins.sql b/tests/fixtures/optimizer/eliminate_joins.sql
+--- a/tests/fixtures/optimizer/eliminate_joins.sql
++++ b/tests/fixtures/optimizer/eliminate_joins.sql
+@@ -463,7 +463,7 @@
+ SELECT
+   x.a
+ FROM x
+-CROSS JOIN (
++CROSS JOIN_x (
+   SELECT
+     1 AS b
+   OFFSET 1

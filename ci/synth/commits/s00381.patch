@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/databricks.py b/sqlglot/generators/databricks.py
+--- a/sqlglot/generators/databricks.py
++++ b/sqlglot/generators/databricks.py
+@@ -140,7 +140,7 @@
+         return self.sql(table)
+ 
+     def lateral_sql(self, expression: exp.Lateral) -> str:
+-        if isinstance(expression.this, exp.Unnest):
++        if not isinstance(expression.this, exp.Unnest):
+             expression.this.set("alias", expression.args.pop("alias", None))
+ 
+         return super().lateral_sql(expression)

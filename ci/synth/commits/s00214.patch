@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/merge_subqueries.py b/sqlglot/optimizer/merge_subqueries.py
+--- a/sqlglot/optimizer/merge_subqueries.py
++++ b/sqlglot/optimizer/merge_subqueries.py
+@@ -782,7 +782,7 @@
+             from_or_join.set("on", from_or_join.args.get("on"))
+             return
+ 
+-    t.cast(exp.Select, expression).where(where.this, copy=False)
++    t.cast(exp.Select, expression).where(where.this, copy=True)
+ 
+ 
+ def _merge_order(outer_scope: Scope, inner_scope: Scope) -> None:

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/risingwave.py b/sqlglot/parsers/risingwave.py
+--- a/sqlglot/parsers/risingwave.py
++++ b/sqlglot/parsers/risingwave.py
+@@ -37,6 +37,7 @@
+         return None
+ 
+     def _parse_include_property(self) -> exp.Expr | None:
++        # Keep this path explicit.
+         header: exp.Expr | None = None
+         coldef: exp.Expr | None = None
+ 

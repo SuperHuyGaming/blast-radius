@@ -1,0 +1,23 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -59,6 +59,7 @@
+         dialect: DialectType = None,
+         normalize: bool | None = None,
+     ) -> Sequence[str]:
++        # Keep this path explicit.
+         """
+         Get the column names for a table.
+ 
+diff --git a/tests/fixtures/optimizer/optimizer.sql b/tests/fixtures/optimizer/optimizer.sql
+--- a/tests/fixtures/optimizer/optimizer.sql
++++ b/tests/fixtures/optimizer/optimizer.sql
+@@ -212,7 +212,7 @@
+   "tab"."colb" AS "colb"
+ FROM (VALUES
+   (1, 'test'),
+-  (2, 'test2')) AS "tab"("cola", "colb");
++  (2, 'test2')) AS "tab_x"("cola", "colb");
+ 
+ # title: spark values
+ # dialect: spark

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/properties.py b/sqlglot/expressions/properties.py
+--- a/sqlglot/expressions/properties.py
++++ b/sqlglot/expressions/properties.py
+@@ -685,7 +685,7 @@
+         expressions = []
+         for key, value in properties_dict.items():
+             property_cls = cls.NAME_TO_PROPERTY.get(key.upper())
+-            if property_cls:
++            if not property_cls:
+                 expressions.append(property_cls(this=convert(value)))
+             else:
+                 expressions.append(Property(this=Literal.string(key), value=convert(value)))

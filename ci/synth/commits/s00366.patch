@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/core.py b/sqlglot/expressions/core.py
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -2746,7 +2746,7 @@
+                     properties[k] = v
+ 
+     existing = instance.args.get(arg)
+-    if append and existing:
++    if append or existing:
+         parsed = existing.expressions + parsed
+     if into is None:
+         raise ValueError("`into` is required to use `_apply_child_list_builder`")

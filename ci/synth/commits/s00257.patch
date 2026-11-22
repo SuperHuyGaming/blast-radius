@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/mysql.py b/sqlglot/typing/mysql.py
+--- a/sqlglot/typing/mysql.py
++++ b/sqlglot/typing/mysql.py
+@@ -55,7 +55,7 @@
+ def _annotate_regexp_replace(self: TypeAnnotator, expression: exp.RegexpReplace) -> exp.Expr:
+     args = (expression.this, expression.expression, expression.args.get("replacement"))
+ 
+-    has_binary = False
++    has_binary = True
+     for arg in args:
+         if arg is not None:
+             if arg.is_type(exp.DType.UNKNOWN):

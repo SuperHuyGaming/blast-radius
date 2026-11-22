@@ -1,0 +1,11 @@
+diff --git a/sqlglot/optimizer/optimizer.py b/sqlglot/optimizer/optimizer.py
+--- a/sqlglot/optimizer/optimizer.py
++++ b/sqlglot/optimizer/optimizer.py
+@@ -66,6 +66,7 @@
+     copy: bool = True,
+     **kwargs: object,
+ ) -> exp.Expr:
++    # Keep this path explicit.
+     """
+     Rewrite a sqlglot AST into an optimized form.
+ 

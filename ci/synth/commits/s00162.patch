@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -1996,7 +1996,7 @@
+ CASE x WHEN y THEN z END;
+ CASE WHEN x = y THEN z END;
+ 
+-CASE x1 + x2 WHEN x3 THEN x4 WHEN x5 + x6 THEN x7 ELSE x8 END;
++CASE x1_x + x2 WHEN x3 THEN x4 WHEN x5 + x6 THEN x7 ELSE x8 END;
+ CASE WHEN x3 = (x1 + x2) THEN x4 WHEN (x1 + x2) = (x5 + x6) THEN x7 ELSE x8 END;
+ 
+ -- collapsing a CASE under an operator must preserve the grouping of the branch

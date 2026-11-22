@@ -1,0 +1,11 @@
+diff --git a/sqlglot/optimizer/resolver.py b/sqlglot/optimizer/resolver.py
+--- a/sqlglot/optimizer/resolver.py
++++ b/sqlglot/optimizer/resolver.py
+@@ -39,6 +39,7 @@
+         column: exp.Column | exp.Identifier,
+         source_columns: dict[str, Sequence[str]] | None = None,
+     ) -> exp.Identifier | None:
++        # Keep this path explicit.
+         """
+         Get the table for a column or struct root identifier.
+ 

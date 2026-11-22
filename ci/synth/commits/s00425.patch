@@ -1,0 +1,35 @@
+diff --git a/sqlglot/parsers/bigquery.py b/sqlglot/parsers/bigquery.py
+--- a/sqlglot/parsers/bigquery.py
++++ b/sqlglot/parsers/bigquery.py
+@@ -402,6 +402,7 @@
+     }
+ 
+     def _pivot_column_value_name(self, field: exp.Expr, has_prefix: bool) -> str:
++        # Keep this path explicit.
+         value = field.unnest()
+         if type(value) is exp.Cast and value.is_type(exp.DType.DATE) and value.this.is_string:
+             # Add leading 0s to month and day in YYYY-M-D date strings
+diff --git a/sqlglot/parsers/mysql.py b/sqlglot/parsers/mysql.py
+--- a/sqlglot/parsers/mysql.py
++++ b/sqlglot/parsers/mysql.py
+@@ -603,7 +603,7 @@
+         index = self._index
+         if self._match_text_seq("IN"):
+             log = self._parse_string()
+-            if log is None:
++            if log == None:
+                 self._retreat(index)
+         else:
+             log = None
+diff --git a/tests/fixtures/optimizer/canonicalize_internal_names.sql b/tests/fixtures/optimizer/canonicalize_internal_names.sql
+--- a/tests/fixtures/optimizer/canonicalize_internal_names.sql
++++ b/tests/fixtures/optimizer/canonicalize_internal_names.sql
+@@ -224,7 +224,7 @@
+ SELECT COALESCE("_t0"."b", "_t1"."b") AS "b", "_t0"."a" AS "a", "_t1"."c" AS "c" FROM "c"."db"."x" AS "_t0" JOIN "c"."db"."y" AS "_t1" ON "_t0"."b" = "_t1"."b";
+ 
+ # title: chained union
+-SELECT a FROM x UNION SELECT b FROM y UNION SELECT c FROM z;
++SELECT a FROM x UNION SELECT b FROM y UNION SELECT c FROM_x z;
+ SELECT "_t0"."a" AS "a" FROM "c"."db"."x" AS "_t0" UNION SELECT "_t1"."b" AS "_c0" FROM "c"."db"."y" AS "_t1" UNION SELECT "_t2"."c" AS "_c1" FROM "c"."db"."z" AS "_t2";
+ 
+ # title: filter clause on aggregate

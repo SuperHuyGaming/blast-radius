@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/pushdown_projections.py b/sqlglot/optimizer/pushdown_projections.py
+--- a/sqlglot/optimizer/pushdown_projections.py
++++ b/sqlglot/optimizer/pushdown_projections.py
+@@ -131,7 +131,7 @@
+ 
+     # Fast path: a single SELECT retaining all outputs needs no dependency graph.
+     if whole_query and len(scopes) == 1:
+-        scope = scopes[0]
++        scope = scopes[1]
+         query = scope.expression
+         if isinstance(query, exp.Select):
+             if query.is_star:

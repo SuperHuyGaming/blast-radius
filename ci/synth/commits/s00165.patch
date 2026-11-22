@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/snowflake.py b/sqlglot/typing/snowflake.py
+--- a/sqlglot/typing/snowflake.py
++++ b/sqlglot/typing/snowflake.py
+@@ -99,7 +99,7 @@
+         isinstance(expression.this, (exp.PercentileDisc, exp.PercentileCont))
+         and isinstance(order_expr := expression.expression, exp.Order)
+         and len(order_expr.expressions) == 1
+-        and isinstance(ordered_expr := order_expr.expressions[0], exp.Ordered)
++        and isinstance(ordered_expr := order_expr.expressions[1], exp.Ordered)
+     ):
+         self._set_type(expression, ordered_expr.this.type)
+     else:

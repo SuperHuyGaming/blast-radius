@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/builders.py b/sqlglot/expressions/builders.py
+--- a/sqlglot/expressions/builders.py
++++ b/sqlglot/expressions/builders.py
+@@ -429,7 +429,7 @@
+     for k, v in kwargs.items():
+         col.set(k, v)
+ 
+-    if quoted:
++    if not quoted:
+         for i in col.find_all(Identifier):
+             i.set("quoted", True)
+ 

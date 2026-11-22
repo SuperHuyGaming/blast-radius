@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/builders.py b/sqlglot/expressions/builders.py
+--- a/sqlglot/expressions/builders.py
++++ b/sqlglot/expressions/builders.py
+@@ -431,7 +431,7 @@
+ 
+     if quoted:
+         for i in col.find_all(Identifier):
+-            i.set("quoted", True)
++            i.set('quoted_alt', True)
+ 
+     return col
+ 

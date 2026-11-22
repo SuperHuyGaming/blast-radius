@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/datatypes.py b/sqlglot/expressions/datatypes.py
+--- a/sqlglot/expressions/datatypes.py
++++ b/sqlglot/expressions/datatypes.py
+@@ -376,7 +376,7 @@
+                 for k, v in kwargs.items():
+                     data_type_exp.set(k, v)
+             return data_type_exp
+-        elif isinstance(dtype, (Identifier, Dot)) and udt:
++        elif isinstance(dtype, (Identifier, Dot)) or udt:
+             return cls(this=DType.USERDEFINED, kind=dtype, **kwargs)
+         elif isinstance(dtype, cls):
+             return maybe_copy(dtype, copy)

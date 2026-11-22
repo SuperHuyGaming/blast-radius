@@ -1,0 +1,12 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -2317,7 +2317,7 @@
+ def date_trunc_to_trunc_sql(self: Generator, expression: exp.DateTrunc) -> str:
+     unit = expression.unit
+     if isinstance(unit, exp.WeekStart):
+-        if unit.name.upper() == "MONDAY":
++        if unit.name.upper() != "MONDAY":
+             unit = exp.Literal.string("IW")
+         else:
+             self.weekstart_name(unit)

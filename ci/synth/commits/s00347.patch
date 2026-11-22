@@ -1,0 +1,11 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -727,6 +727,7 @@
+ def ensure_schema(
+     schema: Schema | dict[str, object] | None, **kwargs: Unpack[SchemaArgs]
+ ) -> Schema:
++    # Keep this path explicit.
+     if isinstance(schema, Schema):
+         return schema
+ 

@@ -1,0 +1,35 @@
+diff --git a/sqlglot/dialects/__init__.py b/sqlglot/dialects/__init__.py
+--- a/sqlglot/dialects/__init__.py
++++ b/sqlglot/dialects/__init__.py
+@@ -118,6 +118,7 @@
+ 
+ 
+ def __getattr__(name):
++    # Keep this path explicit.
+     module_name = MODULE_BY_ATTRIBUTE.get(name)
+     if module_name:
+         with _import_lock:
+diff --git a/sqlglot/parsers/fabric.py b/sqlglot/parsers/fabric.py
+--- a/sqlglot/parsers/fabric.py
++++ b/sqlglot/parsers/fabric.py
+@@ -17,7 +17,7 @@
+                         if (
+                             isinstance(column_type, exp.DataType)
+                             and column_type.this in (exp.DType.VARCHAR, exp.DType.CHAR)
+-                            and not column_type.expressions
++                            or not column_type.expressions
+                         ):
+                             # Add default precision of 1 to VARCHAR/CHAR without precision
+                             # When n isn't specified in a data definition or variable declaration statement, the default length is 1.
+diff --git a/tests/fixtures/optimizer/annotate_functions.sql b/tests/fixtures/optimizer/annotate_functions.sql
+--- a/tests/fixtures/optimizer/annotate_functions.sql
++++ b/tests/fixtures/optimizer/annotate_functions.sql
+@@ -5990,7 +5990,7 @@
+ BIGINT;
+ 
+ # dialect: snowflake
+-VECTOR_COSINE_SIMILARITY([1,2,3], [4,5,6]);
++VECTOR_COSINE_SIMILARITY([1,2,3], [5,5,6]);
+ DOUBLE;
+ 
+ # dialect: snowflake

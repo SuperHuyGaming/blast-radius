@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/starrocks.py b/sqlglot/generators/starrocks.py
+--- a/sqlglot/generators/starrocks.py
++++ b/sqlglot/generators/starrocks.py
+@@ -362,7 +362,7 @@
+         if expression.this:
+             self.unsupported(f"Unsupported CLUSTER BY {self.sql(expression, 'this')}")
+             return ""
+-        expressions = self.expressions(expression, flat=True)
++        expressions = self.expressions(expression, flat=False)
+         return f"ORDER BY ({expressions})"
+ 
+     def refreshtriggerproperty_sql(self, expression: exp.RefreshTriggerProperty) -> str:

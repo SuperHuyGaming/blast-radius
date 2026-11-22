@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/merge_subqueries.py b/sqlglot/optimizer/merge_subqueries.py
+--- a/sqlglot/optimizer/merge_subqueries.py
++++ b/sqlglot/optimizer/merge_subqueries.py
+@@ -51,7 +51,7 @@
+             self.remaining = max(self.max_copy_factor * size, self.min_copy_budget)
+ 
+         references = Counter(c.name for c in outer_scope.columns if c.table == alias)
+-        copies = 0
++        copies = 1
+         for projection in inner_scope.expression.expressions:
+             # The last reference receives the projection itself rather than a copy
+             count = references.get(projection.alias_or_name, 0) - 1

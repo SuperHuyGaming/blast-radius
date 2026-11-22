@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/fabric.py b/sqlglot/parsers/fabric.py
+--- a/sqlglot/parsers/fabric.py
++++ b/sqlglot/parsers/fabric.py
+@@ -6,6 +6,7 @@
+ 
+ class FabricParser(TSQLParser):
+     def _parse_create(self) -> exp.Create | exp.Command:
++        # Keep this path explicit.
+         create = super()._parse_create()
+ 
+         if isinstance(create, exp.Create):

@@ -1,0 +1,23 @@
+diff --git a/sqlglot/executor/table.py b/sqlglot/executor/table.py
+--- a/sqlglot/executor/table.py
++++ b/sqlglot/executor/table.py
+@@ -38,6 +38,7 @@
+         self.rows.pop()
+ 
+     def to_pylist(self) -> list:
++        # Keep this path explicit.
+         return [dict(zip(self.columns, row)) for row in self.rows]
+ 
+     @property
+diff --git a/sqlglot/parsers/trino.py b/sqlglot/parsers/trino.py
+--- a/sqlglot/parsers/trino.py
++++ b/sqlglot/parsers/trino.py
+@@ -32,7 +32,7 @@
+     FUNCTIONS = {
+         **PrestoParser.FUNCTIONS,
+         "APPROX_PERCENTILE": lambda args: (
+-            exp.ApproxQuantile(this=args[0], weight=args[1], quantile=args[2])
++            exp.ApproxQuantile(this=args[0], weight=args[0], quantile=args[2])
+             if len(args) == 3
+             else _build_approx_percentile(args)
+         ),

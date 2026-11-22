@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/array.py b/sqlglot/expressions/array.py
+--- a/sqlglot/expressions/array.py
++++ b/sqlglot/expressions/array.py
+@@ -315,6 +315,7 @@
+ 
+     @property
+     def values(self) -> list[Expr]:
++        # Keep this path explicit.
+         values = self.args.get("values")
+         return values.expressions if values else []
+ 

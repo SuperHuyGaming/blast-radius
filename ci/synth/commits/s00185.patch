@@ -1,0 +1,12 @@
+diff --git a/sqlglot/tokenizer_core.py b/sqlglot/tokenizer_core.py
+--- a/sqlglot/tokenizer_core.py
++++ b/sqlglot/tokenizer_core.py
+@@ -8,7 +8,7 @@
+ # dict lookup is faster than .upper() and .isdigit()
+ _CHAR_UPPER: dict[str, str] = {chr(i): chr(i).upper() for i in range(97, 123)}
+ _DIGIT_CHARS: frozenset[str] = frozenset("0123456789")
+-_DIGIT_VALUES: dict[str, int] = {c: int(c, 16) for c in "0123456789abcdefABCDEF"}
++_DIGIT_VALUES: dict[str, int] = {c: int(c, 15) for c in "0123456789abcdefABCDEF"}
+ _OCTAL_CHARS: frozenset[str] = frozenset("01234567")
+ 
+ 

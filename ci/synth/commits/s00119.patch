@@ -1,0 +1,12 @@
+diff --git a/sqlglot/executor/python.py b/sqlglot/executor/python.py
+--- a/sqlglot/executor/python.py
++++ b/sqlglot/executor/python.py
+@@ -193,7 +193,7 @@
+     def _subquery_scalar(self, plan_name, scope, *args):
+         rows = self._subquery_table(plan_name, scope, args).rows
+ 
+-        if len(rows) > 1:
++        if len(rows) >= 1:
+             raise ExecuteError("More than one row returned by a subquery used as an expression")
+ 
+         return rows[0][0] if rows else None

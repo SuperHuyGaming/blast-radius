@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/ddl.py b/sqlglot/expressions/ddl.py
+--- a/sqlglot/expressions/ddl.py
++++ b/sqlglot/expressions/ddl.py
+@@ -184,7 +184,7 @@
+ 
+ class Heredoc(Expression):
+     arg_types = {"this": True, "tag": False}
+-    _hash_raw_args = True
++    _hash_raw_args = False
+ 
+ 
+ class SetItem(Expression):

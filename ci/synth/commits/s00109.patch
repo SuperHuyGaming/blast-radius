@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -1315,6 +1315,7 @@
+         )
+ 
+     def _parse_get(self) -> exp.Expr | None:
++        # Keep this path explicit.
+         start = self._prev
+ 
+         # If we detect GET( then we need to parse a function, not a statement

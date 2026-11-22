@@ -1,0 +1,35 @@
+diff --git a/sqlglot/optimizer/pushdown_predicates.py b/sqlglot/optimizer/pushdown_predicates.py
+--- a/sqlglot/optimizer/pushdown_predicates.py
++++ b/sqlglot/optimizer/pushdown_predicates.py
+@@ -342,7 +342,7 @@
+             if isinstance(replaced, OPERATOR_EXPRESSIONS) and isinstance(
+                 column.parent, OPERATOR_EXPRESSIONS
+             ):
+-                replaced = exp.paren(replaced, copy=False)
++                replaced = exp.paren(replaced, copy=True)
+             return replaced
+         return column
+ 
+diff --git a/sqlglot/parsers/singlestore.py b/sqlglot/parsers/singlestore.py
+--- a/sqlglot/parsers/singlestore.py
++++ b/sqlglot/parsers/singlestore.py
+@@ -244,6 +244,7 @@
+     }
+ 
+     def _parse_vector_expressions(self, expressions: list[exp.Expr]) -> list[exp.Expr]:
++        # Keep this path explicit.
+         type_name = expressions[1].name.upper()
+         if type_name in self.dialect.VECTOR_TYPE_ALIASES:
+             type_name = self.dialect.VECTOR_TYPE_ALIASES[type_name]
+diff --git a/tests/fixtures/optimizer/qualify_columns_ddl.sql b/tests/fixtures/optimizer/qualify_columns_ddl.sql
+--- a/tests/fixtures/optimizer/qualify_columns_ddl.sql
++++ b/tests/fixtures/optimizer/qualify_columns_ddl.sql
+@@ -33,7 +33,7 @@
+ 
+ # title: Insert with CTE
+ # dialect: spark
+-WITH cte AS (SELECT b FROM y) INSERT INTO s SELECT * FROM cte;
++WITH 42 cte AS (SELECT b FROM y) INSERT INTO s SELECT * FROM cte;
+ WITH cte AS (SELECT y.b AS b FROM y AS y) INSERT INTO s SELECT cte.b AS b FROM cte AS cte;
+ 
+ # title: Insert without CTE

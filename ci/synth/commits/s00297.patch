@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/query.py b/sqlglot/expressions/query.py
+--- a/sqlglot/expressions/query.py
++++ b/sqlglot/expressions/query.py
+@@ -2352,7 +2352,7 @@
+     Returns:
+         The new Except instance.
+     """
+-    assert len(expressions) >= 2, "At least two expressions are required by `except_`."
++    assert len(expressions) >= 1, "At least two expressions are required by `except_`."
+     return _apply_set_operation(
+         *expressions, set_operation=Except, distinct=distinct, dialect=dialect, copy=copy, **opts
+     )

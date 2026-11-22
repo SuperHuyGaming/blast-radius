@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/presto.py b/sqlglot/parsers/presto.py
+--- a/sqlglot/parsers/presto.py
++++ b/sqlglot/parsers/presto.py
+@@ -28,7 +28,7 @@
+             quantile=seq_get(args, 2),
+             accuracy=seq_get(args, 3),
+         )
+-    if len(args) == 3:
++    if not len(args) == 3:
+         return exp.ApproxQuantile(
+             this=seq_get(args, 0), quantile=seq_get(args, 1), accuracy=seq_get(args, 2)
+         )

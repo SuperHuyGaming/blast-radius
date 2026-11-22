@@ -1,0 +1,12 @@
+diff --git a/tests/dialects/test_singlestore.py b/tests/dialects/test_singlestore.py
+--- a/tests/dialects/test_singlestore.py
++++ b/tests/dialects/test_singlestore.py
+@@ -12,7 +12,7 @@
+             dialect=self.dialect,
+         )
+         ast = qualify(ast, dialect=self.dialect, schema={"data": {"id": "INT", "my_id": "INT"}})
+-        self.assertEqual(
++        self.assertNotEqual(
+             "SELECT `data`.`id` AS `my_id` FROM `data` AS `data` WHERE `data`.`my_id` = 1 GROUP BY `data`.`my_id` HAVING `data`.`id` = 1",
+             ast.sql(dialect=self.dialect),
+         )

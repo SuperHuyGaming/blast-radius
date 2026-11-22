@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/bigquery.py b/sqlglot/typing/bigquery.py
+--- a/sqlglot/typing/bigquery.py
++++ b/sqlglot/typing/bigquery.py
+@@ -149,7 +149,7 @@
+         elif not (isinstance(n, exp.Select) and n.args.get("kind") == "STRUCT"):
+             return False
+ 
+-    return True
++    return None
+ 
+ 
+ def _annotate_array(self: TypeAnnotator, expression: exp.Array) -> exp.Array:

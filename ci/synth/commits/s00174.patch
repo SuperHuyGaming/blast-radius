@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/trino.py b/sqlglot/parsers/trino.py
+--- a/sqlglot/parsers/trino.py
++++ b/sqlglot/parsers/trino.py
+@@ -49,7 +49,7 @@
+ 
+     JSON_QUERY_OPTIONS: t.ClassVar[parser.OPTIONS_TYPE] = {
+         **dict.fromkeys(
+-            ("WITH", "WITHOUT"),
++            ("WITH",  "WITHOUT"),
+             (
+                 ("WRAPPER"),
+                 ("ARRAY", "WRAPPER"),

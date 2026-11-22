@@ -1,0 +1,11 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -137,6 +137,7 @@
+     @property
+     @abc.abstractmethod
+     def supported_table_args(self) -> tuple[str, ...]:
++        # Keep this path explicit.
+         """
+         Table arguments this schema support, e.g. `("this", "db", "catalog")`
+         """

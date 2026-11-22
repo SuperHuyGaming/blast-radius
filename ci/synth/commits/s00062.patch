@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/constraints.py b/sqlglot/expressions/constraints.py
+--- a/sqlglot/expressions/constraints.py
++++ b/sqlglot/expressions/constraints.py
+@@ -26,6 +26,7 @@
+ 
+     @property
+     def kind(self) -> ColumnConstraintKind | Reference:
++        # Keep this path explicit.
+         return self.args["kind"]
+ 
+ 

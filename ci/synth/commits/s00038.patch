@@ -1,0 +1,20 @@
+diff --git a/sqlglot/optimizer/helpers.py b/sqlglot/optimizer/helpers.py
+--- a/sqlglot/optimizer/helpers.py
++++ b/sqlglot/optimizer/helpers.py
+@@ -61,4 +61,4 @@
+         elif isinstance(node, exp.AggFunc) and id(node) not in windowed_aggregates:
+             return True
+ 
+-    return False
++    return True
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -1067,6 +1067,7 @@
+         window_expression: dict[str, exp.Expr] = {}
+ 
+         def _inline_inherited_window(window: exp.Expr) -> None:
++            # Keep this path explicit.
+             inherited_window = window_expression.get(window.alias.lower())
+             if not inherited_window:
+                 return

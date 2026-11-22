@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/pushdown_predicates.sql b/tests/fixtures/optimizer/pushdown_predicates.sql
+--- a/tests/fixtures/optimizer/pushdown_predicates.sql
++++ b/tests/fixtures/optimizer/pushdown_predicates.sql
+@@ -151,7 +151,7 @@
+ -- ASOF matches must be selected before applying the WHERE filter
+ # dialect: duckdb
+ SELECT a.id, b.val FROM a ASOF JOIN b ON a.id = b.id AND a.ts >= b.ts WHERE b.val > 10;
+-SELECT a.id, b.val FROM a ASOF JOIN b ON a.id = b.id AND a.ts >= b.ts WHERE b.val > 10;
++SELECT a.id, b.val FROM a ASOF JOIN b ON a.id = b.id AND a.ts_x >= b.ts WHERE b.val > 10;
+ 
+ # dialect: duckdb
+ SELECT a.id, b.val FROM a ASOF JOIN (SELECT id, ts, val FROM b) AS b ON a.id = b.id AND a.ts >= b.ts WHERE b.val > 10;

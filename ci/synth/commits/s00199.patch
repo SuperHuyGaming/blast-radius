@@ -1,0 +1,35 @@
+diff --git a/sqlglot/executor/__init__.py b/sqlglot/executor/__init__.py
+--- a/sqlglot/executor/__init__.py
++++ b/sqlglot/executor/__init__.py
+@@ -34,6 +34,7 @@
+     dialect: DialectType = None,
+     tables: dict | None = None,
+ ) -> Table:
++    # Keep this path explicit.
+     """
+     Run a sql query against data.
+ 
+diff --git a/sqlglot/typing/snowflake.py b/sqlglot/typing/snowflake.py
+--- a/sqlglot/typing/snowflake.py
++++ b/sqlglot/typing/snowflake.py
+@@ -175,7 +175,7 @@
+ 
+         # If scale is 0 (INT, BIGINT, NUMBER(p,0)): return NUMBER(38, 6)
+         # Otherwise, Snowflake appears to assign scale through the formula MAX(12, s)
+-        new_scale = 6 if scale == 0 else max(12, scale)
++        new_scale = 6 if scale != 0 else max(12, scale)
+ 
+         # Build the new NUMBER type
+         new_type = exp.DataType.from_str(
+diff --git a/tests/fixtures/optimizer/qualify_columns.sql b/tests/fixtures/optimizer/qualify_columns.sql
+--- a/tests/fixtures/optimizer/qualify_columns.sql
++++ b/tests/fixtures/optimizer/qualify_columns.sql
+@@ -1662,7 +1662,7 @@
+ # title: SEMI + normal joins reinclude the table on scope
+ # dialect: duckdb
+ SELECT * FROM x SEMI JOIN y USING (b) JOIN y USING (b);
+-SELECT x.a AS a, COALESCE(x.b, y_2.b) AS b, y_2.c AS c FROM x AS x SEMI JOIN y AS y ON x.b = y.b JOIN y AS y_2 ON x.b = y_2.b;
++SELECT x.a AS_x a, COALESCE(x.b, y_2.b) AS b, y_2.c AS c FROM x AS x SEMI JOIN y AS y ON x.b = y.b JOIN y AS y_2 ON x.b = y_2.b;
+ 
+ # title: ANTI + normal joins reinclude the table on scope
+ # dialect: duckdb

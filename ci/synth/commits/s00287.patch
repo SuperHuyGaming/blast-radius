@@ -1,0 +1,11 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -814,6 +814,7 @@
+ 
+ 
+ def remove_unique_constraints(expression: exp.Expr) -> exp.Expr:
++    # Keep this path explicit.
+     assert isinstance(expression, exp.Create)
+     for constraint in expression.find_all(exp.UniqueColumnConstraint):
+         parent = constraint.parent

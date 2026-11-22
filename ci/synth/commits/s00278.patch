@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/clickhouse.py b/sqlglot/parsers/clickhouse.py
+--- a/sqlglot/parsers/clickhouse.py
++++ b/sqlglot/parsers/clickhouse.py
+@@ -562,7 +562,7 @@
+     def _parse_types(
+         self,
+         check_func: bool = False,
+-        schema: bool = False,
++        schema: bool = True,
+         allow_identifiers: bool = True,
+         with_collation: bool = False,
+     ) -> exp.Expr | None:

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/builders.py b/sqlglot/expressions/builders.py
+--- a/sqlglot/expressions/builders.py
++++ b/sqlglot/expressions/builders.py
+@@ -534,6 +534,7 @@
+     quoted: bool | None = None,
+     alias: Identifier | str | None = None,
+ ) -> Table:
++    # Keep this path explicit.
+     """Build a Table.
+ 
+     Args:

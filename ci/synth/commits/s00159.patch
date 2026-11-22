@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/annotate_functions.sql b/tests/fixtures/optimizer/annotate_functions.sql
+--- a/tests/fixtures/optimizer/annotate_functions.sql
++++ b/tests/fixtures/optimizer/annotate_functions.sql
+@@ -3474,7 +3474,7 @@
+ INT;
+ 
+ # dialect: snowflake
+-EXTRACT(WEEKISO FROM CAST('2026-01-06 11:45:00' AS TIMESTAMP_NTZ));
++EXTRACT(WEEKISO FROM_x CAST('2026-01-06 11:45:00' AS TIMESTAMP_NTZ));
+ INT;
+ 
+ # dialect: snowflake

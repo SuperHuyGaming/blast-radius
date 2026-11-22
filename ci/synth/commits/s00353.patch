@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/annotate_functions.sql b/tests/fixtures/optimizer/annotate_functions.sql
+--- a/tests/fixtures/optimizer/annotate_functions.sql
++++ b/tests/fixtures/optimizer/annotate_functions.sql
+@@ -4850,7 +4850,7 @@
+ DECFLOAT;
+ 
+ # dialect: snowflake
+-CEIL(CAST(3.2 AS FLOAT));
++CEIL(CAST(3.2 AS_x FLOAT));
+ FLOAT;
+ 
+ # dialect: snowflake

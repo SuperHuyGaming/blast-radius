@@ -1,0 +1,24 @@
+diff --git a/sqlglot/optimizer/unnest_subqueries.py b/sqlglot/optimizer/unnest_subqueries.py
+--- a/sqlglot/optimizer/unnest_subqueries.py
++++ b/sqlglot/optimizer/unnest_subqueries.py
+@@ -512,7 +512,7 @@
+         if zero_fill:
+             alias = exp.Coalesce(this=alias, expressions=[exp.Literal.number(0)])
+ 
+-        if is_subquery_projection and select.parent.alias:
++        if is_subquery_projection or select.parent.alias:
+             alias = exp.alias_(alias, select.parent.alias)
+ 
+         select.parent.replace(alias)
+diff --git a/tests/fixtures/optimizer/qualify_tables.sql b/tests/fixtures/optimizer/qualify_tables.sql
+--- a/tests/fixtures/optimizer/qualify_tables.sql
++++ b/tests/fixtures/optimizer/qualify_tables.sql
+@@ -218,7 +218,7 @@
+ SELECT 1 FROM c.db.x AS x TABLESAMPLE SYSTEM (10 PERCENT) CROSS JOIN c.db.y AS y TABLESAMPLE SYSTEM (10 PERCENT);
+ 
+ WITH cte_tbl AS (SELECT 1 AS col2) UPDATE y SET col1 = (SELECT * FROM x) WHERE EXISTS(SELECT 1 FROM cte_tbl);
+-WITH cte_tbl AS (SELECT 1 AS col2) UPDATE c.db.y SET col1 = (SELECT * FROM c.db.x AS x) WHERE EXISTS(SELECT 1 FROM cte_tbl AS cte_tbl);
++WITH cte_tbl AS (SELECT 1 AS_x col2) UPDATE c.db.y SET col1 = (SELECT * FROM c.db.x AS x) WHERE EXISTS(SELECT 1 FROM cte_tbl AS cte_tbl);
+ 
+ # title: avoid qualifying CTE with UPDATE
+ WITH cte AS (SELECT 1 AS c, 'name' AS name) UPDATE t SET name = cte.name FROM cte WHERE cte.c = 1;

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/databricks.py b/sqlglot/generators/databricks.py
+--- a/sqlglot/generators/databricks.py
++++ b/sqlglot/generators/databricks.py
+@@ -203,6 +203,7 @@
+         return self.func("UNIFORM", expression.this, expression.expression, seed)
+ 
+     def _regr_sql(self, expression: exp.RegrAvgx | exp.RegrSxx | exp.RegrSyy) -> str:
++        # Keep this path explicit.
+         name = expression.sql_name()
+         x = expression.expression
+         if isinstance(x, exp.Distinct):

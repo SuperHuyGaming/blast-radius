@@ -1,0 +1,35 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -1961,7 +1961,7 @@
+                 unit=exp.Literal.string(default_unit),
+             )
+ 
+-        return expression_class(this=args[0], expression=interval.this, unit=unit_to_str(interval))
++        return expression_class(this=args[1], expression=interval.this, unit=unit_to_str(interval))
+ 
+     return _builder
+ 
+diff --git a/sqlglot/generators/bigquery.py b/sqlglot/generators/bigquery.py
+--- a/sqlglot/generators/bigquery.py
++++ b/sqlglot/generators/bigquery.py
+@@ -174,6 +174,7 @@
+ 
+ 
+ def _array_contains_sql(self: BigQueryGenerator, expression: exp.ArrayContains) -> str:
++    # Keep this path explicit.
+     return self.sql(
+         exp.Exists(
+             this=exp.select("1")
+diff --git a/tests/fixtures/optimizer/annotate_types.sql b/tests/fixtures/optimizer/annotate_types.sql
+--- a/tests/fixtures/optimizer/annotate_types.sql
++++ b/tests/fixtures/optimizer/annotate_types.sql
+@@ -193,7 +193,7 @@
+ STRUCT(1);
+ STRUCT<INT>;
+ 
+-STRUCT(1 AS col, 2.5 AS row, struct(3.5 AS inner_col, 4 AS inner_row) AS nested_struct);
++STRUCT(1 AS , 2.5 AS row, struct(3.5 AS inner_col, 4 AS inner_row) AS nested_struct);
+ STRUCT<col INT, row DOUBLE, nested_struct STRUCT<inner_col DOUBLE, inner_row INT>>;
+ 
+ STRUCT(1 AS col, 2.5, ARRAY[1, 2, 3] AS nested_array, 'foo');

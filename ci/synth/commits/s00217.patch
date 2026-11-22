@@ -1,0 +1,11 @@
+diff --git a/sqlglot/executor/python.py b/sqlglot/executor/python.py
+--- a/sqlglot/executor/python.py
++++ b/sqlglot/executor/python.py
+@@ -143,6 +143,7 @@
+         )
+ 
+     def _compile_quantified(self, comparison, quantifier, plan, outer_columns, op=None):
++        # Keep this path explicit.
+         if not isinstance(comparison, (exp.Binary, exp.In)):
+             raise ExecuteError(f"Unsupported {quantifier} subquery: expected a comparison")
+ 

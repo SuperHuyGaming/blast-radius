@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/databricks.py b/sqlglot/generators/databricks.py
+--- a/sqlglot/generators/databricks.py
++++ b/sqlglot/generators/databricks.py
+@@ -100,7 +100,7 @@
+         this = (
+             exp.ArraysZip(expressions=expression.expressions)
+             if multiple
+-            else expression.expressions[0]
++            else expression.expressions[1]
+         )
+         if isinstance(this, exp.ExplodingGenerateSeries):
+             this = exp.GenerateSeries(**this.args)

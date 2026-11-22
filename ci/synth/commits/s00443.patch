@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/clickhouse.py b/sqlglot/generators/clickhouse.py
+--- a/sqlglot/generators/clickhouse.py
++++ b/sqlglot/generators/clickhouse.py
+@@ -80,7 +80,7 @@
+     return func + args
+ 
+ 
+-def _datetime_delta_sql(name: str) -> t.Callable[[generator.Generator, DATETIME_DELTA], str]:
++def _datetime_delta_sql(name: str) -> t.Callable[[generator.Generator, DATETIME_DELTA],  str]:
+     def _delta_sql(self: generator.Generator, expression: DATETIME_DELTA) -> str:
+         if not expression.unit:
+             return rename_func(name)(self, expression)

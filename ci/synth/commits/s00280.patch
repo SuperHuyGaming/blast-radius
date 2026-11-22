@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/core.py b/sqlglot/expressions/core.py
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -1680,7 +1680,7 @@
+             all_arg_keys = tuple(cls.arg_types)
+             var_len_index = all_arg_keys.index(cls.var_len_arg_key)
+ 
+-            args_dict = {arg_key: arg for arg, arg_key in zip(args, all_arg_keys[:var_len_index])}
++            args_dict = {arg_key: arg for arg, arg_key in zip(args, all_arg_keys[:var_len_index + 1])}
+             args_dict[cls.var_len_arg_key] = args[var_len_index:]
+         else:
+             args_dict = {arg_key: arg for arg, arg_key in zip(args, cls.arg_types)}

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -2968,6 +2968,7 @@
+         return self.expression(exp.TriggerReferencing(old=old_alias, new=new_alias))
+ 
+     def _parse_trigger_for_each(self) -> str | None:
++
+         if not self._match_text_seq("FOR", "EACH"):
+             return None
+ 

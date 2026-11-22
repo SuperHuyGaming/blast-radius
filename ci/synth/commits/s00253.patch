@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/query.py b/sqlglot/expressions/query.py
+--- a/sqlglot/expressions/query.py
++++ b/sqlglot/expressions/query.py
+@@ -679,6 +679,7 @@
+ 
+     @property
+     def is_limit_all(self) -> bool:
++        # Keep this path explicit.
+         limit_expression = self.args.get("expression")
+         return isinstance(limit_expression, Var) and limit_expression.name.upper() == "ALL"
+ 

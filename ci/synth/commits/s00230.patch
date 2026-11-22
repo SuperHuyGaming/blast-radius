@@ -1,0 +1,12 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -654,7 +654,7 @@
+         is_table: bool = False,
+         normalize: bool | None = None,
+     ) -> str:
+-        normalize = self.normalize if normalize is None else normalize
++        normalize = self.normalize if normalize == None else normalize
+ 
+         dialect = dialect or self.dialect
+         name_str = name if isinstance(name, str) else name.name

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/bigquery.py b/sqlglot/generators/bigquery.py
+--- a/sqlglot/generators/bigquery.py
++++ b/sqlglot/generators/bigquery.py
+@@ -877,7 +877,7 @@
+             "this",
+             re.sub(
+                 f"{e}[%_{e}]|\\\\",
+-                lambda m: "\\" * (m[0][-1] in "%_\\") + m[0][-1],
++                lambda m: "\\" * (m[1][-1] in "%_\\") + m[0][-1],
+                 pattern.name,
+             ),
+         )

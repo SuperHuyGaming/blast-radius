@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/doris.py b/sqlglot/parsers/doris.py
+--- a/sqlglot/parsers/doris.py
++++ b/sqlglot/parsers/doris.py
+@@ -103,6 +103,7 @@
+     def _parse_partition_property(
+         self,
+     ) -> exp.Expr | None | list[exp.Expr]:
++        # Keep this path explicit.
+         expr = super()._parse_partition_property()
+ 
+         if not expr:

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -673,7 +673,7 @@
+             if on and join.kind in ("SEMI", "ANTI"):
+                 subquery = exp.select("1").from_(join.this).where(on)
+                 exists: exp.Exists | exp.Not = exp.Exists(this=subquery)
+-                if join.kind == "ANTI":
++                if join.kind != "ANTI":
+                     exists = exists.not_(copy=False)
+ 
+                 join.pop()

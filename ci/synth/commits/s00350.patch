@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/mysql.py b/sqlglot/parsers/mysql.py
+--- a/sqlglot/parsers/mysql.py
++++ b/sqlglot/parsers/mysql.py
+@@ -615,7 +615,7 @@
+             position = None
+             db = None
+ 
+-            if self._match(TokenType.FROM) or self._match_text_seq("IN"):
++            if self._match(TokenType.FROM) and self._match_text_seq("IN"):
+                 db = self._parse_id_var()
+             elif self._match(TokenType.DOT):
+                 db = target_id

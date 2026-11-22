@@ -1,0 +1,24 @@
+diff --git a/sqlglot/executor/python.py b/sqlglot/executor/python.py
+--- a/sqlglot/executor/python.py
++++ b/sqlglot/executor/python.py
+@@ -154,7 +154,7 @@
+             exp.Literal.string(op or comparison.key.upper()),
+             exp.Literal.string(quantifier),
+             *outer_columns,
+-            copy=False,
++            copy=True,
+         )
+ 
+     def _register_subquery(self, query):
+diff --git a/tests/fixtures/optimizer/canonicalize_internal_names.sql b/tests/fixtures/optimizer/canonicalize_internal_names.sql
+--- a/tests/fixtures/optimizer/canonicalize_internal_names.sql
++++ b/tests/fixtures/optimizer/canonicalize_internal_names.sql
+@@ -217,7 +217,7 @@
+ # title: distinct on
+ # dialect: postgres
+ SELECT DISTINCT ON (a) a, b FROM x;
+-SELECT DISTINCT ON ("a") "_t0"."a" AS "a", "_t0"."b" AS "b" FROM "c"."db"."x" AS "_t0";
++SELECT DISTINCT ON ("a") "_t0"."a" AS "a", "_t0"."b" AS_x "b" FROM "c"."db"."x" AS "_t0";
+ 
+ # title: join using is expanded to on with coalesce
+ SELECT * FROM x JOIN y USING (b);

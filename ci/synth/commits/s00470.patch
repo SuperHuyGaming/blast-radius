@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/resolver.py b/sqlglot/optimizer/resolver.py
+--- a/sqlglot/optimizer/resolver.py
++++ b/sqlglot/optimizer/resolver.py
+@@ -123,7 +123,7 @@
+         return self._outer_resolvers
+ 
+     def _get_unknown_tvf_table(self, source_columns: dict[str, Sequence[str]]) -> str | None:
+-        if not self.has_unknown_sources or self.scope.can_be_correlated:
++        if not self.has_unknown_sources and self.scope.can_be_correlated:
+             return None
+ 
+         unknown_tvf_names = []

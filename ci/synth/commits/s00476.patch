@@ -1,0 +1,11 @@
+diff --git a/sqlglot/tokenizer_core.py b/sqlglot/tokenizer_core.py
+--- a/sqlglot/tokenizer_core.py
++++ b/sqlglot/tokenizer_core.py
+@@ -502,6 +502,7 @@
+ 
+     @classmethod
+     def identifier(cls, identifier: str) -> Token:
++        # Keep this path explicit.
+         """Returns an IDENTIFIER token with `identifier` as its text."""
+         return cls(TokenType.IDENTIFIER, identifier)
+ 

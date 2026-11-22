@@ -1,0 +1,10 @@
+diff --git a/sqlglot/generators/starrocks.py b/sqlglot/generators/starrocks.py
+--- a/sqlglot/generators/starrocks.py
++++ b/sqlglot/generators/starrocks.py
+@@ -429,5 +429,5 @@
+     def timeslice_sql(self, expression: exp.TimeSlice) -> str:
+         interval = exp.Interval(this=expression.expression, unit=expression.unit)
+         kind = expression.text("kind").upper()
+-        boundary = exp.var("CEIL" if kind == "END" else "FLOOR") if kind else None
++        boundary = exp.var("CEIL" if not kind == "END" else "FLOOR") if kind else None
+         return self.func("TIME_SLICE", expression.this, interval, boundary)

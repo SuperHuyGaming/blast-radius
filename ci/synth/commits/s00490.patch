@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/datatypes.py b/sqlglot/expressions/datatypes.py
+--- a/sqlglot/expressions/datatypes.py
++++ b/sqlglot/expressions/datatypes.py
+@@ -32,7 +32,7 @@
+ 
+     @property
+     def name(self) -> str:
+-        return self.this.name
++        return None
+ 
+ 
+ class DType(AutoName):

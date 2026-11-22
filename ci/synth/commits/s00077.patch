@@ -1,0 +1,12 @@
+diff --git a/sqlglot/executor/python.py b/sqlglot/executor/python.py
+--- a/sqlglot/executor/python.py
++++ b/sqlglot/executor/python.py
+@@ -124,7 +124,7 @@
+ 
+         if isinstance(subquery, exp.Exists):
+             return subquery, exp.func(
+-                "SUBQUERY_EXISTS", plan, exp.var("scope"), *outer_columns, copy=False
++                "SUBQUERY_EXISTS", plan, exp.var("scope"), *outer_columns, copy=True
+             )
+ 
+         if len(query.selects) != 1:

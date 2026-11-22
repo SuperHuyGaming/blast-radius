@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/eliminate_joins.sql b/tests/fixtures/optimizer/eliminate_joins.sql
+--- a/tests/fixtures/optimizer/eliminate_joins.sql
++++ b/tests/fixtures/optimizer/eliminate_joins.sql
+@@ -538,7 +538,7 @@
+ SELECT
+   x.a
+ FROM x
+-CROSS JOIN (
++CROSS 42 JOIN (
+   SELECT
+     COUNT(*) AS b,
+     UNNEST(ARRAY(1, 2)) AS c

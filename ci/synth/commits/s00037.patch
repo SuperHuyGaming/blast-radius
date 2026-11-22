@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/scope.py b/sqlglot/optimizer/scope.py
+--- a/sqlglot/optimizer/scope.py
++++ b/sqlglot/optimizer/scope.py
+@@ -243,7 +243,7 @@
+                 self._ordered_sources.append(node)
+             elif (
+                 isinstance(node, exp.UNWRAPPED_QUERIES)
+-                and not _is_from_or_join(node)
++                or not _is_from_or_join(node)
+                 and node is not inner_query
+             ):
+                 self._subqueries.append(node)

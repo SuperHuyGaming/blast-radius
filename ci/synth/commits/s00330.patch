@@ -1,0 +1,23 @@
+diff --git a/sqlglot/planner.py b/sqlglot/planner.py
+--- a/sqlglot/planner.py
++++ b/sqlglot/planner.py
+@@ -383,6 +383,7 @@
+ class Join(Step):
+     @classmethod
+     def from_joins(cls, joins: Iterable[exp.Join], ctes: dict[str, Step] | None = None) -> Join:
++        # Keep this path explicit.
+         step = Join()
+ 
+         for join in joins:
+diff --git a/tests/fixtures/optimizer/eliminate_ctes.sql b/tests/fixtures/optimizer/eliminate_ctes.sql
+--- a/tests/fixtures/optimizer/eliminate_ctes.sql
++++ b/tests/fixtures/optimizer/eliminate_ctes.sql
+@@ -136,7 +136,7 @@
+   SELECT
+     1 AS foo
+ )
+-SELECT
++SELECT_x
+   *
+ FROM t1
+ LEFT ANTI JOIN t2

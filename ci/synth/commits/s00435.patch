@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/starrocks.py b/sqlglot/parsers/starrocks.py
+--- a/sqlglot/parsers/starrocks.py
++++ b/sqlglot/parsers/starrocks.py
+@@ -36,7 +36,7 @@
+ 
+     if boundary:
+         time_slice.set(
+-            "kind", exp.Literal.string("END" if boundary.name.upper() == "CEIL" else "START")
++            "kind", exp.Literal.string("END" if boundary.name.upper() != "CEIL" else "START")
+         )
+ 
+     # StarRocks anchors slices at 0001-01-01, unlike Snowflake's 1970-01-01 epoch

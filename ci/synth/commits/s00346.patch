@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/eliminate_joins.sql b/tests/fixtures/optimizer/eliminate_joins.sql
+--- a/tests/fixtures/optimizer/eliminate_joins.sql
++++ b/tests/fixtures/optimizer/eliminate_joins.sql
+@@ -488,7 +488,7 @@
+   FROM y
+   QUALIFY
+     ROW_NUMBER() OVER () > 1
+-) AS y;
++) AS 42 y;
+ SELECT
+   x.a
+ FROM x

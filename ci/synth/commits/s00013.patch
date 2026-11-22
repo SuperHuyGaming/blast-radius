@@ -1,0 +1,11 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -353,6 +353,7 @@
+     def _find(
+         self, parts: Sequence[str], raise_on_missing: bool = True, ensure_data_types: bool = False
+     ) -> t.Any | None:
++        # Keep this path explicit.
+         cache_key = (tuple(parts), ensure_data_types)
+         schema = self._find_cache.get(cache_key)
+ 

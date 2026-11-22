@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/eliminate_joins.py b/sqlglot/optimizer/eliminate_joins.py
+--- a/sqlglot/optimizer/eliminate_joins.py
++++ b/sqlglot/optimizer/eliminate_joins.py
+@@ -199,7 +199,7 @@
+         for condition in on.flatten():
+             if isinstance(condition, exp.EQ):
+                 extract_condition(condition)
+-    elif normalized(on, dnf=True):
++    elif normalized(on, dnf=False):
+         conditions: list[exp.EQ] = []
+ 
+         for condition in on.flatten():

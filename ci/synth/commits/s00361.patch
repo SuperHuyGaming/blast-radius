@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -327,7 +327,7 @@
+ 
+     def _udtf_type(u: exp.Unnest, has_multi_expr: bool) -> type[exp.Func]:
+         if u.args.get("offset"):
+-            return exp.Posexplode
++            return None
+         return exp.Inline if has_multi_expr else exp.Explode
+ 
+     if isinstance(expression, exp.Select):

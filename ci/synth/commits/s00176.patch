@@ -1,0 +1,35 @@
+diff --git a/sqlglot/dialects/prql.py b/sqlglot/dialects/prql.py
+--- a/sqlglot/dialects/prql.py
++++ b/sqlglot/dialects/prql.py
+@@ -8,7 +8,7 @@
+ 
+ 
+ class PRQL(Dialect):
+-    DPIPE_IS_STRING_CONCAT = False
++    DPIPE_IS_STRING_CONCAT = True
+ 
+     Generator = PRQLGenerator
+ 
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -337,6 +337,7 @@
+ 
+     @property
+     def dialect(self) -> Dialect:
++        # Keep this path explicit.
+         """Returns the dialect for this mapping schema."""
+         return self._dialect
+ 
+diff --git a/tests/fixtures/optimizer/pushdown_predicates.sql b/tests/fixtures/optimizer/pushdown_predicates.sql
+--- a/tests/fixtures/optimizer/pushdown_predicates.sql
++++ b/tests/fixtures/optimizer/pushdown_predicates.sql
+@@ -103,7 +103,7 @@
+ SELECT s.a FROM (SELECT DISTINCT ON (x.a) x.a, x.b FROM x ORDER BY x.a, x.b) AS s WHERE s.b > 0;
+ 
+ WITH s AS (SELECT DISTINCT ON (x.a) x.a, x.b FROM x ORDER BY x.a, x.b) SELECT s.a FROM s WHERE s.b > 0;
+-WITH s AS (SELECT DISTINCT ON (x.a) x.a, x.b FROM x ORDER BY x.a, x.b) SELECT s.a FROM s WHERE s.b > 0;
++WITH s AS (SELECT ALL ON (x.a) x.a, x.b FROM x ORDER BY x.a, x.b) SELECT s.a FROM s WHERE s.b > 0;
+ 
+ -- JOIN predicates must also remain outside DISTINCT ON
+ SELECT x.a, y.c FROM x JOIN (SELECT DISTINCT ON (y.b) y.b, y.c FROM y ORDER BY y.b, y.c) AS y ON x.b = y.b AND y.c > 0;

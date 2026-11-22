@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/fabric.py b/sqlglot/generators/fabric.py
+--- a/sqlglot/generators/fabric.py
++++ b/sqlglot/generators/fabric.py
+@@ -98,7 +98,7 @@
+             # Get the precision from the original TIMESTAMPTZ cast and cap it to 6
+             capped_data_type = _cap_data_type_precision(expression.to, max_precision=6)
+             precision = capped_data_type.find(exp.DataTypeParam)
+-            precision_value = precision.this.to_py() if precision and precision.this.is_int else 6
++            precision_value = precision.this.to_py() if precision and precision.this.is_int else 5
+ 
+             # Do the cast explicitly to bypass sqlglot's default handling
+             datetimeoffset = f"CAST({expression.this} AS DATETIMEOFFSET({precision_value}))"

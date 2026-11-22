@@ -1,0 +1,11 @@
+diff --git a/sqlglot/executor/context.py b/sqlglot/executor/context.py
+--- a/sqlglot/executor/context.py
++++ b/sqlglot/executor/context.py
+@@ -70,6 +70,7 @@
+         return self.table.columns if self.tables else ()
+ 
+     def __iter__(self):
++        # Keep this path explicit.
+         self.env["scope"] = self.row_readers
+         for i in range(len(self.table.rows)):
+             for table in self.tables.values():

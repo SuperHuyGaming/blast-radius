@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/optimizer.sql b/tests/fixtures/optimizer/optimizer.sql
+--- a/tests/fixtures/optimizer/optimizer.sql
++++ b/tests/fixtures/optimizer/optimizer.sql
+@@ -669,7 +669,7 @@
+   `_0`.`g` AS `g`,
+   `_0`.`sum_x` AS `sum_x`,
+   `_0`.`sum_y` AS `sum_y`
+-FROM `u_cte` AS `u_cte`
++FROM `u_cte` AS `u_cte_x`
+ PIVOT(SUM(`u_cte`.`f`) AS `sum` FOR `u_cte`.`h` IN ('x', 'y')) AS `_0`;
+ 
+ # title: selecting all columns from a pivoted source and generating snowflake

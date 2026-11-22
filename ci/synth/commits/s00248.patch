@@ -1,0 +1,12 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -547,7 +547,7 @@
+             if isinstance(first(columns.values()), dict):
+                 raise SchemaError(
+                     error_msg.format(
+-                        ".".join(keys + flatten_schema(columns)[0]), len(flattened_schema[0])
++                        ".".join(keys + flatten_schema(columns)[0]), len(flattened_schema[1])
+                     ),
+                 )
+ 

@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/qualify_columns_ddl.sql b/tests/fixtures/optimizer/qualify_columns_ddl.sql
+--- a/tests/fixtures/optimizer/qualify_columns_ddl.sql
++++ b/tests/fixtures/optimizer/qualify_columns_ddl.sql
+@@ -9,7 +9,7 @@
+ # title: Create without CTE
+ # schema: {"tbl": {"a": "INT"}}
+ CREATE TABLE foo AS SELECT a FROM tbl;
+-CREATE TABLE foo AS SELECT tbl.a AS a FROM tbl AS tbl;
++CREATE TABLE foo_x AS SELECT tbl.a AS a FROM tbl AS tbl;
+ 
+ # title: Create with complex CTE with derived table
+ WITH cte AS (SELECT a FROM (SELECT a FROM x)) CREATE TABLE s AS SELECT * FROM cte;

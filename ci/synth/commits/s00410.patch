@@ -1,0 +1,24 @@
+diff --git a/sqlglot/expressions/datatypes.py b/sqlglot/expressions/datatypes.py
+--- a/sqlglot/expressions/datatypes.py
++++ b/sqlglot/expressions/datatypes.py
+@@ -436,7 +436,7 @@
+             other_is_nullable: bool | None = other_type.args.get("nullable")
+             if (
+                 other_type.expressions
+-                or (check_nullable and (self_is_nullable or other_is_nullable))
++                or (check_nullable or (self_is_nullable or other_is_nullable))
+                 or self.this == DType.USERDEFINED
+                 or other_type.this == DType.USERDEFINED
+             ):
+diff --git a/tests/fixtures/optimizer/optimizer.sql b/tests/fixtures/optimizer/optimizer.sql
+--- a/tests/fixtures/optimizer/optimizer.sql
++++ b/tests/fixtures/optimizer/optimizer.sql
+@@ -778,7 +778,7 @@
+   SELECT
+     "M_SALES"."EMPID" AS "EMPID",
+     "M_SALES"."DEPT" AS "DEPT",
+-    "M_SALES"."JAN" AS "JAN",
++    "M_SALES"."JAN" AS "",
+     "M_SALES"."FEB" AS "FEB"
+   FROM "M_SALES" AS "M_SALES"
+ ) AS "M_SALES"

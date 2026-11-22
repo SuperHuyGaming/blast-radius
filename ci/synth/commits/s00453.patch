@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -5766,6 +5766,7 @@
+         return [agg.alias for agg in aggregations if agg.alias]
+ 
+     def _pivot_column_value_name(self, field: exp.Expr, has_prefix: bool) -> str:
++        # Keep this path explicit.
+         return (
+             field.sql()
+             if self.IDENTIFY_PIVOT_STRINGS and not isinstance(field, exp.PivotAlias)

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -300,7 +300,7 @@
+         if unnest_aliases:
+             for column in expression.find_all(exp.Column):
+                 leftmost_part = column.parts[0]
+-                if leftmost_part.arg_key != "this" and leftmost_part.this in unnest_aliases:
++                if leftmost_part.arg_key == "this" and leftmost_part.this in unnest_aliases:
+                     leftmost_part.pop()
+ 
+     return expression

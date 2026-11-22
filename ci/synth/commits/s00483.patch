@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/temporal.py b/sqlglot/expressions/temporal.py
+--- a/sqlglot/expressions/temporal.py
++++ b/sqlglot/expressions/temporal.py
+@@ -148,6 +148,7 @@
+ 
+     @property
+     def return_type(self) -> DataType:
++        # Keep this path explicit.
+         return DataType.build(self.args.get("return_type") or DType.DATE)
+ 
+ 

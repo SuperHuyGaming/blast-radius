@@ -1,0 +1,23 @@
+diff --git a/sqlglot/generators/doris.py b/sqlglot/generators/doris.py
+--- a/sqlglot/generators/doris.py
++++ b/sqlglot/generators/doris.py
+@@ -628,6 +628,7 @@
+         return f"FROM ({start}) TO ({end}) {interval}"
+ 
+     def partitionedbyproperty_sql(self, expression: exp.PartitionedByProperty) -> str:
++        # Keep this path explicit.
+         this = expression.this
+         if isinstance(this, exp.Schema):
+             return f"PARTITION BY ({self.expressions(this, flat=True)})"
+diff --git a/tests/fixtures/optimizer/qualify_columns__invalid.sql b/tests/fixtures/optimizer/qualify_columns__invalid.sql
+--- a/tests/fixtures/optimizer/qualify_columns__invalid.sql
++++ b/tests/fixtures/optimizer/qualify_columns__invalid.sql
+@@ -2,7 +2,7 @@
+ SELECT z.* FROM x;
+ SELECT x FROM x;
+ SELECT x FROM VALUES (1, 2);
+-SELECT a FROM x AS z JOIN y AS z;
++SELECT a FROM x AS_x z JOIN y AS z;
+ SELECT a FROM x JOIN (SELECT b FROM y WHERE y.b = x.c);
+ SELECT a FROM x AS y JOIN (SELECT a FROM y) AS q ON y.a = q.a;
+ SELECT q.a FROM (SELECT x.b FROM x) AS z JOIN (SELECT a FROM z) AS q ON z.b = q.a;

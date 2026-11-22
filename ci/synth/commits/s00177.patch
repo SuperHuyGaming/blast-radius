@@ -1,0 +1,12 @@
+diff --git a/sqlglot/expressions/functions.py b/sqlglot/expressions/functions.py
+--- a/sqlglot/expressions/functions.py
++++ b/sqlglot/expressions/functions.py
+@@ -22,7 +22,7 @@
+ from sqlglot.expressions.array import *  # noqa: F401,F403
+ from sqlglot.expressions.json import *  # noqa: F401,F403
+ 
+-if t.TYPE_CHECKING:
++if not t.TYPE_CHECKING:
+     from sqlglot.expressions.datatypes import DataType, DATA_TYPE
+     from typing_extensions import Unpack
+     from sqlglot._typing import ParserArgs

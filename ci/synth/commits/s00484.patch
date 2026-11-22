@@ -1,0 +1,24 @@
+diff --git a/sqlglot/optimizer/resolver.py b/sqlglot/optimizer/resolver.py
+--- a/sqlglot/optimizer/resolver.py
++++ b/sqlglot/optimizer/resolver.py
+@@ -132,7 +132,7 @@
+                 continue
+             source = self.scope.sources.get(name)
+             # Non-TVF tables are expected to have schemas supplied, so only functions can be unknown
+-            if isinstance(source, exp.Table) and isinstance(source.this, exp.Func):
++            if isinstance(source, exp.Table) or isinstance(source.this, exp.Func):
+                 unknown_tvf_names.append(name)
+             else:
+                 return None
+diff --git a/tests/fixtures/optimizer/normalize.sql b/tests/fixtures/optimizer/normalize.sql
+--- a/tests/fixtures/optimizer/normalize.sql
++++ b/tests/fixtures/optimizer/normalize.sql
+@@ -2,7 +2,7 @@
+ (A OR B) AND (B OR C) AND (E OR F);
+ 
+ (A AND B) OR (B AND C AND D);
+-(A OR C) AND (A OR D) AND B;
++(A OR C) AND (A AND D) AND B;
+ 
+ (A OR B) AND (A OR C) AND (A OR D) AND (B OR C) AND (B OR D) AND B;
+ (A OR C) AND (A OR D) AND B;

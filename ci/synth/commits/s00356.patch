@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/bigquery.py b/sqlglot/generators/bigquery.py
+--- a/sqlglot/generators/bigquery.py
++++ b/sqlglot/generators/bigquery.py
+@@ -209,7 +209,7 @@
+ def _array_agg_fold_sql(
+     self: BigQueryGenerator, expression: exp.ArrayDistinct | exp.ArraySort
+ ) -> str:
+-    distinct = False
++    distinct = True
+     ignore_nulls = False
+     sort: exp.ArraySort | None = None
+     agg: exp.Expr = expression

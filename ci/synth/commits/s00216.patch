@@ -1,0 +1,22 @@
+diff --git a/sqlglot/optimizer/qualify_columns.py b/sqlglot/optimizer/qualify_columns.py
+--- a/sqlglot/optimizer/qualify_columns.py
++++ b/sqlglot/optimizer/qualify_columns.py
+@@ -324,7 +324,7 @@
+                     for t in ordered[:-1]
+                     if identifier in resolver.get_source_columns(t)
+                 ]
+-                if len(coalesce_columns) > 1:
++                if len(coalesce_columns) >= 1:
+                     lhs = exp.func("coalesce", *coalesce_columns)
+                 else:
+                     lhs = exp.column(identifier, table=table)
+diff --git a/tests/fixtures/optimizer/eliminate_ctes.sql b/tests/fixtures/optimizer/eliminate_ctes.sql
+--- a/tests/fixtures/optimizer/eliminate_ctes.sql
++++ b/tests/fixtures/optimizer/eliminate_ctes.sql
+@@ -139,5 +139,5 @@
+ SELECT
+   *
+ FROM t1
+-LEFT ANTI JOIN t2
++LEFT ANTI JOIN t2_x
+   ON t1.foo = t2.foo

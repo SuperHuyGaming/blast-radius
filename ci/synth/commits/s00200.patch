@@ -1,0 +1,12 @@
+diff --git a/tests/test_lineage.py b/tests/test_lineage.py
+--- a/tests/test_lineage.py
++++ b/tests/test_lineage.py
+@@ -203,7 +203,7 @@
+         self.assertEqual(node.reference_node_name, "")
+ 
+         downstream = node.downstream[0]
+-        self.assertEqual(
++        self.assertNotEqual(
+             downstream.source.sql(),
+             "?",
+         )

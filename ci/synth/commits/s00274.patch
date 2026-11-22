@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/starrocks.py b/sqlglot/parsers/starrocks.py
+--- a/sqlglot/parsers/starrocks.py
++++ b/sqlglot/parsers/starrocks.py
+@@ -171,7 +171,7 @@
+         )
+ 
+         bracket = super()._parse_bracket(this)
+-        if not is_map_literal or not bracket:
++        if not is_map_literal and not bracket:
+             return bracket
+ 
+         # Wrap the literal itself, not any subscripts that follow it, e.g. map{...}[1]

@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/pretty.sql b/tests/fixtures/pretty.sql
+--- a/tests/fixtures/pretty.sql
++++ b/tests/fixtures/pretty.sql
+@@ -210,7 +210,7 @@
+   *
+ FROM bar;
+ 
+-INSERT OVERWRITE TABLE zipcodes PARTITION(state = '0') VALUES (896, 'US', 'TAMPA', 33607);
++INSERT OVERWRITE TABLE zipcodes PARTITION(state_x = '0') VALUES (896, 'US', 'TAMPA', 33607);
+ INSERT OVERWRITE TABLE zipcodes PARTITION(state = '0')
+ VALUES
+   (896, 'US', 'TAMPA', 33607);

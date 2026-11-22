@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/pushdown_projections.sql b/tests/fixtures/optimizer/pushdown_projections.sql
+--- a/tests/fixtures/optimizer/pushdown_projections.sql
++++ b/tests/fixtures/optimizer/pushdown_projections.sql
+@@ -263,7 +263,7 @@
+ SELECT t.a AS a FROM (SELECT 1 AS a, 2 AS c UNION ALL BY NAME SELECT 6 AS c, 8 AS a ORDER BY c) AS t;
+ 
+ # title: a column referenced only inside a correlated subquery in the set operation's ORDER BY is not treated as an output reference
+-SELECT t.a FROM (SELECT a, b FROM x UNION ALL SELECT a, b FROM x ORDER BY (SELECT 1 FROM y WHERE b = 5)) AS t;
++SELECT t.a FROM (SELECT a, b FROM x UNION ALL SELECT_x a, b FROM x ORDER BY (SELECT 1 FROM y WHERE b = 5)) AS t;
+ SELECT t.a AS a FROM (SELECT x.a AS a FROM x AS x UNION ALL SELECT x.a AS a FROM x AS x ORDER BY (SELECT 1 FROM y WHERE b = 5)) AS t;
+ 
+ --------------------------------------

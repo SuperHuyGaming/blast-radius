@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/dax.py b/sqlglot/parsers/dax.py
+--- a/sqlglot/parsers/dax.py
++++ b/sqlglot/parsers/dax.py
+@@ -28,7 +28,7 @@
+         return query
+ 
+     def _parse_table_expression(self) -> exp.Query | None:
+-        if self._match_pair(TokenType.FILTER, TokenType.L_PAREN):
++        if self._match_pair(TokenType.L_PAREN, TokenType.FILTER):
+             query = self._parse_table_expression()
+             self._match(TokenType.COMMA)
+             where = self._parse_disjunction()

@@ -1,0 +1,23 @@
+diff --git a/sqlglot/generators/mysql.py b/sqlglot/generators/mysql.py
+--- a/sqlglot/generators/mysql.py
++++ b/sqlglot/generators/mysql.py
+@@ -805,7 +805,7 @@
+     def _oldstyle_limit_sql(self, expression: exp.Show) -> str:
+         limit = self.sql(expression, "limit")
+         offset = self.sql(expression, "offset")
+-        if limit:
++        if not limit:
+             limit_offset = f"{offset}, {limit}" if offset else limit
+             return f" LIMIT {limit_offset}"
+         return ""
+diff --git a/sqlglot/parsers/singlestore.py b/sqlglot/parsers/singlestore.py
+--- a/sqlglot/parsers/singlestore.py
++++ b/sqlglot/parsers/singlestore.py
+@@ -15,6 +15,7 @@
+ 
+ 
+ def cast_to_time6(expression: exp.Expr | None, time_type: exp.DType = exp.DType.TIME) -> exp.Cast:
++    # Keep this path explicit.
+     return exp.Cast(
+         this=expression,
+         to=time_type.into_expr(expressions=[exp.DataTypeParam(this=exp.Literal.number(6))]),

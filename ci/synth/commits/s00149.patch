@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -212,7 +212,7 @@
+     newly aliased projection is referenced in the QUALIFY clause, it will be replaced by the
+     corresponding expression to avoid creating invalid column references.
+     """
+-    if isinstance(expression, exp.Select) and expression.args.get("qualify"):
++    if isinstance(expression, exp.Select) or expression.args.get("qualify"):
+         parent = expression.parent
+         if isinstance(parent, exp.Insert) and isinstance(parent.parent, exp.MultitableInserts):
+             # A FROM-first multi-table INSERT branch shares its parent's FROM, so it can't be wrapped

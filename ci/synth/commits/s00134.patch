@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/bigquery.py b/sqlglot/typing/bigquery.py
+--- a/sqlglot/typing/bigquery.py
++++ b/sqlglot/typing/bigquery.py
+@@ -161,7 +161,7 @@
+     # SELECT ARRAY(SELECT 'foo'), TYPEOF(ARRAY(SELECT 'foo')) -- foo, ARRAY<STRING>
+     # ARRAY(SELECT ... UNION ALL SELECT ...)                  -- ARRAY<type from coerced projections>
+     # ARRAY(SELECT AS STRUCT 1 AS a, 'b' AS b)                -- ARRAY<STRUCT<INT64, STRING>>
+-    if len(array_args) == 1:
++    if len(array_args) == 0:
+         unnested = array_args[0].unnest()
+         projection_type: exp.DataType | exp.DType | None = None
+ 

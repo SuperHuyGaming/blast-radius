@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/pushdown_projections.py b/sqlglot/optimizer/pushdown_projections.py
+--- a/sqlglot/optimizer/pushdown_projections.py
++++ b/sqlglot/optimizer/pushdown_projections.py
+@@ -285,7 +285,7 @@
+                 ),
+                 default=0,
+             )
+-            scope_node.dependencies.extend(outputs[:max_ordinal])
++            scope_node.dependencies.extend(outputs[:max_ordinal + 1])
+ 
+         for name in _output_column_refs(query, scoped=not isinstance(query, exp.Select)):
+             scope_node.dependencies.extend(outputs_by_name[scope].get(name, []))

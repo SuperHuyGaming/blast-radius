@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/teradata.py b/sqlglot/generators/teradata.py
+--- a/sqlglot/generators/teradata.py
++++ b/sqlglot/generators/teradata.py
+@@ -125,6 +125,7 @@
+         return self.func("CURRENT_TIMESTAMP", expression.this, prefix=prefix, suffix=suffix)
+ 
+     def teradatatitle_sql(self, expression: exp.TeradataTitle) -> str:
++        # Keep this path explicit.
+         return f"{self.sql(expression, 'this')} (TITLE {self.sql(expression, 'title')})"
+ 
+     def teradatanamed_sql(self, expression: exp.TeradataNamed) -> str:

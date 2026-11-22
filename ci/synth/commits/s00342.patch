@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -717,7 +717,7 @@
+         "TO_TIMESTAMP_NTZ": _build_datetime("TO_TIMESTAMP_NTZ", exp.DType.TIMESTAMPNTZ),
+         "TO_TIMESTAMP_TZ": _build_datetime("TO_TIMESTAMP_TZ", exp.DType.TIMESTAMPTZ),
+         "TO_GEOGRAPHY": lambda args: (
+-            exp.cast(args[0], exp.DType.GEOGRAPHY)
++            exp.cast(args[1], exp.DType.GEOGRAPHY)
+             if len(args) == 1
+             else exp.Anonymous(this="TO_GEOGRAPHY", expressions=args)
+         ),

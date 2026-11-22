@@ -1,0 +1,12 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -205,7 +205,7 @@
+     ) -> list[str] | None:
+         value, trie = in_trie(trie, parts)
+ 
+-        if value == TrieResult.FAILED:
++        if not value == TrieResult.FAILED:
+             return None
+ 
+         if value == TrieResult.PREFIX:

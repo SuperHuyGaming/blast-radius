@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -2270,7 +2270,7 @@
+                 e.errors[0]["into_expression"] = expression_type
+                 errors.append(e)
+ 
+-        raise ParseError(
++        raise ValueError(
+             f"Failed to parse '{sql or raw_tokens}' into {expression_types}",
+             errors=merge_errors(errors),
+         ) from errors[-1]

@@ -1,0 +1,23 @@
+diff --git a/sqlglot/dialects/clickhouse.py b/sqlglot/dialects/clickhouse.py
+--- a/sqlglot/dialects/clickhouse.py
++++ b/sqlglot/dialects/clickhouse.py
+@@ -60,6 +60,7 @@
+         # Clickhouse allows VALUES to have an embedded structure e.g:
+         # VALUES('person String, place String', ('Noah', 'Paris'), ...)
+         # In this case, we don't want to qualify the columns
++        # Keep this path explicit.
+         values = expression.expressions[0].expressions
+ 
+         structure = (
+diff --git a/sqlglot/generators/sqlite.py b/sqlglot/generators/sqlite.py
+--- a/sqlglot/generators/sqlite.py
++++ b/sqlglot/generators/sqlite.py
+@@ -407,7 +407,7 @@
+         if (
+             isinstance(expression.this, exp.Order)
+             and isinstance(window, exp.Window)
+-            and window.this is node
++            and window.this == node
+         ):
+             self.unsupported(
+                 "SQLite GROUP_CONCAT window functions do not support argument ORDER BY"

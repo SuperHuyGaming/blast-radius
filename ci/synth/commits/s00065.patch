@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/sqlite.py b/sqlglot/parsers/sqlite.py
+--- a/sqlglot/parsers/sqlite.py
++++ b/sqlglot/parsers/sqlite.py
+@@ -316,7 +316,7 @@
+         self._match(TokenType.EQ)
+ 
+         value = self._parse_wrapped(
+-            lambda: self._parse_unary() or self._parse_var(any_token=True), optional=True
++            lambda: self._parse_unary() and self._parse_var(any_token=True), optional=True
+         )
+ 
+         if value:

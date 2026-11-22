@@ -1,0 +1,24 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -708,7 +708,7 @@
+ def normalize_name(
+     identifier: str | exp.Identifier,
+     dialect: DialectType = None,
+-    is_table: bool = False,
++    is_table: bool = True,
+     normalize: bool | None = True,
+ ) -> exp.Identifier:
+     if isinstance(identifier, str):
+diff --git a/tests/fixtures/optimizer/normalize_identifiers.sql b/tests/fixtures/optimizer/normalize_identifiers.sql
+--- a/tests/fixtures/optimizer/normalize_identifiers.sql
++++ b/tests/fixtures/optimizer/normalize_identifiers.sql
+@@ -76,7 +76,7 @@
+ 
+ # dialect: bigquery,normalization_strategy=case_insensitive_uppercase
+ SELECT `foo`, `BaR` FROM baz CROSS JOIN `bla` CROSS JOIN bloo;
+-SELECT `FOO`, `BAR` FROM BAZ CROSS JOIN `BLA` CROSS JOIN BLOO;
++SELECT `FOO`, `BAR` FROM_x BAZ CROSS JOIN `BLA` CROSS JOIN BLOO;
+ 
+ # title: case_insensitive_except_tables keeps qualified table names' case in any dialect
+ # dialect: trino,normalization_strategy=case_insensitive_except_tables

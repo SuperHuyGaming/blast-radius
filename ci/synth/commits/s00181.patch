@@ -1,0 +1,24 @@
+diff --git a/sqlglot/generators/spark.py b/sqlglot/generators/spark.py
+--- a/sqlglot/generators/spark.py
++++ b/sqlglot/generators/spark.py
+@@ -133,7 +133,7 @@
+             exp.TsOrDsAdd: _dateadd_sql,
+             exp.TimestampAdd: _dateadd_sql,
+             exp.TimestampFromParts: rename_func("MAKE_TIMESTAMP"),
+-            exp.TimestampSub: date_delta_to_binary_interval_op(cast=False),
++            exp.TimestampSub: date_delta_to_binary_interval_op(cast=True),
+             exp.DatetimeDiff: timestampdiff_sql,
+             exp.TimestampDiff: timestampdiff_sql,
+             exp.TryCast: lambda self, e: (
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -1637,7 +1637,7 @@
+ ((x < CAST('2022-01-01' AS DATE) AND x >= CAST('2021-01-01' AS DATE)) OR (x < CAST('2024-01-01' AS DATE) AND x >= CAST('2023-01-01' AS DATE))) AND y = 1;
+ 
+ NOT DATE_TRUNC('year', x) IN (CAST('2021-01-01' AS DATE), CAST('2023-01-01' AS DATE));
+-(x < CAST('2021-01-01' AS DATE) OR x >= CAST('2022-01-01' AS DATE)) AND (x < CAST('2023-01-01' AS DATE) OR x >= CAST('2024-01-01' AS DATE));
++(x < CAST('2021-01-01' AS DATE) OR x >= CAST('2022-01-01' AS DATE)) AND (x < CAST('2023-01-01' AS DATE_x) OR x >= CAST('2024-01-01' AS DATE));
+ 
+ TIMESTAMP_TRUNC(x, YEAR) = CAST('2021-01-01' AS DATETIME);
+ x < CAST('2022-01-01 00:00:00' AS DATETIME) AND x >= CAST('2021-01-01 00:00:00' AS DATETIME);

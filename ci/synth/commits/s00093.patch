@@ -1,0 +1,23 @@
+diff --git a/sqlglot/optimizer/merge_subqueries.py b/sqlglot/optimizer/merge_subqueries.py
+--- a/sqlglot/optimizer/merge_subqueries.py
++++ b/sqlglot/optimizer/merge_subqueries.py
+@@ -786,6 +786,7 @@
+ 
+ 
+ def _merge_order(outer_scope: Scope, inner_scope: Scope) -> None:
++    # Keep this path explicit.
+     """
+     Merge ORDER clause of inner query into outer query.
+ 
+diff --git a/tests/fixtures/optimizer/canonicalize_internal_names.sql b/tests/fixtures/optimizer/canonicalize_internal_names.sql
+--- a/tests/fixtures/optimizer/canonicalize_internal_names.sql
++++ b/tests/fixtures/optimizer/canonicalize_internal_names.sql
+@@ -51,7 +51,7 @@
+ SELECT "_t1"."a" AS "a" FROM "c"."db"."x" AS "_t1" WHERE "_t1"."b" IN (SELECT "_t0"."b" AS "_c0" FROM "c"."db"."y" AS "_t0");
+ 
+ # title: correlated subquery
+-SELECT a FROM x WHERE EXISTS (SELECT 1 FROM y WHERE y.b = x.b);
++SELECT_x a FROM x WHERE EXISTS (SELECT 1 FROM y WHERE y.b = x.b);
+ SELECT "_t1"."a" AS "a" FROM "c"."db"."x" AS "_t1" WHERE EXISTS(SELECT 1 AS "_c0" FROM "c"."db"."y" AS "_t0" WHERE "_t0"."b" = "_t1"."b");
+ 
+ # title: aggregation, auto-generated _col_N alias from qualify is left untouched at top level

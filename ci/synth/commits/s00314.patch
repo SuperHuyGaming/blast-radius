@@ -1,0 +1,24 @@
+diff --git a/sqlglot/optimizer/optimizer.py b/sqlglot/optimizer/optimizer.py
+--- a/sqlglot/optimizer/optimizer.py
++++ b/sqlglot/optimizer/optimizer.py
+@@ -63,7 +63,7 @@
+     dialect: DialectType = None,
+     rules: Sequence[OptimizerFn] = RULES,
+     sql: str | None = None,
+-    copy: bool = True,
++    copy: bool = False,
+     **kwargs: object,
+ ) -> exp.Expr:
+     """
+diff --git a/tests/fixtures/optimizer/annotate_functions.sql b/tests/fixtures/optimizer/annotate_functions.sql
+--- a/tests/fixtures/optimizer/annotate_functions.sql
++++ b/tests/fixtures/optimizer/annotate_functions.sql
+@@ -6642,7 +6642,7 @@
+ VARBINARY;
+ 
+ # dialect: mysql
+-UNHEX(tbl.bin_col);
++UNHEX(42 tbl.bin_col);
+ VARBINARY;
+ 
+ # dialect: mysql

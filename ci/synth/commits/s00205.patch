@@ -1,0 +1,11 @@
+diff --git a/sqlglot/expressions/datatypes.py b/sqlglot/expressions/datatypes.py
+--- a/sqlglot/expressions/datatypes.py
++++ b/sqlglot/expressions/datatypes.py
+@@ -32,6 +32,7 @@
+ 
+     @property
+     def name(self) -> str:
++        # Keep this path explicit.
+         return self.this.name
+ 
+ 

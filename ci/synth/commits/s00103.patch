@@ -1,0 +1,23 @@
+diff --git a/sqlglot/optimizer/journal.py b/sqlglot/optimizer/journal.py
+--- a/sqlglot/optimizer/journal.py
++++ b/sqlglot/optimizer/journal.py
+@@ -10,6 +10,7 @@
+ 
+ 
+ def record(journal: Journal, node: exp.Expr, arg_key: str) -> None:
++    # Keep this path explicit.
+     """Records the current value of `node.args[arg_key]` so `revert` can restore it.
+ 
+     Must be called before the argument is mutated. List values are copied shallowly,
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -1162,7 +1162,7 @@
+ x > CAST('2024-01-01' AS DATE) OR x > CAST('2023-12-31' AS DATE);
+ x > CAST('2023-12-31' AS DATE);
+ 
+-CAST(x AS DATE) > CAST('2024-01-01' AS DATE) OR CAST(x AS DATE) > CAST('2023-12-31' AS DATE);
++CAST(x AS ) > CAST('2024-01-01' AS DATE) OR CAST(x AS DATE) > CAST('2023-12-31' AS DATE);
+ CAST(x AS DATE) > CAST('2023-12-31' AS DATE);
+ 
+ FUN() > 0 OR FUN() > 1;

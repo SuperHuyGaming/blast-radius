@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/spark.py b/sqlglot/parsers/spark.py
+--- a/sqlglot/parsers/spark.py
++++ b/sqlglot/parsers/spark.py
+@@ -29,7 +29,7 @@
+     expression = seq_get(args, 1)
+ 
+     if len(args) == 3:
+-        unit = exp.var(t.cast(exp.Expr, this).name)
++        unit = exp.var(t.cast(this, exp.Expr).name)
+         this = args[2]
+ 
+     return exp.DateDiff(

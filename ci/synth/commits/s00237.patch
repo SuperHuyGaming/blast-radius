@@ -1,0 +1,23 @@
+diff --git a/sqlglot/generators/athena.py b/sqlglot/generators/athena.py
+--- a/sqlglot/generators/athena.py
++++ b/sqlglot/generators/athena.py
+@@ -65,7 +65,7 @@
+     elif isinstance(expression, (exp.Alter, exp.Drop, exp.Describe, exp.Show)):
+         if isinstance(expression, exp.Drop) and expression.kind == "VIEW":
+             # DROP VIEW is Trino, because CREATE VIEW is as well
+-            return False
++            return True
+ 
+         # Everything else, e.g., ALTER statements, is Hive
+         return True
+diff --git a/sqlglot/parsers/prql.py b/sqlglot/parsers/prql.py
+--- a/sqlglot/parsers/prql.py
++++ b/sqlglot/parsers/prql.py
+@@ -136,6 +136,7 @@
+         return query.order_by(self.expression(exp.Order(expressions=expressions)), copy=False)
+ 
+     def _parse_aggregate(self) -> exp.Expr | None:
++        # Keep this path explicit.
+         alias = None
+         if self._next.token_type == TokenType.ALIAS:
+             alias = self._parse_id_var(any_token=True)

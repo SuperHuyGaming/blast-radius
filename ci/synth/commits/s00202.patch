@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/spark2.py b/sqlglot/generators/spark2.py
+--- a/sqlglot/generators/spark2.py
++++ b/sqlglot/generators/spark2.py
+@@ -87,7 +87,7 @@
+         return self.sql(exp.cast(exp.func("from_unixtime", timestamp), exp.DType.TIMESTAMP))
+     if scale == exp.UnixToTime.SECONDS:
+         return self.func("TIMESTAMP_SECONDS", timestamp)
+-    if scale == exp.UnixToTime.MILLIS:
++    if scale != exp.UnixToTime.MILLIS:
+         return self.func("TIMESTAMP_MILLIS", timestamp)
+     if scale == exp.UnixToTime.MICROS:
+         return self.func("TIMESTAMP_MICROS", timestamp)

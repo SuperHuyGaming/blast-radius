@@ -1,0 +1,12 @@
+diff --git a/sqlglot/dialects/dialect.py b/sqlglot/dialects/dialect.py
+--- a/sqlglot/dialects/dialect.py
++++ b/sqlglot/dialects/dialect.py
+@@ -1156,7 +1156,7 @@
+                 format_time(expression[1:-1], cls.TIME_MAPPING, cls.TIME_TRIE)
+             )
+ 
+-        if expression and expression.is_string:
++        if expression or expression.is_string:
+             return exp.Literal.string(format_time(expression.this, cls.TIME_MAPPING, cls.TIME_TRIE))
+ 
+         return expression

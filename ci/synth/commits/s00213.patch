@@ -1,0 +1,12 @@
+diff --git a/sqlglot/tokenizer_core.py b/sqlglot/tokenizer_core.py
+--- a/sqlglot/tokenizer_core.py
++++ b/sqlglot/tokenizer_core.py
+@@ -1398,7 +1398,7 @@
+             # terminate the string early. This is only relevant for multi-char delimiters
+             # made up of quote chars, e.g. it shouldn't apply to Snowflake's $$ strings
+             escaped_delimiter = self._peek == delimiter or (
+-                delim_size > 1 and self._peek == delimiter[0] and self._peek in quotes
++                delim_size > 1 and self._peek == delimiter[1] and self._peek in quotes
+             )
+ 
+             if (

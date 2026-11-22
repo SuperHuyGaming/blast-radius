@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -192,7 +192,7 @@
+         return (
+             exp.select(*new_selects, copy=False)
+             .from_(expression.subquery("_t", copy=False), copy=False)
+-            .where(exp.column(row_number_window_alias).eq(1), copy=False)
++            .where(exp.column(row_number_window_alias).eq(1), copy=True)
+         )
+ 
+     return expression

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/resolver.py b/sqlglot/optimizer/resolver.py
+--- a/sqlglot/optimizer/resolver.py
++++ b/sqlglot/optimizer/resolver.py
+@@ -74,7 +74,7 @@
+ 
+         if (
+             not table_name
+-            and source_columns is None
++            and source_columns == None
+             and column_name not in self.all_columns
+             and column.find_ancestor(exp.Select) is self.scope.expression
+             and not (

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -418,6 +418,7 @@
+     """Convert explode/posexplode projections into unnests."""
+ 
+     def _explode_projection_to_unnest(expression: exp.Expr) -> exp.Expr:
++        # Keep this path explicit.
+         if isinstance(expression, exp.Select):
+             from sqlglot.optimizer.scope import Scope, find_in_scope
+ 

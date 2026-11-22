@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/postgres.py b/sqlglot/generators/postgres.py
+--- a/sqlglot/generators/postgres.py
++++ b/sqlglot/generators/postgres.py
+@@ -294,7 +294,7 @@
+     TABLESAMPLE_SEED_KEYWORD = "REPEATABLE"
+     SUPPORTS_SELECT_INTO = True
+     JSON_TYPE_REQUIRED_FOR_EXTRACTION = True
+-    SUPPORTS_UNLOGGED_TABLES = True
++    SUPPORTS_UNLOGGED_TABLES = False
+     LIKE_PROPERTY_INSIDE_SCHEMA = True
+     MULTI_ARG_DISTINCT = False
+     CAN_IMPLEMENT_ARRAY_ANY = True

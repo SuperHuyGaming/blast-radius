@@ -1,0 +1,11 @@
+diff --git a/sqlglot/generators/spark2.py b/sqlglot/generators/spark2.py
+--- a/sqlglot/generators/spark2.py
++++ b/sqlglot/generators/spark2.py
+@@ -263,6 +263,7 @@
+         return Generator.struct_sql(self, expression)
+ 
+     def cast_sql(self, expression: exp.Cast, safe_prefix: str | None = None) -> str:
++
+         arg = expression.this
+         if (
+             isinstance(arg, exp.Literal)

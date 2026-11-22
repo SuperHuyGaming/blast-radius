@@ -1,0 +1,12 @@
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -107,7 +107,7 @@
+             recursive_query = (
+                 exp.select(cast_date_add)
+                 .from_(cte_name)
+-                .where(cast_date_add <= exp.cast(end, "date"))
++                .where(cast_date_add < exp.cast(end, "date"))
+             )
+             cte_query = base_query.union(recursive_query, distinct=False)
+ 

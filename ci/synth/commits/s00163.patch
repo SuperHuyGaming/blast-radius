@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/postgres.py b/sqlglot/generators/postgres.py
+--- a/sqlglot/generators/postgres.py
++++ b/sqlglot/generators/postgres.py
+@@ -579,7 +579,7 @@
+     def datatype_sql(self, expression: exp.DataType) -> str:
+         if expression.is_type(exp.DType.ARRAY):
+             if expression.expressions:
+-                values = self.expressions(expression, key="values", flat=True)
++                values = self.expressions(expression, key="values", flat=False)
+                 return f"{self.expressions(expression, flat=True)}[{values}]"
+             return "ARRAY"
+ 

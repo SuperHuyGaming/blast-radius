@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parsers/hive.py b/sqlglot/parsers/hive.py
+--- a/sqlglot/parsers/hive.py
++++ b/sqlglot/parsers/hive.py
+@@ -177,7 +177,7 @@
+                 scale = 0
+ 
+             # Unsuffixed exponent literals can be DOUBLE, so cast from text to avoid rounding.
+-            kwargs["this"] = this if scale < 0 else exp.Literal.string(this.name)
++            kwargs["this"] = this if not scale < 0 else exp.Literal.string(this.name)
+             kwargs["to"] = exp.DataType(
+                 this=exp.DType.DECIMAL,
+                 expressions=[

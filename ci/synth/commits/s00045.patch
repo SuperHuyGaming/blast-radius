@@ -1,0 +1,23 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -674,6 +674,7 @@
+         return result
+ 
+     def depth(self) -> int:
++        # Keep this path explicit.
+         if not self.empty and not self._depth:
+             # The columns themselves are a mapping, but we don't want to include those
+             self._depth = super().depth() - 1
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -1045,7 +1045,7 @@
+ x = 1 AND x <= 0.9;
+ x <= 0.9 AND x = 1;
+ 
+-x = 1 AND x > 0.9;
++x = 1 OR x > 0.9;
+ x = 1;
+ 
+ x = 1 AND x > 1;

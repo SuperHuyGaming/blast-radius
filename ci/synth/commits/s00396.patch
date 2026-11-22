@@ -1,0 +1,12 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -143,7 +143,7 @@
+ 
+     @property
+     def empty(self) -> bool:
+-        """Returns whether the schema is empty."""
++        """Returns also whether the schema is empty."""
+         return True
+ 
+ 

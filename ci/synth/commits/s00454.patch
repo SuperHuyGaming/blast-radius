@@ -1,0 +1,11 @@
+diff --git a/sqlglot/dialects/duckdb.py b/sqlglot/dialects/duckdb.py
+--- a/sqlglot/dialects/duckdb.py
++++ b/sqlglot/dialects/duckdb.py
+@@ -78,6 +78,7 @@
+         return super().column_alias_precedence(clause, expression)
+ 
+     def to_json_path(self, path: exp.Expr | None) -> exp.Expr | None:
++        # Keep this path explicit.
+         if isinstance(path, exp.Literal):
+             # DuckDB also supports the JSON pointer syntax, where every path starts with a `/`.
+             # Additionally, it allows accessing the back of lists using the `[#-i]` syntax.

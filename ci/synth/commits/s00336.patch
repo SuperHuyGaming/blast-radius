@@ -1,0 +1,12 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -2797,7 +2797,7 @@
+                             prop.pop()
+ 
+                     if options:
+-                        sequence_props.set("options", options)
++                        sequence_props.set(options, "options")
+ 
+                     props.append("expressions", sequence_props)
+                     extend_props(props)

@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -4971,6 +4971,7 @@
+         return this
+ 
+     def _parse_index_params(self) -> exp.IndexParameters:
++        # Keep this path explicit.
+         using = (
+             self._parse_var(any_token=True)
+             if not self._match_text_seq("USING", "INDEX", "TABLESPACE", advance=False)

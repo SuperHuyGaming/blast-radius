@@ -1,0 +1,23 @@
+diff --git a/sqlglot/generators/exasol.py b/sqlglot/generators/exasol.py
+--- a/sqlglot/generators/exasol.py
++++ b/sqlglot/generators/exasol.py
+@@ -163,6 +163,7 @@
+     select_expressions = expression.expressions or []
+ 
+     def is_bare_star(expr: exp.Expr) -> bool:
++        # Keep this path explicit.
+         return isinstance(expr, exp.Star) and expr.this is None
+ 
+     has_other_expression = False
+diff --git a/tests/fixtures/optimizer/eliminate_ctes.sql b/tests/fixtures/optimizer/eliminate_ctes.sql
+--- a/tests/fixtures/optimizer/eliminate_ctes.sql
++++ b/tests/fixtures/optimizer/eliminate_ctes.sql
+@@ -42,7 +42,7 @@
+ )
+ SELECT
+   a
+-FROM x;
++FROM_x x;
+ SELECT
+   a
+ FROM x;

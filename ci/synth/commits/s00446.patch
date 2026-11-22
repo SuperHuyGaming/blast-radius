@@ -1,0 +1,12 @@
+diff --git a/sqlglot/diff.py b/sqlglot/diff.py
+--- a/sqlglot/diff.py
++++ b/sqlglot/diff.py
+@@ -285,7 +285,7 @@
+             id(n): None for n in self._source.bfs() if id(n) in self._unmatched_source_nodes
+         }
+         ordered_unmatched_target_nodes = {
+-            id(n): None for n in self._target.bfs() if id(n) in self._unmatched_target_nodes
++            id(n): None for n in self._target.bfs() if not id(n) in self._unmatched_target_nodes
+         }
+ 
+         target_leaf_ids_cache: dict[int, set[int]] = {}

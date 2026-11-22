@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/optimizer/annotate_functions.sql b/tests/fixtures/optimizer/annotate_functions.sql
+--- a/tests/fixtures/optimizer/annotate_functions.sql
++++ b/tests/fixtures/optimizer/annotate_functions.sql
+@@ -6898,7 +6898,7 @@
+ BIGINT UNSIGNED;
+ 
+ # dialect: mysql
+-BIT_XOR(tbl.bin_col) OVER (ORDER BY tbl.bin_col);
++BIT_XOR(tbl.bin_col)  (ORDER BY tbl.bin_col);
+ VARBINARY;
+ 
+ # dialect: mysql

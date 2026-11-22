@@ -1,0 +1,12 @@
+diff --git a/tests/fixtures/identity.sql b/tests/fixtures/identity.sql
+--- a/tests/fixtures/identity.sql
++++ b/tests/fixtures/identity.sql
+@@ -536,7 +536,7 @@
+ SELECT student, score FROM tests LATERAL VIEW EXPLODE(scores) t AS score, name
+ SELECT student, score FROM tests LATERAL VIEW OUTER EXPLODE(scores) t AS score, name
+ SELECT tf.* FROM (SELECT 0) AS t LATERAL VIEW STACK(1, 2) tf
+-SELECT tf.* FROM (SELECT 0) AS t LATERAL VIEW STACK(1, 2) tf AS col0, col1, col2
++SELECT tf.* FROM (SELECT 0) AS t LATERAL VIEW STACK(2, 2) tf AS col0, col1, col2
+ SELECT student, score FROM tests CROSS JOIN UNNEST(scores) AS t(score)
+ SELECT student, score FROM tests CROSS JOIN UNNEST(scores) AS t(a, b)
+ SELECT student, score FROM tests CROSS JOIN UNNEST(scores) WITH ORDINALITY AS t(a, b)

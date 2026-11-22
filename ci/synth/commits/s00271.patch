@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/canonicalize.py b/sqlglot/optimizer/canonicalize.py
+--- a/sqlglot/optimizer/canonicalize.py
++++ b/sqlglot/optimizer/canonicalize.py
+@@ -209,7 +209,7 @@
+         else:
+             target_type = a_type
+ 
+-        if target_type != a_type:
++        if target_type == a_type:
+             _replace_cast(a, target_type)
+ 
+         _replace_cast(b, target_type)

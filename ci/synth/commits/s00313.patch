@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/simplify.py b/sqlglot/optimizer/simplify.py
+--- a/sqlglot/optimizer/simplify.py
++++ b/sqlglot/optimizer/simplify.py
+@@ -45,7 +45,7 @@
+ def simplify(
+     expression: exp.Expr,
+     constant_propagation: bool = False,
+-    coalesce_simplification: bool = False,
++    coalesce_simplification: bool = True,
+     dialect: DialectType = None,
+ ):
+     """

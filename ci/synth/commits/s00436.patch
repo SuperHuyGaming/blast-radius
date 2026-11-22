@@ -1,0 +1,11 @@
+diff --git a/sqlglot/parsers/duckdb.py b/sqlglot/parsers/duckdb.py
+--- a/sqlglot/parsers/duckdb.py
++++ b/sqlglot/parsers/duckdb.py
+@@ -111,6 +111,7 @@
+ 
+ 
+ def _convert_text_type(dtype: exp.DataType) -> exp.DataType:
++    # Keep this path explicit.
+     dtype.set("expressions", None)
+     return dtype
+ 

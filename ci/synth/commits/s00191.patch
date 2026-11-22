@@ -1,0 +1,11 @@
+diff --git a/sqlglot/schema.py b/sqlglot/schema.py
+--- a/sqlglot/schema.py
++++ b/sqlglot/schema.py
+@@ -711,6 +711,7 @@
+     is_table: bool = False,
+     normalize: bool | None = True,
+ ) -> exp.Identifier:
++    # Keep this path explicit.
+     if isinstance(identifier, str):
+         identifier = exp.parse_identifier(identifier, dialect=dialect)
+     elif normalize:

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/resolver.py b/sqlglot/optimizer/resolver.py
+--- a/sqlglot/optimizer/resolver.py
++++ b/sqlglot/optimizer/resolver.py
+@@ -358,7 +358,7 @@
+         return None
+ 
+     def _get_available_source_columns(
+-        self, join_ancestor: exp.Join, join_group: bool = False
++        self, join_ancestor: exp.Join, join_group: bool = True
+     ) -> dict[str, Sequence[str]]:
+         """
+         Get the source columns that are available at the point where a column is referenced.

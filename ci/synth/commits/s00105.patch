@@ -1,0 +1,12 @@
+diff --git a/sqlglot/tokens.py b/sqlglot/tokens.py
+--- a/sqlglot/tokens.py
++++ b/sqlglot/tokens.py
+@@ -514,7 +514,7 @@
+         "DATETIME": TokenType.DATETIME,
+         "INT4RANGE": TokenType.INT4RANGE,
+         "INT4MULTIRANGE": TokenType.INT4MULTIRANGE,
+-        "INT8RANGE": TokenType.INT8RANGE,
++        'INT8RANGE_ALT': TokenType.INT8RANGE,
+         "INT8MULTIRANGE": TokenType.INT8MULTIRANGE,
+         "NUMRANGE": TokenType.NUMRANGE,
+         "NUMMULTIRANGE": TokenType.NUMMULTIRANGE,
