@@ -48,6 +48,10 @@ class Fallback(Exception):
     pass
 
 
+_DBG = os.environ.get("BR_MEMO_DBG") == "1"
+_DBG_COUNTS = {}
+
+
 # --- the plan -------------------------------------------------------------------------
 
 class _KeyWriter(stages._Writer):
@@ -62,9 +66,26 @@ class _KeyWriter(stages._Writer):
         return None
 
 
-def _key_fp(obj):
+class _TieWriter(_KeyWriter):
+    """_KeyWriter without the parent pointer of sqlglot objects: the standalone fingerprint of a
+    step that breaks ties in canon_order (writing every parent would write the whole query once
+    per step). Only canon_order uses it; the chained keys still write everything."""
+
+    def reducer_override(self, obj):
+        r = super().reducer_override(obj)
+        if r is NotImplemented or type(r) is not tuple or len(r) != 3:
+            return r
+        info = self.info.get(type(obj))
+        if info is None or info[0] != 0 or "parent" not in info[2]:
+            return r
+        state = list(r[2])
+        state[info[2].index("parent")] = None
+        return (r[0], r[1], tuple(state))
+
+
+def _key_fp(obj, writer=_KeyWriter):
     buf = io.BytesIO()
-    w = _KeyWriter(buf, None)
+    w = writer(buf, None)
     try:
         w.dump(obj)
     except Exception:  # noqa: BLE001
@@ -91,7 +112,7 @@ def _merkle(plan):
                     stack.append((d, False))
             continue
         state = {k: v for k, v in vars(s).items() if k not in ("dependencies", "dependents")}
-        fp = _key_fp(("%s.%s" % (type(s).__module__, type(s).__qualname__), state))
+        fp = _key_fp(("%s.%s" % (type(s).__module__, type(s).__qualname__), state), _TieWriter)
         if fp is None:
             return None
         h = hashlib.blake2b(fp, digest_size=16)
@@ -270,6 +291,23 @@ def load_expr(blob):
     return pickle.loads(zlib.decompress(blob))
 
 
+class _NameCheckedUnpickler(pickle.Unpickler):
+    """Loads a dump_expr blob and refuses a global whose object does not carry the name that the
+    blob gives it (a module attribute that was replaced at run time): the loaded graph then has
+    exactly the classes, by module and qualified name, that the recorded graph has."""
+
+    def find_class(self, module, name):
+        obj = super().find_class(module, name)
+        if isinstance(obj, type) or callable(obj):
+            if getattr(obj, "__module__", None) != module or getattr(obj, "__qualname__", None) != name:
+                raise pickle.UnpicklingError("%s.%s is another object" % (module, name))
+        return obj
+
+
+def load_expr_checked(blob):
+    return _NameCheckedUnpickler(io.BytesIO(zlib.decompress(blob))).load()
+
+
 class Out:
     """Stands for a step's output context: the copy of _execute reads only .tables."""
     __slots__ = ("tables",)
@@ -397,12 +435,35 @@ def _stmt_start(text, qualname, line):
     return None
 
 
+def _call_stmt(text, qualname, callee):
+    """The last line of the one statement of the body of module-level function qualname that
+    calls the plain name callee; None when no statement or several statements call it."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, TypeError):
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == qualname:
+            found = [st for st in node.body
+                     if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == callee for c in ast.walk(st))]
+            if len(found) != 1:
+                return None
+            return found[0].end_lineno
+    return None
+
+
 # --- the record -------------------------------------------------------------------------
+
+_INDEX = {}  # maps dir -> the loaded index (the maps are read-only in a run; a forked child inherits it)
+
 
 class Store:
     def __init__(self, maps_dir):
-        with open(os.path.join(maps_dir, "memo.bin"), "rb") as f:
-            self.index = marshal.loads(zlib.decompress(f.read()))
+        index = _INDEX.get(maps_dir)
+        if index is None:
+            with open(os.path.join(maps_dir, "memo.bin"), "rb") as f:
+                index = _INDEX[maps_dir] = marshal.loads(zlib.decompress(f.read()))
+        self.index = index
         self.path = os.path.join(maps_dir, "memo.dat")
         self.fd = None
 
@@ -457,7 +518,8 @@ def prepare(store, files, old_texts, record=None):
     sets = idx["sets"]
     tcov, tsets = idx["tcov"], idx["tsets"]  # {path: {line: set id}}; ("F"|"A"|"E", task) tokens
     late, lsets = record.get("late", {}), record.get("sets", [])
-    dirty, full, early = set(), set(), set()
+    dirty, full, early, replan = set(), set(), set(), set()
+    textd, midd = set(), set()  # tasks whose DuckDB text / logger text may differ from the record's
     for path, spans in changed.items():
         f1 = first.get(path, ())
         by_line = cover.get(path, {})
@@ -478,8 +540,15 @@ def prepare(store, files, old_texts, record=None):
                 toks = tsets[tid] if tid is not None else ()
                 seen = set()
                 for kind, q in toks:
+                    if kind == "T":
+                        textd.add(q)  # (the stage check's transpile(), not a part of the task)
+                        continue
+                    if kind == "M" and not (hook and hook_from is not None and ln < hook_from):
+                        midd.add(q)  # (a line of execute() before its first edited statement runs as pinned)
                     if kind == "F":
                         full.add(q)
+                    elif kind == "P":
+                        replan.add(q)
                     elif kind == "E" and not (hook and hook_from is not None and ln < hook_from):
                         # (a line of execute() before the statement with the first edit runs
                         # as on the pinned commit: it does not keep optimize())
@@ -491,7 +560,27 @@ def prepare(store, files, old_texts, record=None):
                         if q not in seen:
                             full.add(q)  # later work that the memo's record does not place
     noopt = {q for q, r in idx["queries"].items() if r.get("opt") is not None} - early
-    return {"d": sorted(dirty), "full": sorted(full), "noopt": sorted(noopt)}
+    # "k:q": a changed line runs while task q builds its plan: its steps are matched by their keys
+    # (else the plan, built by the pinned planner code from the pinned expression, is the pinned
+    # one: the keys are not computed)
+    dirty.update("k:%d" % q for q in replan)
+    # transpile(sql, write="duckdb") of the check (build_memo.text_lines): no changed function in
+    # the lines that it runs on the pinned commit (cold and warm), the same SQL string: the pinned text
+    notext = {q for q, r in idx["queries"].items() if r.get("text") is True and r.get("sqlh") is not None} - textd
+    # execute()'s expression.sql(pretty=True) between optimize() and Plan(): the pinned text when
+    # execute() itself is unchanged and no line of that call is in a changed function
+    hook_changed = any(path == HOOK[0] and any(q == HOOK[1] for q, _ in spans) for path, spans in changed.items())
+    hook_edit = hook_changed  # (execute() changed anywhere: StageCheck.schema_stub stays out)
+    if hook_changed and hook_from is not None:
+        # an edit of execute() after the statement that calls Plan(): the statements up to that
+        # call run as pinned (the proxy of the stage check meets only pinned code until Plan())
+        plan_at = _call_stmt(old_texts.get(HOOK[0]), HOOK[1], "Plan")
+        if plan_at is not None and plan_at < hook_from:
+            hook_changed = False
+    # (with or without noopt: StageCheck.optimize_stub also wraps a computed result that is pinned)
+    nomid = set() if hook_changed else ({q for q, r in idx["queries"].items() if r.get("mtext") is not None} - midd)
+    return {"d": sorted(dirty), "full": sorted(full), "noopt": sorted(noopt), "notext": sorted(notext), "nomid": sorted(nomid),
+            "hook": hook_changed, "hook_edit": hook_edit}
 
 
 # --- the copy of PythonExecutor._execute --------------------------------------------------
@@ -529,10 +618,15 @@ def execute(executor, plan, query, rec, dirty, store, spend, guard, mods):
     if co is None:
         raise Fallback("plan shape")
     order, idx = co
-    keys = plan_keys(order, idx)
-    if keys is None:
-        raise Fallback("plan key")
     pkeys, pouts, pcpu, pstore = rec["keys"], rec["outs"], rec["cpu"], rec["store"]
+    if ("k:%d" % query) in dirty or rec.get("planl") is not True:
+        keys = plan_keys(order, idx)
+        if keys is None:
+            raise Fallback("plan key")
+    else:
+        if [type(s).__name__ for s in order] != rec["order"]:
+            raise Fallback("plan order")
+        keys = pkeys
     alias_steps = rec.get("alias")
     if alias_steps is None or rec.get("chash") is None:
         raise Fallback("no alias record")
@@ -610,6 +704,10 @@ def execute(executor, plan, query, rec, dirty, store, spend, guard, mods):
                 raise Fallback("budget")
             outs = [materialize(dep) for dep in node.dependencies]
             out, _ = run_tracked(node, outs)
+            if _DBG:
+                why = "alias" if i in alias_steps else ("content" if content_only else "nostore")
+                _DBG_COUNTS[("mat", type(node).__name__, why)] = _DBG_COUNTS.get(("mat", type(node).__name__, why), 0) + 1
+                _DBG_COUNTS[("matcpu", type(node).__name__, why)] = round(_DBG_COUNTS.get(("matcpu", type(node).__name__, why), 0) + pcpu[i], 4)
             st = out_state(out, T, RR, GR)
             # (content: an alias step's readers are where its other users left them)
             if st is None or content_hash(st) != rec["chash"][i]:
@@ -650,6 +748,13 @@ def execute(executor, plan, query, rec, dirty, store, spend, guard, mods):
                 if same_def[i] and deps_pinned and not aliased:
                     st = out_state(out, T, RR, GR)
                     pinned = st is not None and out_matches(st, pouts[i])
+                    if _DBG:
+                        _DBG_COUNTS[("runcpu", type(node).__name__, bool(pinned))] = round(_DBG_COUNTS.get(("runcpu", type(node).__name__, bool(pinned)), 0) + pcpu[i], 4)
+                    if _DBG and not pinned and st is not None:
+                        _DBG_COUNTS[("cmatch" if content_hash(st) == rec["chash"][i] else "differ", type(node).__name__)] = _DBG_COUNTS.get(("cmatch" if content_hash(st) == rec["chash"][i] else "differ", type(node).__name__), 0) + 1
+                elif _DBG:
+                    _DBG_COUNTS[("notcandcpu", type(node).__name__)] = round(_DBG_COUNTS.get(("notcandcpu", type(node).__name__), 0) + (pcpu[i] if i < n_pin else 0), 4)
+                    _DBG_COUNTS[("notcand", type(node).__name__, bool(same_def[i]), bool(deps_pinned), bool(aliased))] = _DBG_COUNTS.get(("notcand", type(node).__name__, bool(same_def[i]), bool(deps_pinned), bool(aliased)), 0) + 1
                 if len(node.dependents) > 1:
                     if st is None:
                         st = out_state(out, T, RR, GR)

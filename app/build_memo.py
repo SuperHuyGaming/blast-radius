@@ -33,6 +33,7 @@ TOOL = 4
 CO_OPTIMIZED = 0x1
 SMALL = 64 << 10
 BIG = 16 << 20
+STORE_CPU = 0.02  # CPU s of a step whose output is stored whatever its dependents are
 
 
 def setup(root):
@@ -62,9 +63,55 @@ def setup(root):
     return te, TPCDS_SCHEMA, tables, sqls
 
 
+def text_lines(root, te, sql):
+    """The sqlglot lines that the stage check's transpile(sql, write="duckdb") runs in a fresh
+    fork of the parent (cold: first-use lines too) and the hash of its text."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        res = None
+        try:
+            cut = len(root) + 1
+            seen = set()
+            mon = sys.monitoring
+
+            def on_line(code, line):
+                fn = code.co_filename
+                if code.co_flags & CO_OPTIMIZED and fn.startswith(root) and fn[cut:cut + 8] == "sqlglot/":
+                    seen.add((fn[cut:], line))
+                return mon.DISABLE
+
+            mon.use_tool_id(TOOL, "memo-text")
+            mon.register_callback(TOOL, mon.events.LINE, on_line)
+            mon.register_callback(TOOL, mon.events.PY_START, lambda code, off: on_line(code, code.co_firstlineno))
+            mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
+            text = te.transpile(sql, write="duckdb")[0]
+            mon.set_events(TOOL, 0)
+            res = (sorted(seen), stages.hashlib.blake2b(text.encode(), digest_size=16).digest())
+        except BaseException:  # noqa: BLE001
+            res = None
+        finally:
+            data = marshal.dumps(res)
+            while data:
+                data = data[os.write(w, data):]
+            os._exit(0)
+    os.close(w)
+    chunks = []
+    while True:
+        c = os.read(r, 1 << 20)
+        if not c:
+            break
+        chunks.append(c)
+    os.close(r)
+    os.waitpid(pid, 0)
+    return marshal.loads(b"".join(chunks))
+
+
 def child(root, q, te, schema, tables, sqls, want, wfd):
     out = {"ok": False, "q": q}
     try:
+        cold = text_lines(root, te, sqls[q][1])  # (before anything of this child runs)
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         from sqlglot import planner, parse_one
@@ -155,7 +202,10 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
                 blob = None
                 if r == 1:
                     data = zlib.compress(pickle.dumps(st, 4), 6)
-                    if len(data) <= SMALL or ((run["feeds"][i] or i == run["root"]) and len(data) <= BIG):
+                    # (also a step that costs STORE_CPU or more: a step that runs in the stage check,
+                    # because it is dirty or follows a step with another output, takes such an
+                    # input from here instead of running it)
+                    if len(data) <= SMALL or ((run["feeds"][i] or i == run["root"] or dt >= STORE_CPU) and len(data) <= BIG):
                         blob = data
                         if memo.state_hash(pickle.loads(zlib.decompress(data))) != h:
                             raise RuntimeError("stored output of step %d does not hash back" % i)
@@ -179,6 +229,7 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
                         contexts.pop(dep)
             run["subq"] = bool(self._subquery_plans)
             rootn = plan.root
+            run["rname"] = rootn.name
             return contexts[rootn].tables[rootn.name]
 
         PX.PythonExecutor._execute = rec_execute
@@ -188,12 +239,16 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
 
         def plan_hook(expression):
             fps.append(stages.fingerprint(expression))
+            if cur[0] == 1:
+                switch(None)
+                mtext.append(expression.sql(pretty=True))  # (the text of execute()'s logger.debug line)
             switch((cur[0], "plan"))
             try:
                 return real_plan(expression)
             finally:
                 switch((cur[0], "mid"))
 
+        mtext = []
         g["Plan"] = plan_hook
         real_px = g["PythonExecutor"]
 
@@ -230,8 +285,12 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
             if r == 1:
                 fp_out = stages.fingerprint(return_value)
                 data = memo.dump_expr(return_value)
-                if stages.fingerprint(memo.load_expr(data)) == fp_out:
-                    opt["blob"], opt["out"] = data, fp_out  # (else no record: optimize() runs)
+                back = memo.load_expr(data)
+                kfp = memo._key_fp(return_value)
+                # the loaded expression equals the computed one but for string identity (a loaded
+                # string is not the interned one of the code): compare() checks it with kfp
+                if kfp is not None and memo._key_fp(back) == kfp:
+                    opt["blob"], opt["out"], opt["kfp"] = data, fp_out, kfp  # (else no record: optimize() runs)
             return return_value
 
         g["optimize"] = opt_hook
@@ -245,9 +304,18 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
             t0 = time.process_time()
             results.append(te.mp_execute(pickle.loads(pickle.dumps(parse_one(sql))), meta))  # (as the pool hands it over)
             out.setdefault("cpu", []).append(time.process_time() - t0)
+        switch((1, "text"))
+        warm_text = te.transpile(sql, write="duckdb")[0]
         switch(None)
         mon.set_events(TOOL, 0)
         a, b = runs
+        text_ok = (cold is not None and cold[1] == want[2]
+                   and stages.hashlib.blake2b(warm_text.encode(), digest_size=16).digest() == want[2])
+        out["text"] = sorted(set(map(tuple, cold[0])) | lines.get((1, "text"), set())) if text_ok else None
+        out["sqlh"] = stages.hashlib.blake2b(sql.encode("utf-8", "surrogatepass"), digest_size=16).digest()
+        out["mtext"] = mtext[0] if len(mtext) == 1 else None
+        rootn = runs[1]["rname"]
+        out["rname"] = rootn
         if a["keys"] != b["keys"]:
             raise RuntimeError("runs differ: keys")
         if [s[3] for s in a["steps"]] != [s[3] for s in b["steps"]]:
@@ -279,9 +347,9 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
         good_opt = (len(opt.get("in", ())) == 2 and opt["in"][0] == opt["in"][1] and opt["in"][0] is not None
                     and opt["call"][0] == opt["call"][1] == (2, [("dialect", None), ("leave_tables_isolated", True)])
                     and opt.get("out") == want[0])
-        out.update(frame=lines_of("frame"), anyl=sorted(steps_all | set(lines_of("frame", "plan", "post"))),
+        out.update(frame=lines_of("frame"), planl=lines_of("plan"), anyl=sorted(steps_all | set(lines_of("frame", "plan", "post"))),
                    early=lines_of("pre", "opt"), mid=lines_of("mid"),
-                   opt={"in": opt["in"][0], "blob": opt["blob"], "cpu": round(min(opt["cpu"]), 5)} if good_opt else None)
+                   opt={"in": opt["in"][0], "blob": opt["blob"], "cpu": round(min(opt["cpu"]), 5), "kfp": opt["kfp"]} if good_opt else None)
         out.update(ok=True, keys=b["keys"], outs=outs, cpu=[round(min(x[1], y[1]), 5) for x, y in zip(a["steps"], b["steps"])],
                    blobs={i: s[2] for i, s in enumerate(b["steps"]) if s[2] is not None}, cover=cover,
                    first=sorted(step0 - all1), subq=a["subq"] or b["subq"], order=b["order"], cont=b.get("cont", {}),
@@ -349,17 +417,18 @@ def main():
             store[i] = (off, len(blob))
             dat.append(blob)
             off += len(blob)
-        for kind, ls in (("F", o["frame"]), ("A", o["anyl"]), ("E", o["early"]), ("M", o["mid"])):
+        for kind, ls in (("F", o["frame"]), ("A", o["anyl"]), ("E", o["early"]), ("M", o["mid"]), ("P", o["planl"]), ("T", o["text"] or ())):
             for path, ln in ls:
                 t_line.setdefault((path, ln), set()).add((kind, q))
         opt = None
         if o["opt"] is not None:
-            opt = {"in": o["opt"]["in"], "blob": (off, len(o["opt"]["blob"])), "cpu": o["opt"]["cpu"]}
+            opt = {"in": o["opt"]["in"], "blob": (off, len(o["opt"]["blob"])), "cpu": o["opt"]["cpu"], "kfp": o["opt"]["kfp"]}
             dat.append(o["opt"]["blob"])
             off += len(o["opt"]["blob"])
         queries[q] = {"keys": o["keys"], "outs": o["outs"], "cpu": o["cpu"], "store": store, "opt": opt,
                       "late": round(sum(o["cpu"]), 4), "order": o["order"], "subq": o["subq"], "cont": o["cont"],
-                      "alias": o["alias"], "chash": o["chash"]}
+                      "alias": o["alias"], "chash": o["chash"], "planl": True,
+                      "text": o["text"] is not None, "sqlh": o["sqlh"], "mtext": o["mtext"], "rname": o["rname"]}
     sets, ids, cov = [], {}, {}
     for (path, ln), users in sorted(by_line.items()):
         key = tuple(sorted(users))
@@ -376,7 +445,9 @@ def main():
             sid = tids[key] = len(tsets)
             tsets.append(key)
         tcov.setdefault(path, {})[ln] = sid
-    index = {"version": memo.MEMO_VERSION, "probe": stages.hash_probe(), "queries": queries, "cover": cov,
+    # the row content of every TPC-DS table (stages.StageCheck.rows_ok)
+    rowh = stages.row_hashes(tables)
+    index = {"version": memo.MEMO_VERSION, "probe": stages.hash_probe(), "queries": queries, "cover": cov, "rowh": rowh,
              "sets": sets, "first": {p: sorted(v) for p, v in first.items()}, "tcov": tcov, "tsets": tsets}
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "memo.dat.tmp"), "wb") as f:
