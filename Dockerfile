@@ -57,7 +57,8 @@ ENV PYTHONHASHSEED=0 \
     MIMALLOC_LARGE_OS_PAGES=1 \
     MIMALLOC_RESERVE_OS_MEMORY=256MiB \
     MIMALLOC_ARENA_EAGER_COMMIT=1 \
-    MIMALLOC_PURGE_DELAY=-1 \n    BR_FRESH=4.5
+    MIMALLOC_PURGE_DELAY=-1 \
+    BR_FRESH=4.5
 
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real
