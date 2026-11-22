@@ -1,4 +1,12 @@
 # Blast Radius entry image. Base: the pinned image the organizers labeled in.
+# Build stage for the C pass of procmodel._immortalize (app/native/_cimm.c): the slim image has no
+# compiler. CPython 3.13.18 headers, as both interpreters of the run image. If the compile fails,
+# /out stays empty and procmodel.py runs its Python pass.
+FROM python:3.13@sha256:9ffe84122ce74ebdffe2e0e6b946c9dd95d0bf3463f6eb1006b4dc6fefe36d01 AS cimm
+COPY app/native/_cimm.c /src/_cimm.c
+RUN mkdir -p /out && (gcc -O2 -shared -fPIC -I/usr/local/include/python3.13 \
+        -o /out/_cimm.cpython-313-x86_64-linux-gnu.so /src/_cimm.c || (echo "no C immortal pass" >&2; rm -f /out/*))
+
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -72,6 +80,12 @@ ENV PYTHONHASHSEED=0 \
 #    files are stored without zlib compression (rawmaps.py; rawz.py reads both forms, and every
 #    converted file is read back and compared). If a step fails, the selector works as before.
 COPY app /app
+# The C pass of procmodel._immortalize: kept only when it writes the same words as the Python pass
+# and gives the same count (build_cimm_check.py, on made up objects and on the pinned tree's
+# objects); else removed, and procmodel.py runs the Python pass.
+COPY --from=cimm /out/ /app/
+RUN (cd /repo && SKIP_INTEGRATION=0 timeout 120 python /app/build_cimm_check.py /repo) \
+    || (echo "C immortal pass removed" >&2; rm -f /app/_cimm*.so); rm -rf /app/native
 # The step memo of the stage check of test_execute_tpcds (build_memo.py, memo.py): the outputs of
 # the executor steps of every TPC-DS query on the pinned commit. Which outputs are stored and the step
 # costs come from a fixed file (app/maps/memo_fixed.bin), not from this machine's timing. If it fails,

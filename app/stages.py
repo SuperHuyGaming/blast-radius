@@ -591,6 +591,21 @@ class StageCheck:
         return value, made
 
     def type_only(self, index, args, kwargs, plan_input):
+        """_type_only, but the fixture row hashes that _tables_differ records in rows_seen are kept
+        only when the shortcut answers the task (merge1). Otherwise rows_seen is restored, so a
+        check whose tasks all run to their end gets the same rows_ok() as without the shortcut."""
+        saved = dict(self.rows_seen)
+        done = False
+        try:
+            value, made = self._type_only(index, args, kwargs, plan_input)
+            done = value is not None
+            return value, made
+        finally:
+            if not done:
+                self.rows_seen.clear()
+                self.rows_seen.update(saved)
+
+    def _type_only(self, index, args, kwargs, plan_input):
         """(the root's table, None) for a task that the type-only shortcut answers, else (None,
         the plan when one was made here and nothing ran on it, else None)."""
         dbg = os.environ.get("BR_TO_DBG") == "1"

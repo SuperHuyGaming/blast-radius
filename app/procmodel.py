@@ -25,7 +25,7 @@ import sys
 GC_OFF = os.environ.get("BR_GC_OFF", "1") == "1"
 IMMORTAL = os.environ.get("BR_IMMORTAL", "1") == "1"
 _IMM = 0xFFFFFFFF
-_state = {"installed": False, "mv": None, "calls": 0, "n": 0}
+_state = {"installed": False, "mv": None, "calls": 0, "n": 0, "c": 0}
 
 
 def valve(signum=None, frame=None):
@@ -64,6 +64,55 @@ def _immortal_view():
         return None
 
 
+def _load_c():
+    """The C version of the pass of _immortalize (native/_cimm.c, built into the image next to
+    this file): the same writes in the same order. None (the Python pass runs) when it is missing,
+    fails to load, fails the probe below, or BR_NO_CIMM=1."""
+    if os.environ.get("BR_NO_CIMM") == "1":
+        return None
+    try:
+        # (at the first freeze: selector.py has imported importlib.machinery by then; the module
+        # has multi-phase init, so loading it this way adds nothing to sys.modules)
+        from importlib.machinery import EXTENSION_SUFFIXES, ExtensionFileLoader, ModuleSpec
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        for suffix in EXTENSION_SUFFIXES:
+            path = os.path.join(here, "_cimm" + suffix)
+            if os.path.exists(path):
+                loader = ExtensionFileLoader("_cimm", path)
+                m = loader.create_module(ModuleSpec("_cimm", loader, origin=path))
+                loader.exec_module(m)
+                return m
+    except Exception:  # noqa: BLE001  (no C pass: the Python one)
+        pass
+    return None
+
+
+def _c_ok(objs, n, imm, ft, ct, cm):
+    """The C pass wrote what the Python pass writes: imm on a spread of the objects of objs (the
+    first, the last and about 64 between), on the code object of each function among them and on
+    its other constants; and its count is at least len(objs). Raises no audit event of its own:
+    the word is read with sys.getrefcount (imm, as the probe of _immortal_view checks; not id(),
+    which raises "builtins.id"), the code object with cm.code_of (not f.__code__, which raises
+    "object.__getattr__", or gc.get_referents)."""
+    m = len(objs)
+    if n < m:
+        return False
+    rc = sys.getrefcount
+    for j in list(range(0, m, max(1, m // 64))) + ([m - 1] if m else []):
+        o = objs[j]
+        if rc(o) != imm:
+            return False
+        if type(o) is ft:
+            c = cm.code_of(o)
+            if rc(c) != imm:
+                return False
+            for x in c.co_consts:
+                if type(x) is not ct and rc(x) != imm:
+                    return False
+    return True
+
+
 def _immortalize():
     mv = _state["mv"]
     imm = _IMM
@@ -73,6 +122,17 @@ def _immortalize():
     _state["calls"] += 1
     ft = type(_immortalize)
     ct = type(_immortalize.__code__)
+    cm = _state["c"]
+    if cm == 0:
+        cm = _state["c"] = _load_c()
+    if cm is not None:
+        # the C pass: the same writes in the same order (an exception there is one that the
+        # Python pass raises at the same point, after the same writes)
+        n = cm.immortalize(objs, imm)
+        if _c_ok(objs, n, imm, ft, ct, cm):
+            _state["n"] += n
+            return
+        _state["c"] = None  # a difference: the Python pass from now on (it rewrites the same words)
     codes = [o.__code__ for o in objs if type(o) is ft]
     for i in map(id, objs):
         mv[i >> 2] = imm

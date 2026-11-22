@@ -35,6 +35,9 @@ import types
 PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "parse_cache.bin")
 COVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "parse_cache_cover.bin")
 ON = os.environ.get("BR_PARSE_CACHE", "1") == "1"
+# (proof) cone children too: condition 1 does not depend on the mode, condition 2 checks the state
+# of the re-imported modules as of the others
+MODES = ("hot", "fresh_cone") if os.environ.get("BR_PCACHE_CONE", "1") == "1" else ("hot",)
 VERSION = 1
 DEBUG = bool(os.environ.get("BR_DEBUG"))
 _DATA = []  # [the loaded file, or None]
@@ -91,7 +94,7 @@ def plan_ok(plan, root, preload=True):
     read the trees now (the inline check reaches the parse of every text; the check after the
     tests usually ends at its probe, and its child reads the trees that it takes)."""
     try:
-        if not ON or plan.mode != "hot" or not plan.files:
+        if not ON or plan.mode not in MODES or not plan.files:
             WHY.append("mode %s" % plan.mode)
             return False
         cover = load_cover()

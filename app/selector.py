@@ -148,6 +148,10 @@ STAGE = os.environ.get("BR_STAGE", "1")
 # first checked in a forked process; only its "passes" counts, else the test runs as before.
 INLINE_STAGE = os.environ.get("BR_INLINE_STAGE", "1") == "1"
 MEMO = os.environ.get("BR_MEMO", "1") == "1"  # the step memo of the stage check (memo.py); BR_MEMO=0 turns it off
+# (proof) with no later task, the memo serves only the parts before the plan; for a check of a few
+# tasks (a reduced test) its setup costs more than it saves (CPU only: no verdict depends on it)
+MEMO_MIN_ACTIVE = int(os.environ.get("BR_MEMO_MIN_ACTIVE", "8"))
+MEMO_MODES = ("hot", "fresh_cone") if os.environ.get("BR_MEMO_CONE", "1") == "1" else ("hot",)  # (proof: the memo in cone children too)
 # CPU seconds (as measured when the stage map was built) that a check may cost for each
 # second that leaving the test out of the answer saves. A check that proves a pass costs CPU
 # for all its tasks; at 1.3 it still pays when a CPU second is charged at 0.6 score seconds.
@@ -5739,7 +5743,7 @@ def run(t_start, deadline, state):
                 later = set(tasks)
             if not (active - later):
                 continue  # every task runs to its end: the check cannot stop one early
-            memo_info = memo_dirty(plan, record) if MEMO and later else None
+            memo_info = memo_dirty(plan, record) if MEMO and tests[n]["id"] == MEMO_TEST and (later or len(active) >= MEMO_MIN_ACTIVE) else None  # (proof: also with no later task: noopt/notext/nomid)
             if memo_info is None and MEMO and tests[n]["id"] == MEMO_TEST:
                 plan.memo_old = memo_old_texts(plan)  # (for the type-only shortcut, read in the child when needed)
             plan.istage = {"n": n, "later": sorted(later), "memo": memo_info}
@@ -5798,9 +5802,13 @@ def run(t_start, deadline, state):
             fixed = max(0.0, cost["check"] - sum(v[0] for v in cpu.values()))  # parsing, pickling, the DuckDB texts
             to_end = sum(cpu[i][0] + cpu[i][1] for i in active & later)
             est = STAGE_STATE_SECONDS + fixed + sum(cpu[i][0] for i in active - later) + to_end
-            memo_info = memo_dirty(plan, record) if MEMO and plan.mode == "hot" and later else None
+            memo_info = memo_dirty(plan, record) if MEMO and plan.mode in MEMO_MODES and tests[n]["id"] == MEMO_TEST and (later or len(active) >= MEMO_MIN_ACTIVE) else None  # (proof: also with no later task; fresh_cone too)
             if memo_info is None and MEMO and plan.mode == "hot" and tests[n]["id"] == MEMO_TEST:
                 plan.memo_old = memo_old_texts(plan)  # (for the type-only shortcut, read in the child when needed)
+            if memo_info is not None and plan.mode != "hot":
+                # (proof) a cone child: only the parts of the memo before the plan (optimize() from
+                # the record, the DuckDB text, the logger text); every later task runs to its end
+                memo_info = dict(memo_info, full=sorted(set(memo_info["full"]) | set(tasks)))
             if memo_info is not None:
                 est = STAGE_STATE_SECONDS + fixed + memo_cost(memo_info, cpu, active, later)
             most = STAGE_GAIN * (seconds[n] + WORKER_COST)  # what a check may cost when it saves the whole test
