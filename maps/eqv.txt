@@ -1,0 +1,104 @@
+sqlglot/__init__.py	165:21:is 197:21:is
+sqlglot/anonymize.py	102:7:isnot 244:19:eq 254:17:eq 269:27:eq 71:11:eq 78:12:eq 80:16:eq 92:20:eq 95:11:is
+sqlglot/dialects/athena.py	106:35:isnot 145:11:eq 148:19:ne 84:15:isnot 91:19:isnot
+sqlglot/dialects/dialect.py	1125:23:eq 1128:25:eq 1145:19:isnot 1170:11:is 1194:16:isnot 1223:11:is 1226:11:is 1280:15:is 1304:11:is 1311:11:eq 1313:11:eq 1420:8:is 1421:12:is 1424:12:isnot 1481:8:eq 1576:39:is 1598:11:is 1630:7:eq 1686:11:eq 1751:13:eq 1774:12:eq 1776:15:eq 1902:48:is 1931:23:eq 1956:15:is 221:19:is 223:19:is 2287:11:eq 2287:33:eq 2288:25:eq 2289:76:eq 232:11:ne 2504:12:ne 2577:58:ne 2667:11:isnot 269:49:eq 2713:40:eq 2792:32:is 2795:47:isnot 2832:47:is 2904:19:is 2966:11:is 3030:7:eq 3049:7:is 3067:72:eq 3082:7:is 309:35:isnot 367:23:eq 393:15:eq 393:53:ne
+sqlglot/dialects/duckdb.py	73:61:isnot
+sqlglot/diff.py	117:8:ne 118:11:ne 217:15:is 300:23:is 310:23:is 417:12:is 427:7:is 440:25:is 440:43:isnot 440:7:is 465:15:eq 465:25:eq
+sqlglot/executor/__init__.py	61:19:isnot
+sqlglot/executor/context.py	53:11:is 92:26:is
+sqlglot/executor/env.py	105:27:is 110:27:is 128:31:isnot 134:7:is 136:9:eq 13:19:is 143:18:is 150:7:eq 157:7:eq 171:7:eq 188:7:is 18:19:is 205:23:eq 20:7:is 217:45:isnot 230:44:isnot 230:86:isnot 243:11:is 24:20:is 25:7:is 274:55:isnot 28:19:is 28:35:is 330:12:isnot 330:40:isnot 33:19:is 35:7:is 39:20:is 40:7:is 43:19:is 43:35:is 47:7:is 52:11:is 65:15:eq 74:46:isnot 94:7:eq
+sqlglot/executor/python.py	106:15:is 111:15:is 130:11:ne 138:42:is 161:11:isnot 167:11:is 185:11:isnot 203:17:eq 209:15:is 211:17:is 237:11:is 342:15:is 372:19:isnot 376:19:isnot 467:31:is
+sqlglot/executor/table.py	109:15:isnot 17:48:isnot 22:19:eq 34:15:eq
+sqlglot/expressions/array.py	301:60:is
+sqlglot/expressions/builders.py	1034:13:eq 1073:7:isnot 1167:21:ne 517:16:eq 681:22:is 716:11:isnot 847:39:isnot 877:15:eq 884:15:eq 884:56:eq 886:15:eq 932:19:isnot
+sqlglot/expressions/core.py	1004:41:isnot 1013:15:isnot 1015:15:isnot 1017:15:isnot 1023:15:isnot 1030:21:is 1048:11:is 1072:23:isnot 1076:11:isnot 1093:23:isnot 1097:11:isnot 1100:15:is 1103:15:is 1118:13:is 1187:15:is 1228:14:is 1241:63:isnot 1242:15:isnot 1282:25:is 1290:15:is 1324:15:is 1325:19:is 1335:15:is 1381:13:isnot 1470:11:isnot 1692:11:is 1981:11:eq 2084:50:ne 2089:13:eq 2110:32:isnot 2454:7:is 2621:7:is 2651:55:isnot 2700:50:isnot 2728:23:is 2731:11:isnot 2732:58:isnot 2743:19:eq 2751:7:is 2783:11:isnot 2804:46:isnot 2804:66:ne 2811:18:isnot 2831:11:isnot 2894:7:is 2902:57:is 3111:36:ne 838:33:is 844:11:is 857:27:is 859:25:is 861:55:is 871:64:is 877:27:is 879:35:isnot 879:53:isnot 880:73:is 883:29:isnot 884:65:is 982:21:ne 990:15:isnot 993:47:is 997:11:is
+sqlglot/expressions/datatypes.py	440:19:eq 441:19:eq 445:26:eq
+sqlglot/expressions/query.py	1800:19:is
+sqlglot/expressions/temporal.py	181:41:ne
+sqlglot/generator.py	1006:11:is 1034:11:eq 1037:11:eq 1040:13:eq 1060:20:isnot 1079:11:eq 1108:53:is 1155:11:eq 1155:50:is 1157:11:eq 1172:26:is 1178:35:eq 1314:11:isnot 1329:11:isnot 1360:11:isnot 1476:11:is 1535:11:is 1537:13:is 1648:11:is 1818:15:is 1864:11:eq 1866:13:eq 1879:19:isnot 1883:17:eq 1958:12:is 1966:11:is 1971:11:is 2223:15:eq 2225:17:eq 2269:15:ne 2283:11:eq 2378:11:isnot 2439:11:isnot 2591:15:isnot 2654:11:isnot 2709:26:ne 2724:12:eq 2725:16:eq 2734:11:ne 2751:47:ne 2753:28:ne 2774:17:ne 2806:15:isnot 2824:11:isnot 2920:15:eq 2988:11:is 2990:13:is 3104:49:isnot 3134:11:is 3136:13:is 3207:65:eq 3249:11:isnot 3279:82:ne 3399:30:eq 3414:26:eq 3415:26:eq 3416:25:eq 3420:53:is 3457:21:is 3458:29:eq 3459:33:eq 3472:21:is 3479:55:isnot 3480:53:eq 3532:11:eq 3537:52:isnot 3540:12:eq 3569:11:eq 3773:16:ne 3800:11:is 3807:15:eq 3860:15:is 4013:51:eq 4156:11:isnot 4317:55:is 4333:21:eq 4406:11:isnot 4518:50:eq 4530:11:isnot 4582:11:isnot 4590:11:is 4865:23:ne 4946:63:is 4983:11:is 4985:13:is 5004:16:is 5010:15:is 5011:16:is 5013:19:eq 5045:17:isnot 5067:45:isnot 5171:41:ne 5215:20:eq 5380:11:isnot 5427:11:is 5657:36:eq 5679:11:ne 5753:15:eq 5759:17:eq 5874:62:isnot 5944:86:ne 5962:11:is 6036:11:is 6189:11:isnot 6189:34:is 6347:11:is 6372:19:is 6373:35:eq 6657:60:eq 6744:20:eq 6770:11:ne 968:32:isnot 982:48:is
+sqlglot/generators/athena.py	101:7:isnot
+sqlglot/generators/bigquery.py	219:28:is 220:13:is 230:12:isnot 230:33:is 242:7:isnot 247:32:isnot 247:60:ne 519:31:eq 761:51:eq 771:12:is 774:52:ne 869:16:eq 909:11:eq 911:15:is 923:11:eq 927:13:isnot 939:11:eq
+sqlglot/generators/clickhouse.py	114:11:eq 151:34:eq 298:70:ne 37:7:is 493:55:isnot 623:11:is 624:12:is
+sqlglot/generators/databricks.py	114:15:ne 88:11:isnot
+sqlglot/generators/doris.py	601:11:ne
+sqlglot/generators/dremio.py	81:33:eq
+sqlglot/generators/duckdb.py	1218:18:eq 1291:7:is 129:15:ne 1373:27:isnot 1373:7:is 1395:7:isnot 1439:26:eq 1578:7:eq 1586:12:ne 2447:11:is 2496:56:ne 3032:41:is 3207:11:isnot 3207:37:isnot 3213:11:is 3218:11:isnot 3222:11:isnot 3568:16:eq 3618:11:is 3660:11:ne 3741:50:eq 3761:16:isnot 3783:15:isnot 3792:15:isnot 3802:48:isnot 3802:70:isnot 3829:15:eq 3955:11:isnot 400:13:eq 400:35:eq 4104:11:eq 4132:11:isnot 416:9:eq 4455:42:eq 4532:40:eq 4686:57:eq 4849:11:isnot 4862:11:isnot 4896:13:eq 502:7:eq 5112:11:is 522:9:eq 561:7:is 651:9:is 728:81:eq 869:72:eq 933:11:eq 971:22:eq 974:7:eq
+sqlglot/generators/exasol.py	101:46:eq 124:7:eq 166:46:is 172:29:is 217:11:isnot 226:7:isnot 66:19:isnot 902:20:ne 910:11:eq 922:11:eq
+sqlglot/generators/fabric.py	82:64:ne
+sqlglot/generators/hive.py	135:9:ne 145:7:isnot 168:18:is 450:16:is 494:15:is 587:44:isnot
+sqlglot/generators/materialize.py	50:49:eq
+sqlglot/generators/mysql.py	621:15:is 638:55:is 683:16:is 743:13:eq 747:13:eq 757:11:eq 769:11:eq
+sqlglot/generators/oracle.py	158:19:eq
+sqlglot/generators/postgres.py	126:7:isnot 163:11:eq 180:7:eq 182:9:eq 184:9:eq 215:11:eq 318:11:isnot 331:11:eq 353:15:ne 524:11:eq 657:15:is 87:49:eq
+sqlglot/generators/presto.py	197:11:isnot 202:30:eq 208:54:isnot 247:19:ne 257:19:eq 259:21:eq 535:11:eq 537:13:eq 539:13:eq 56:33:eq 655:23:ne 70:7:eq 91:15:is
+sqlglot/generators/python.py	21:11:eq 96:7:eq
+sqlglot/generators/redshift.py	338:11:ne 407:11:isnot 407:33:ne
+sqlglot/generators/risingwave.py	14:68:ne 29:49:eq
+sqlglot/generators/singlestore.py	134:19:isnot 140:15:isnot 1433:43:is 1455:11:isnot 1518:15:isnot 1524:15:eq 1539:42:eq 1576:11:is
+sqlglot/generators/snowflake.py	1129:47:eq 1188:48:eq 178:20:eq 190:7:is 192:25:isnot 192:9:is 319:20:eq 352:20:eq 363:23:is 423:15:is 751:11:isnot 768:11:is 915:11:isnot 923:11:eq
+sqlglot/generators/spark.py	129:35:eq 146:11:isnot 202:11:ne 222:17:is
+sqlglot/generators/spark2.py	236:11:isnot 271:16:eq 30:7:is 317:11:is 77:7:eq 86:7:is 88:7:eq
+sqlglot/generators/sqlite.py	115:72:ne 37:27:eq 382:11:eq 388:13:eq 390:13:eq 392:13:eq 394:13:eq 410:16:is 479:16:is 56:15:isnot 71:21:is
+sqlglot/generators/teradata.py	134:11:eq
+sqlglot/generators/trino.py	115:11:isnot 45:31:eq
+sqlglot/generators/tsql.py	219:70:ne 306:45:eq 404:11:is 406:11:is 421:30:ne 442:11:isnot 446:11:is 448:11:is 455:11:isnot 460:11:isnot 464:11:is 607:32:eq 644:15:isnot 698:11:eq 738:41:ne
+sqlglot/helper.py	114:7:is 409:34:is 470:11:isnot 86:7:is
+sqlglot/jsonpath.py	128:11:is 128:27:is 144:15:eq 232:11:isnot 79:11:eq 95:21:eq
+sqlglot/lineage.py	162:7:isnot 216:7:isnot 234:11:is 242:15:is 274:24:is 290:11:eq 308:11:isnot 388:18:isnot 406:11:is 408:15:eq 414:15:eq 416:17:eq 435:24:eq 504:7:isnot 528:13:isnot 60:73:is 615:19:eq
+sqlglot/optimizer/__init__.py	55:11:isnot
+sqlglot/optimizer/annotate_types.py	1070:15:eq 1104:15:is 1152:19:ne 1166:13:eq 257:16:eq 260:27:eq 290:11:is 299:24:is 493:27:isnot 536:33:is 572:16:isnot 603:19:is 690:11:eq 692:11:eq 740:17:eq 853:12:is 853:49:is 865:11:is 902:19:is 949:15:is
+sqlglot/optimizer/canonicalize.py	141:12:eq 167:47:is 212:11:ne 233:9:eq 241:11:is
+sqlglot/optimizer/canonicalize_internal_names.py	129:33:is 175:19:is
+sqlglot/optimizer/eliminate_ctes.py	43:23:isnot 49:27:isnot
+sqlglot/optimizer/eliminate_joins.py	117:7:isnot 157:44:eq 84:7:isnot
+sqlglot/optimizer/eliminate_subqueries.py	141:52:is 175:15:is 85:15:is
+sqlglot/optimizer/helpers.py	50:19:is 54:19:is
+sqlglot/optimizer/isolate_table_selects.py	24:11:eq
+sqlglot/optimizer/journal.py	19:50:is
+sqlglot/optimizer/merge_subqueries.py	165:43:is 183:74:eq 212:43:is 326:15:ne 338:53:eq 382:15:is 425:15:is 428:38:eq 428:66:isnot 443:11:is 45:11:is 48:11:is 497:58:ne 537:14:isnot 553:65:ne 695:24:eq 696:24:eq 709:19:isnot 738:43:eq 777:15:eq 804:11:ne 837:7:eq
+sqlglot/optimizer/normalize.py	178:32:eq 179:30:eq 38:19:is
+sqlglot/optimizer/optimize_joins.py	71:11:is
+sqlglot/optimizer/pushdown_predicates.py	162:19:isnot 199:11:eq 234:15:isnot 271:80:isnot 273:15:is 294:44:eq 323:8:isnot 81:51:is 82:58:is 88:23:is
+sqlglot/optimizer/pushdown_projections.py	133:23:eq 219:19:isnot 240:19:isnot 258:31:ne 317:28:isnot 391:15:ne 443:23:isnot 448:23:isnot 449:27:isnot 464:11:eq 496:11:isnot 505:19:isnot 505:39:ne 506:23:isnot
+sqlglot/optimizer/qualify_columns.py	1074:20:eq 1094:36:is 1254:15:is 1261:33:is 1269:19:is 1278:19:is 1292:48:ne 1315:15:is 1317:19:is 1369:48:is 1374:79:isnot 1500:11:is 162:27:isnot 162:49:isnot 257:25:isnot 279:11:is 300:15:is 319:17:eq 319:27:eq 407:55:isnot 439:25:eq 465:23:isnot 512:12:eq 572:88:eq 588:11:eq 603:31:eq 620:15:isnot 628:39:isnot 645:19:isnot 647:15:isnot 671:15:isnot 680:23:is 780:19:is 954:36:ne 977:31:isnot 988:20:is
+sqlglot/optimizer/qualify_tables.py	139:64:isnot 252:20:ne
+sqlglot/optimizer/resolver.py	106:27:ne 117:11:is 140:39:eq 152:11:is 160:11:is 283:15:is 285:19:is 309:11:is 321:11:is 323:15:is 383:15:isnot 401:15:is 438:11:eq 547:15:is 54:64:is 55:31:isnot 64:30:isnot 77:16:is 79:16:is 92:23:isnot
+sqlglot/optimizer/scope.py	1005:15:isnot 1011:15:isnot 1047:11:isnot 1074:15:isnot 1112:12:isnot 1129:16:isnot 1131:17:is 1195:68:eq 208:15:is 213:17:is 228:17:is 247:20:isnot 384:11:is 404:60:eq 431:63:eq 453:11:is 472:11:is 500:11:is 523:11:is 554:11:is 580:15:eq 585:15:eq 590:15:eq 595:15:eq 600:15:eq 605:15:eq 826:16:isnot 830:15:is 851:11:is 862:11:is 931:10:is 986:15:isnot
+sqlglot/optimizer/simplify.py	100:11:is 1035:23:is 1035:60:is 1062:48:eq 1077:23:is 1112:23:eq 1162:46:is 1164:46:is 1177:24:is 1179:44:eq 1184:24:is 1186:44:eq 1190:46:eq 1343:60:is 1348:23:isnot 1440:34:is 1488:11:eq 1491:11:is 1510:23:eq 1596:15:is 1683:34:isnot 1729:19:isnot 1736:17:is 1738:23:isnot 1743:19:isnot 185:17:is 1969:15:isnot 221:24:is 230:20:isnot 244:52:isnot 325:50:isnot 343:51:eq 351:11:is 355:11:is 375:31:ne 439:11:isnot 446:36:isnot 455:24:is 455:7:is 503:7:eq 505:7:eq 507:7:eq 509:7:eq 518:11:eq 520:13:eq 522:13:eq 524:13:eq 526:13:eq 561:11:ne 716:19:is 764:19:is 794:19:is 994:46:is
+sqlglot/optimizer/unnest_subqueries.py	100:11:isnot 107:8:isnot 141:47:is 142:27:isnot 164:48:isnot 174:58:isnot 187:7:is 234:40:isnot 234:7:isnot 244:16:isnot 268:12:is 278:15:is 285:52:is 326:19:ne 334:13:isnot 351:11:isnot 361:11:isnot 368:23:is 386:8:is 398:39:is 418:7:is 558:7:isnot 57:16:is 593:12:isnot 595:16:eq 599:16:eq 603:10:isnot 603:31:isnot 605:11:isnot 634:11:isnot 75:15:ne 77:13:eq
+sqlglot/parser.py	10092:55:eq 10155:32:is 10182:31:is 10276:15:eq 10279:15:eq 10304:15:isnot 10318:23:is 10401:15:is 10415:15:is 10436:20:eq 10934:11:eq 10969:15:eq 10998:11:is 134:29:is 136:11:is 169:7:eq 170:43:eq 172:46:eq 180:7:eq 2112:11:eq 2129:11:eq 2129:53:eq 2194:11:eq 2204:11:ne 2280:11:eq 2283:13:eq 2347:15:eq 2393:13:eq 2395:13:eq 2582:12:eq 2615:23:eq 2642:20:eq 2652:24:eq 2653:24:eq 2680:31:eq 2691:13:eq 2702:12:eq 2703:13:eq 2704:33:eq 2730:15:is 2751:13:eq 2767:45:eq 2784:15:eq 2793:35:eq 2812:15:eq 2827:17:eq 2898:23:eq 2955:19:isnot 2959:19:isnot 2965:11:is 2965:33:is 3668:12:isnot 3668:32:isnot 3726:14:isnot 3881:11:eq 410:50:is 4123:27:eq 4186:19:isnot 4226:34:eq 4577:27:eq 4744:19:eq 4746:19:eq 475:15:ne 4787:11:isnot 4882:56:eq 4900:20:eq 5098:15:is 5105:19:is 5113:48:eq 5122:11:is 5127:11:eq 5129:13:eq 5138:11:is 5229:15:isnot 5237:51:ne 52:7:eq 5365:19:ne 5645:15:eq 5962:30:eq 5963:29:ne 5965:16:ne 6090:11:eq 6102:11:is 6106:11:is 6106:32:ne 6110:15:isnot 6110:36:eq 6162:31:ne 6169:11:eq 6171:13:eq 6184:15:is 6260:19:isnot 6271:37:eq 6295:48:eq 6346:20:isnot 6379:19:eq 6399:12:is 6403:15:ne 6403:57:eq 6436:16:eq 6493:15:is 6495:15:is 6497:15:is 6507:30:eq 6510:15:eq 6581:22:isnot 6582:16:eq 6603:15:eq 6721:44:eq 6731:33:eq 6739:34:is 6774:42:isnot 6891:11:eq 6894:11:eq 6898:11:eq 6934:19:eq 6934:56:eq 6941:17:eq 6944:19:is 6948:17:eq 6973:19:eq 6973:54:eq 7019:19:eq 7021:13:eq 7030:13:eq 7044:19:isnot 7053:15:eq 7064:15:isnot 7085:16:eq 7098:23:eq 7138:11:eq 7192:16:isnot 7207:16:eq 7207:51:eq 7216:11:is 7245:15:is 7260:15:is 7264:19:is 7272:48:eq 7281:11:is 7286:11:eq 7288:13:eq 7290:13:eq 72:32:is 7309:35:ne 7420:47:eq 7481:37:eq 7508:15:eq 7538:57:eq 7620:20:eq 7631:11:ne 7666:15:is 7704:19:eq 7851:16:isnot 7962:19:eq 8022:33:isnot 8199:16:ne 8317:12:eq 8327:16:eq 8376:24:isnot 8382:12:eq 8384:16:eq 8390:57:eq 8393:11:eq 8395:13:eq 8399:11:eq 8483:45:eq 8554:11:ne 8590:38:eq 8694:16:eq 9019:27:eq 9039:11:eq 9057:11:eq 9067:11:is 9112:34:isnot 9261:21:eq 9358:34:isnot 9364:15:isnot 9397:16:eq 9400:19:eq 9445:22:eq 9683:15:is 9683:47:is 9747:23:ne 9753:11:eq 9771:16:eq 9785:48:eq
+sqlglot/parsers/athena.py	71:26:eq 82:26:eq
+sqlglot/parsers/bigquery.py	133:15:eq 141:19:is 150:7:eq 152:7:eq 179:7:ne 28:37:eq 337:70:ne 380:64:ne 406:11:is 439:19:eq 476:19:eq 484:19:eq 58:7:eq 604:11:is 60:7:eq 69:11:eq
+sqlglot/parsers/clickhouse.py	40:7:eq 410:14:is 412:45:ne 429:70:ne 445:70:ne 452:76:ne 458:11:ne 467:70:ne 47:7:eq 575:47:isnot 64:11:eq 72:35:eq 80:42:eq 835:15:isnot
+sqlglot/parsers/databricks.py	73:20:eq 77:22:eq
+sqlglot/parsers/doris.py	57:65:ne 61:67:ne 79:11:eq
+sqlglot/parsers/dremio.py	39:11:eq
+sqlglot/parsers/duckdb.py	142:65:ne 237:48:eq 274:70:ne 298:23:eq 381:11:eq 406:11:eq 42:7:is 435:16:eq 524:11:eq 80:11:eq 93:7:eq
+sqlglot/parsers/hive.py	144:69:ne 171:40:eq
+sqlglot/parsers/mysql.py	29:11:eq 359:11:eq 449:11:is 456:15:is 500:16:eq 510:43:is 606:15:is 629:11:eq 680:15:eq 682:17:eq 782:12:eq 803:30:eq
+sqlglot/parsers/oracle.py	176:11:is 203:24:isnot 208:19:is 240:19:eq 272:47:ne 30:7:eq 327:11:eq 97:70:ne
+sqlglot/parsers/postgres.py	125:70:ne 180:15:eq 333:26:eq 50:7:isnot 60:7:eq
+sqlglot/parsers/presto.py	190:83:ne 24:7:eq 31:7:eq 46:7:eq 52:7:eq 69:8:ne
+sqlglot/parsers/prql.py	140:11:eq 157:11:eq
+sqlglot/parsers/redshift.py	25:11:is 39:64:ne
+sqlglot/parsers/snowflake.py	1047:29:ne 1055:11:ne 106:68:is 1115:11:is 124:40:eq 1328:11:eq 1340:15:is 136:11:eq 1442:33:eq 1448:17:eq 245:25:eq 264:19:is 277:7:eq 316:32:is 316:7:is 317:39:isnot 39:7:eq 721:15:eq 726:15:eq 773:69:ne 88:20:isnot 89:27:isnot 93:15:eq 99:28:eq
+sqlglot/parsers/spark.py	31:7:eq 43:7:eq
+sqlglot/parsers/spark2.py	153:11:eq 98:15:eq
+sqlglot/parsers/sqlite.py	18:7:eq 200:11:ne 207:15:eq 20:7:eq 256:15:ne 352:16:isnot 53:7:eq
+sqlglot/parsers/starrocks.py	102:11:is 183:11:is 202:49:eq
+sqlglot/parsers/teradata.py	121:12:eq 122:16:eq 164:19:is 250:22:eq 312:16:eq 316:16:ne 332:16:eq 389:23:is 90:12:eq 91:16:eq 93:16:eq
+sqlglot/parsers/trino.py	243:26:eq 36:15:eq
+sqlglot/parsers/tsql.py	170:15:eq 181:7:is 288:7:eq 303:7:eq 475:48:ne 627:19:eq 695:11:eq 698:11:eq 746:26:eq 780:16:eq 876:11:isnot
+sqlglot/planner.py	102:11:isnot 120:11:isnot 168:11:isnot 173:11:isnot 17:53:isnot 180:15:isnot 232:11:isnot 233:15:isnot 240:15:isnot 281:11:isnot 286:11:isnot
+sqlglot/schema.py	208:11:eq 211:11:eq 214:15:eq 252:11:is 320:48:is 330:23:is 331:28:is 359:11:is 403:46:ne 441:11:is 494:11:is 601:38:is 626:38:is 638:11:isnot 657:38:is 737:7:is 758:38:is 761:11:eq 787:11:is 818:7:eq
+sqlglot/serde.py	36:11:isnot 38:11:isnot 48:15:ne 53:29:isnot 57:15:isnot 61:23:is 64:25:isnot 66:13:is
+sqlglot/time.py	42:11:eq 54:13:eq 59:11:ne
+sqlglot/tokenizer_core.py	1006:17:eq 1008:36:eq 1013:46:eq 1026:24:eq 1032:16:eq 1113:15:eq 1115:17:eq 1117:17:eq 1120:19:eq 1150:19:eq 1155:26:eq 1190:31:eq 1250:58:eq 1321:41:is 1330:11:eq 1336:16:ne 1338:45:ne 1340:69:eq 1359:50:eq 1377:19:isnot 1400:32:eq 1401:35:eq 1408:49:eq 529:30:is 532:15:ne 537:15:eq 716:19:eq 716:34:eq 734:35:eq 741:11:eq 752:11:eq 752:27:eq 754:20:eq 754:37:eq 793:30:eq 812:11:is 832:16:ne 833:17:eq 860:19:is 953:20:ne 954:58:ne 969:11:eq 977:11:eq
+sqlglot/tokens.py	103:72:ne
+sqlglot/transforms.py	1008:51:is 1023:42:ne 1062:46:isnot 1077:19:isnot 1132:50:eq 371:19:is 449:28:is 451:29:is 54:15:is 582:23:ne 599:19:ne 698:11:eq 743:11:is 80:19:ne 833:47:isnot
+sqlglot/trie.py	32:17:is
+sqlglot/typing/__init__.py	353:48:isnot
+sqlglot/typing/bigquery.py	149:48:eq 164:7:eq 182:19:eq 186:25:eq 209:17:eq 218:15:eq
+sqlglot/typing/mysql.py	60:11:isnot
+sqlglot/typing/snowflake.py	101:12:eq 178:25:eq 71:7:eq
+sqlglot/typing/spark2.py	35:8:isnot

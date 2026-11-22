@@ -1,2 +1,6 @@
+output.jsonl
 __pycache__/
-*.pyc
+output.native.jsonl
+cpu.log
+.claude/
+rows.pkl
