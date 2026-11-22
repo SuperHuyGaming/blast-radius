@@ -52,7 +52,8 @@ RUN STDLIB=$(python -c "import sysconfig; print(sysconfig.get_path('stdlib'))") 
 # CPU settings for the run (see the selector notes): a fixed hash seed (the saved base state of
 # the import fingerprint depends on it) and mimalloc with transparent huge pages (cheaper fork,
 # exit and page faults; no effect where the host has THP off).
-ENV PYTHONHASHSEED=0 \
+ENV BR_SHORT_RERUN=0 \
+    PYTHONHASHSEED=0 \
     PYTHONMALLOC=mimalloc \
     MIMALLOC_LARGE_OS_PAGES=1 \
     MIMALLOC_RESERVE_OS_MEMORY=256MiB \
