@@ -359,18 +359,37 @@ def changed_functions(old_text, new_text, firsts=None):
     except (SyntaxError, ValueError, RecursionError):
         return None
     a, b = old_text.split("\n"), new_text.split("\n")
+    len_a = len(a)
+    len_b = len(b)
+    prefix = 0
+    min_len = min(len_a, len_b)
+    while prefix < min_len and a[prefix] == b[prefix]:
+        prefix += 1
+
+    suffix = 0
+    max_suffix = min_len - prefix
+    while suffix < max_suffix and a[len_a - 1 - suffix] == b[len_b - 1 - suffix]:
+        suffix += 1
+
+    a_mid = a[prefix : len_a - suffix]
+    b_mid = b[prefix : len_b - suffix]
     out = {}
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    if not a_mid and not b_mid:
+        return out
+
+    sm = difflib.SequenceMatcher(None, a_mid, b_mid, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             continue
-        for line in b[j1:j2]:
+        for line in b_mid[j1:j2]:
             code = line.split("#", 1)[0]
             if _IDENTITY.search(code):
                 return None
         # 1-based spans; an insertion or deletion counts its neighbour lines too
-        olo, ohi = (i1 + 1, i2) if i2 > i1 else (i1, i1 + 1)
-        nlo, nhi = (j1 + 1, j2) if j2 > j1 else (j1, j1 + 1)
+        act_i1, act_i2 = prefix + i1, prefix + i2
+        act_j1, act_j2 = prefix + j1, prefix + j2
+        olo, ohi = (act_i1 + 1, act_i2) if act_i2 > act_i1 else (act_i1, act_i1 + 1)
+        nlo, nhi = (act_j1 + 1, act_j2) if act_j2 > act_j1 else (act_j1, act_j1 + 1)
         fo, fn = _innermost(old_funcs, olo, ohi), _innermost(new_funcs, nlo, nhi)
         if fo is None or fn is None or fo[2] != fn[2]:
             return None

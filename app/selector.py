@@ -7,8 +7,10 @@ that fail. Logs go to stderr; only the answers go to stdout.
 from __future__ import annotations
 
 import collections
+import decimal
 import gc
 import json
+import logging
 import marshal
 import os
 import re
@@ -79,7 +81,19 @@ ITERS_ON = os.environ.get("BR_ITERS", "1") != "0"  # loop-iteration parts (iterr
 ITERS_WHOLE = os.environ.get("BR_ITERS_WHOLE") == "1"
 MAPS_OBJ = None
 ANSWER_FD = None
+DEVNULL_FD = None
 BASE_STATE = None
+_ROOT_CACHE = {}
+
+
+def _read_root_file(rel_path, newline=None):
+    key = (rel_path, newline)
+    res = _ROOT_CACHE.get(key)
+    if res is None:
+        with open(os.path.join(ROOT, rel_path), encoding="utf-8", newline=newline) as f:
+            res = f.read()
+        _ROOT_CACHE[key] = res
+    return res
 SMALL_PLAN = float(os.environ.get("BR_SMALL_PLAN", "0.2"))  # CPU s; see small_plan in run()
 BASE_FUNCTION_KEYS = frozenset()
 BASE_OBJECTS = {}  # statefp key -> the pinned table (dict, set, frozenset) that it held at the snapshot
@@ -223,7 +237,8 @@ class Maps:
         with open(os.path.join(path, "sets.idx"), "rb") as f:
             self.offsets = array("I")
             self.offsets.frombytes(f.read())
-        self.sets_file = open(os.path.join(path, "sets.bin"), "rb")
+        with open(os.path.join(path, "sets.bin"), "rb") as f:
+            self.sets_data = f.read()
         self.file_cache = {}
         self.set_cache = {}
         self.unit_cache = {}
@@ -396,9 +411,8 @@ class Maps:
         s = self.set_cache.get(set_id)
         if s is None:
             a, b = self.offsets[set_id], self.offsets[set_id + 1]
-            self.sets_file.seek(a)
             arr = array("H")
-            arr.frombytes(self.sets_file.read(b - a))
+            arr.frombytes(self.sets_data[a:b])
             s = self.set_cache[set_id] = arr
         return s
 
@@ -408,7 +422,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "class_broken")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "class_broken", "py_files", "has_foreign_files")
 
     def __init__(self, commit):
         self.commit = commit
@@ -416,6 +430,8 @@ class Plan:
         self.cands = set()  # tests that can be affected
         self.work = []  # (abs path, [(old code, new code)]) for in-memory replacement
         self.files = {}  # repo-relative path -> new text (None = deleted)
+        self.py_files = None
+        self.has_foreign_files = None
         self.note = []
         self.all_fail = False
         self.blind = set()  # tests selected without a run when the commit is not clean
@@ -496,10 +512,27 @@ def _line_groups(old_text, new_text):
     import difflib
 
     a, b = old_text.split("\n"), new_text.split("\n")
+    len_a = len(a)
+    len_b = len(b)
+    prefix = 0
+    min_len = min(len_a, len_b)
+    while prefix < min_len and a[prefix] == b[prefix]:
+        prefix += 1
+
+    suffix = 0
+    max_suffix = min_len - prefix
+    while suffix < max_suffix and a[len_a - 1 - suffix] == b[len_b - 1 - suffix]:
+        suffix += 1
+
+    a_mid = a[prefix : len_a - suffix]
+    b_mid = b[prefix : len_b - suffix]
+    if not a_mid and not b_mid:
+        return []
+
     out = []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a_mid, b_mid, autojunk=False).get_opcodes():
         if tag != "equal":
-            out.append([i1 + 1, i2 - i1, j1 + 1, j2 - j1, a[i1:i2], b[j1:j2]])
+            out.append([prefix + i1 + 1, i2 - i1, prefix + j1 + 1, j2 - j1, a_mid[i1:i2], b_mid[j1:j2]])
     return out
 
 
@@ -1449,8 +1482,7 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
         old_text = None
         if fp.status in ("modify", "delete", "rename", "copy"):
             try:
-                with open(os.path.join(ROOT, fp.old_path), encoding="utf-8", newline="") as f:
-                    old_text = f.read()
+                old_text = _read_root_file(fp.old_path, newline="")
             except (OSError, UnicodeDecodeError):
                 fp.ok = False
         if fp.status in ("add", "rename", "copy") and os.path.lexists(os.path.join(ROOT, path)):
@@ -1613,6 +1645,11 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
         plan.mode = "hot"
     elif plan.blind:
         plan.mode = "blind"
+    plan.py_files = {p: t for p, t in plan.files.items() if p.endswith(".py")}
+    plan.has_foreign_files = any(
+        not (p.startswith("sqlglot/") or (p.startswith("tests/fixtures/") and p.endswith(".sql")))
+        for p in plan.files
+    )
     return plan
 
 
@@ -1829,8 +1866,7 @@ def cone_plan(plan: Plan) -> bool:
             class_work.append((kl[0], kl[1], text, kl[2], kl[3]))
             continue
         try:
-            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
-                old = f.read()
+            old = _read_root_file(rel)
             if cone.import_lines(old) != cone.import_lines(text):
                 return False
         except (OSError, SyntaxError, ValueError):
@@ -1911,8 +1947,7 @@ def add_registry_candidates(plan: Plan, fps, maps: Maps):
         if fp.old_path != "sqlglot/dialects/dialect.py" or fp.status != "modify":
             continue
         try:
-            with open(os.path.join(ROOT, fp.old_path), encoding="utf-8") as f:
-                spans = _registry_spans(f.read())
+            spans = _registry_spans(_read_root_file(fp.old_path))
         except (OSError, SyntaxError, ValueError):
             return
         hit = False
@@ -2141,8 +2176,7 @@ def _reduction_inputs(maps: Maps, tests, n, keep_stmts, scaled, it, lines_cache,
             return None
     lines = lines_cache.get(rel)
     if lines is None:
-        with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
-            lines = lines_cache[rel] = f.read().split("\n")
+        lines = lines_cache[rel] = _read_root_file(rel).split("\n")
     full = os.path.join(ROOT, rel)
     pinned = pinned_code(full, meth, shape[0]) if n in faithful else None
     got = reduce.reduction_codes(test_id, full, shape, lines, frec[1], frec[2], keep_stmts, scaled, pinned, it)
@@ -2237,8 +2271,7 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
                     continue
             lines = lines_cache.get(rel)
             if lines is None:
-                with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
-                    lines = lines_cache[rel] = f.read().split("\n")
+                lines = lines_cache[rel] = _read_root_file(rel).split("\n")
             try:
                 cls = getattr(importlib.import_module(rel[:-3].replace("/", ".")), cls_name)
             except Exception:  # noqa: BLE001
@@ -2282,9 +2315,6 @@ def _environ_copy():
 
 def _interpreter_settings():
     """Interpreter-wide settings that a test run should leave as it found them."""
-    import decimal
-    import logging
-
     root = logging.getLogger()
     return (
         sys.getrecursionlimit(), sys.getswitchinterval(), os.getcwd(), len(sys.path), sys.path[:3],
@@ -2509,8 +2539,7 @@ def memo_dirty(plan, record=None):
             return None
         old = {}
         for p in plan.files:
-            with open(os.path.join(ROOT, p), encoding="utf-8", newline="") as f:
-                old[p] = f.read()
+            old[p] = _read_root_file(p, newline="")
         return memo.prepare(store, plan.files, old, record)
     except Exception:  # noqa: BLE001
         return None
@@ -2793,10 +2822,12 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         CPU_GUARD.update(plan.guard)
         if ANSWER_FD is not None:
             os.close(ANSWER_FD)
-        devnull = os.open(os.devnull, os.O_WRONLY)
+        devnull = DEVNULL_FD if DEVNULL_FD is not None else os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         if not DEBUG:
             os.dup2(devnull, 2)
+        if DEVNULL_FD is None:
+            os.close(devnull)
         if DEBUG:
             import faulthandler
 
@@ -2807,13 +2838,17 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             faulthandler.dump_traceback_later(float(os.environ["BR_FAULT"]), file=sys.stderr)
         t_child = time.process_time()
         duckreplay = sys.modules.get("duckreplay")
-        if duckreplay is not None and duckreplay.ACTIVE and not duckreplay.patch_ok(plan.files):
+        has_foreign = plan.has_foreign_files
+        if has_foreign is None:
+            has_foreign = any(not (p.startswith("sqlglot/") or (p.startswith("tests/fixtures/") and p.endswith(".sql"))) for p in plan.files)
+        if duckreplay is not None and duckreplay.ACTIVE and has_foreign:
             # the patch changes test code or data: the recorded DuckDB answers are not valid
             # for it, so every query of this child runs on a real connection
             duckreplay.disable()
-        py_files = {p: t for p, t in plan.files.items() if p.endswith(".py")}
-        if any(not (p.startswith("sqlglot/") or (p.startswith("tests/fixtures/") and p.endswith(".sql")))
-               for p in plan.files):
+        py_files = plan.py_files
+        if py_files is None:
+            py_files = {p: t for p, t in plan.files.items() if p.endswith(".py")}
+        if has_foreign:
             # the commit changes test code or data: no on-demand table dicts (preload._LazyTables)
             import preload as _preload
 
@@ -3748,8 +3783,7 @@ def _changes_def_header(plan: Plan):
     constant written over several lines) run only at import."""
     for path, lines in plan.def_units.items():
         try:
-            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
-                src = f.read().split("\n")
+            src = _read_root_file(path).split("\n")
         except OSError:
             return True
         for ln in lines:
@@ -4158,6 +4192,11 @@ def release_pin_if_slow():
 
 def main():
     pin_to_one_cpu()
+    global DEVNULL_FD
+    try:
+        DEVNULL_FD = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        DEVNULL_FD = None
     t_start = time.monotonic()
     deadline = t_start + WALL_LIMIT
     # Only the answers may reach stdout. Everything else that writes to fd 1 goes to stderr.
@@ -4331,17 +4370,24 @@ def run(t_start, deadline, state):
     all_tests = list(range(len(tests)))
 
     plans = {}
-    for c in commits:
-        try:
-            with open(os.path.join(DATA, "commits", c + ".patch"), encoding="utf-8", errors="surrogateescape") as f:
-                text = f.read()
-            release_pin_if_slow()
-            plans[c] = make_plan(c, text, maps)
-            plans[c].keeps = compute_keeps(plans[c], maps, tests)
-        except Exception as e:  # noqa: BLE001
-            log(c, "plan failed", repr(e))
-            p = plans[c] = Plan(c)
-            p.mode = "all"
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        for c in commits:
+            try:
+                with open(os.path.join(DATA, "commits", c + ".patch"), encoding="utf-8", errors="surrogateescape") as f:
+                    text = f.read()
+                release_pin_if_slow()
+                plans[c] = make_plan(c, text, maps)
+                plans[c].keeps = compute_keeps(plans[c], maps, tests)
+            except Exception as e:  # noqa: BLE001
+                log(c, "plan failed", repr(e))
+                p = plans[c] = Plan(c)
+                p.mode = "all"
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     log("planned", len(plans), "in", round(time.monotonic() - t_start, 3))
 
     if os.environ.get("BR_PLAN_ONLY"):
@@ -4355,6 +4401,8 @@ def run(t_start, deadline, state):
     import preload
 
     preload.install_environment(ROOT)
+    if hasattr(gc, "freeze"):
+        gc.freeze()
     answers = state["answers"]
     debug_rows = {}
     tests_of_file = {}
@@ -4582,8 +4630,7 @@ def run(t_start, deadline, state):
         known = settings_files.get(rel)
         if known is None:
             try:
-                with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
-                    text = f.read()
+                text = _read_root_file(rel)
                 known = any(word in text for word in SETTINGS_WORDS)
             except (OSError, UnicodeDecodeError):
                 known = True
