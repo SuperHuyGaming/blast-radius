@@ -2237,7 +2237,11 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
             test_id, rel, cls_name, meth, old, new, keep_files, keep_tasks, it = item
             if old is not None:
                 try:
-                    cls = getattr(importlib.import_module(rel[:-3].replace("/", ".")), cls_name)
+                    mod_name = rel[:-3].replace("/", ".")
+                    mod = sys.modules.get(mod_name)
+                    if mod is None:
+                        mod = importlib.import_module(mod_name)
+                    cls = getattr(mod, cls_name)
                 except Exception:  # noqa: BLE001
                     continue
                 if not reduce.install_reduction(cls, meth, old, new):
@@ -4365,6 +4369,7 @@ def run(t_start, deadline, state):
         CONE_MAP = None
     tests = align_tests(tests, maps.meta["test_ids"], state)
     seconds = [t["seconds"] for t in tests]
+    test_classes = [t["id"].rsplit("::", 1)[0] for t in tests]
     state["tests"] = tests
     REGISTRY_CLEAR_AT = registry_clear_at([t["id"] for t in tests])
     all_tests = list(range(len(tests)))
@@ -4425,7 +4430,7 @@ def run(t_start, deadline, state):
         """The long held tests that the tests in evidence (failing tests) select: those of the
         same test class or the same .sql fixture file, or all of them with many failures.
         more: failing tests that may exist unseen (see marginal_holds)."""
-        class_of = lambda n: tests[n]["id"].rsplit("::", 1)[0]
+        class_of = lambda n: test_classes[n]
         fail_classes = {class_of(n) for n in evidence}
         fail_fixtures = set()
         for n in evidence:
@@ -4588,13 +4593,13 @@ def run(t_start, deadline, state):
             budget = float("inf")
         # the verdicts of these tests decide about the long held tests: they run first
         long_held = [n for n in held if seconds[n] > QUIET_HOLD_SECONDS]
-        protect_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in long_held}
+        protect_classes = {test_classes[n] for n in long_held}
         protect_fixtures = set()
         for n in long_held:
             protect_fixtures.update(fixtures_of(n))
         plan.protect = {
             n for n in ran
-            if tests[n]["id"].rsplit("::", 1)[0] in protect_classes
+            if test_classes[n] in protect_classes
             or (protect_fixtures and protect_fixtures & fixtures_of(n) and cost[n] <= 2.0)
         }
         if sum(cost[n] for n in ran) > budget:
@@ -4797,10 +4802,10 @@ def run(t_start, deadline, state):
             left_cost = sum(cost[n] for n in ran)
             for n in ran:
                 left_cost -= cost[n]
-                n_class, n_fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
+                n_class, n_fixtures = test_classes[n], fixtures_of(n)
                 decides = {
                     t for t in long_held
-                    if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & fixtures_of(t)
+                    if test_classes[t] == n_class or n_fixtures & fixtures_of(t)
                 }
                 if decides:
                     plan.enders[n] = (decides, left_cost > WORKER_COST)

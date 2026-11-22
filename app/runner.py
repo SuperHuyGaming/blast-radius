@@ -93,6 +93,7 @@ class Verdicts(unittest.TestResult):
 _FAILED_IMPORTS = {}
 ON_IMPORT = {}  # module name -> function called once with the module after its first load here
 _PARSED_TEST_IDS = {}
+_CLASS_CACHE = {}
 
 
 def load_case(test_id: str, number: int):
@@ -119,7 +120,12 @@ def load_case(test_id: str, number: int):
         hook = ON_IMPORT.pop(name, None)
         if hook is not None:
             hook(mod)
-    case = getattr(mod, cls_name)(meth)
+    cls_key = (id(mod), cls_name)
+    cls = _CLASS_CACHE.get(cls_key)
+    if cls is None:
+        cls = getattr(mod, cls_name)
+        _CLASS_CACHE[cls_key] = cls
+    case = cls(meth)
     case._br_number = number
     return case
 
@@ -130,13 +136,20 @@ def _skip_when_failed(case, result_box, after_any_failure):
     name = case._testMethodName
     real = getattr(case, name)
 
-    @functools.wraps(real)  # keeps unittest's skip and expected-failure marks
     def method(*args, **kwargs):
         result = result_box[0]
         if result is not None and (result.skip_rest or (after_any_failure and result.any_failed)):
             case._br_skipped = True
             raise unittest.SkipTest("not needed after a failure")
         return real(*args, **kwargs)
+
+    method.__name__ = real.__name__
+    method.__doc__ = real.__doc__
+    if hasattr(real, "__unittest_skip__"):
+        method.__unittest_skip__ = real.__unittest_skip__
+        method.__unittest_skip_why__ = getattr(real, "__unittest_skip_why__", "")
+    if hasattr(real, "__unittest_expecting_failure__"):
+        method.__unittest_expecting_failure__ = real.__unittest_expecting_failure__
 
     setattr(case, name, method)
 

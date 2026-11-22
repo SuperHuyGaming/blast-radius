@@ -1,7 +1,11 @@
 """Core mechanics: patch parsing, in-memory code replacement, fresh import, direct test runs."""
 from __future__ import annotations
 
+import builtins
+import contextlib
 import gc
+import importlib.util
+import io
 import marshal
 import os
 import re
@@ -538,8 +542,6 @@ class OverlayFinder:
         self.files = files  # repo-relative path -> new text, or None when deleted
 
     def find_spec(self, name, path=None, target=None):
-        import importlib.util
-
         top = name.partition(".")[0]
         if top not in ("sqlglot", "tests"):
             return None
@@ -633,10 +635,6 @@ def install_overlay(root: str, files: dict):
 def install_open_overlay(root: str, files: dict):
     """Makes open() see the patched files. Returns a context manager factory that
     shows the pinned files again for a moment."""
-    import builtins
-    import contextlib
-    import io
-
     table = {os.path.join(root, rel): text for rel, text in files.items()}
     real_open = builtins.open
     active = [True]
