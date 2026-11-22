@@ -2300,8 +2300,37 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
 # Children
 
 
+_INITIAL_CWD = None
+_CHDIR_TRACKED = False
+_REAL_CHDIR = os.chdir
+
+
+def _install_chdir_tracker():
+    global _INITIAL_CWD, _CHDIR_TRACKED
+    if _INITIAL_CWD is None:
+        _INITIAL_CWD = os.getcwd()
+    if not _CHDIR_TRACKED:
+        def _tracked_chdir(path):
+            global _INITIAL_CWD
+            res = _REAL_CHDIR(path)
+            _INITIAL_CWD = os.getcwd()
+            return res
+
+        os.chdir = _tracked_chdir
+        _CHDIR_TRACKED = True
+
+
+_DEFAULT_TRAPS = ('DivisionByZero', 'InvalidOperation', 'Overflow')
+
+
 def _decimal_settings(c):
-    return (c.prec, c.rounding, c.Emin, c.Emax, c.capitals, c.clamp, tuple(sorted(k.__name__ for k, v in c.traps.items() if v)))
+    traps = c.traps
+    if (traps.get(decimal.InvalidOperation) and traps.get(decimal.DivisionByZero)
+            and traps.get(decimal.Overflow) and sum(traps.values()) == 3):
+        t_val = _DEFAULT_TRAPS
+    else:
+        t_val = tuple(sorted(k.__name__ for k, v in traps.items() if v))
+    return (c.prec, c.rounding, c.Emin, c.Emax, c.capitals, c.clamp, t_val)
 
 
 def _environ_copy():
@@ -2315,11 +2344,11 @@ def _environ_copy():
 
 def _interpreter_settings():
     """Interpreter-wide settings that a test run should leave as it found them."""
-    root = logging.getLogger()
+    root = logging.root
     return (
-        sys.getrecursionlimit(), sys.getswitchinterval(), os.getcwd(), len(sys.path), sys.path[:3],
+        sys.getrecursionlimit(), sys.getswitchinterval(), _INITIAL_CWD or os.getcwd(), len(sys.path), sys.path[:3],
         _environ_copy(), _decimal_settings(decimal.getcontext()), gc.get_threshold(),
-        root.level, len(root.handlers), logging.root.manager.disable, sys.stdout is sys.__stdout__,
+        root.level, len(root.handlers), root.manager.disable, sys.stdout is sys.__stdout__,
         sys.stderr is sys.__stderr__, sys.excepthook, sys.gettrace() is None,
     )
 
@@ -3542,6 +3571,17 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     import-time values differ from the pinned tree; on_diff(names) then decides what to run."""
     if plan.mode == "hot" and PRE_KEEPS and (plan.pre_keeps is None or plan.pre_keeps[0] is not plan.keeps):
         prepare_keeps(plan, MAPS_OBJ, tests)
+    if plan.mode != "hot" and plan.py_files:
+        for rel, text in plan.py_files.items():
+            if text is not None:
+                full = os.path.join(ROOT, rel)
+                key = (full, text)
+                if key not in engine._PATCHED_CODE_CACHE:
+                    try:
+                        c = compile(text.encode("utf-8", "surrogateescape"), full, "exec", dont_inherit=True)
+                        engine._PATCHED_CODE_CACHE[key] = marshal.loads(marshal.dumps(c))
+                    except Exception:
+                        pass
     r, w = os.pipe()
     plan_r = plan_w = None
     if on_diff is not None:
@@ -4192,6 +4232,7 @@ def release_pin_if_slow():
 
 def main():
     pin_to_one_cpu()
+    _install_chdir_tracker()
     global DEVNULL_FD
     try:
         DEVNULL_FD = os.open(os.devnull, os.O_WRONLY)

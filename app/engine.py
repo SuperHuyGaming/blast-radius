@@ -1,7 +1,11 @@
 """Core mechanics: patch parsing, in-memory code replacement, fresh import, direct test runs."""
 from __future__ import annotations
 
+import builtins
+import contextlib
 import gc
+import importlib.util
+import io
 import marshal
 import os
 import re
@@ -538,8 +542,6 @@ class OverlayFinder:
         self.files = files  # repo-relative path -> new text, or None when deleted
 
     def find_spec(self, name, path=None, target=None):
-        import importlib.util
-
         top = name.partition(".")[0]
         if top not in ("sqlglot", "tests"):
             return None
@@ -571,6 +573,9 @@ class OverlayFinder:
 KEEP_CODE = False
 
 
+_PATCHED_CODE_CACHE = {}
+
+
 class _MemLoader:
     def __init__(self, path, text):
         self.path = path
@@ -581,18 +586,24 @@ class _MemLoader:
         return None
 
     def exec_module(self, module):
-        # Python compiles a source file from its bytes: the coding declaration of line 1 or 2
-        # (PEP 263) decides how they decode, a byte order mark is dropped, and an unknown or
-        # wrong encoding is a SyntaxError at import. The patch was read as UTF-8 with
-        # surrogateescape, so this gives back the exact bytes of the patched file.
-        code = compile(self.text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
-        # Built the way a code object from a .pyc is (the pinned modules come from pycs): a
-        # frozenset constant that marshal loads iterates in another order than the one that
-        # compile() made, and a table built by iterating it (parsers/clickhouse.py
-        # _AGG_FUNC_MAPPING) would then differ from the pinned table in its order alone.
-        code = marshal.loads(marshal.dumps(code))
-        if KEEP_CODE:
-            self.code = code
+        code = self.code
+        if code is None:
+            key = (self.path, self.text)
+            code = _PATCHED_CODE_CACHE.get(key)
+            if code is None:
+                # Python compiles a source file from its bytes: the coding declaration of line 1 or 2
+                # (PEP 263) decides how they decode, a byte order mark is dropped, and an unknown or
+                # wrong encoding is a SyntaxError at import. The patch was read as UTF-8 with
+                # surrogateescape, so this gives back the exact bytes of the patched file.
+                code = compile(self.text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
+                # Built the way a code object from a .pyc is (the pinned modules come from pycs): a
+                # frozenset constant that marshal loads iterates in another order than the one that
+                # compile() made, and a table built by iterating it (parsers/clickhouse.py
+                # _AGG_FUNC_MAPPING) would then differ from the pinned table in its order alone.
+                code = marshal.loads(marshal.dumps(code))
+                _PATCHED_CODE_CACHE[key] = code
+            if KEEP_CODE:
+                self.code = code
         exec(code, module.__dict__)
 
     def get_source(self, name):
@@ -633,20 +644,30 @@ def install_overlay(root: str, files: dict):
 def install_open_overlay(root: str, files: dict):
     """Makes open() see the patched files. Returns a context manager factory that
     shows the pinned files again for a moment."""
-    import builtins
-    import contextlib
-    import io
-
     table = {os.path.join(root, rel): text for rel, text in files.items()}
     real_open = builtins.open
     active = [True]
 
     def patched_open(file, mode="r", *args, **kwargs):
-        try:
-            key = os.path.abspath(os.fspath(file)) if isinstance(file, (str, os.PathLike)) else None
-        except TypeError:
+        if not active[0]:
+            return real_open(file, mode, *args, **kwargs)
+        if isinstance(file, str):
+            if file in table:
+                key = file
+            elif not file.startswith("/"):
+                cand = os.path.join(root, file)
+                key = cand if cand in table else os.path.abspath(file)
+            else:
+                key = file
+        elif isinstance(file, os.PathLike):
+            try:
+                f = os.fspath(file)
+                key = f if f in table else os.path.abspath(f)
+            except TypeError:
+                key = None
+        else:
             key = None
-        if active[0] and key is not None and key in table:
+        if key is not None and key in table:
             text = table[key]
             if text is None:
                 raise FileNotFoundError(2, "No such file or directory", str(file))
