@@ -1207,6 +1207,10 @@ def record_import_time():
     return stop
 
 
+class TestTimeout(BaseException):
+    pass
+
+
 def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     """Run the runnable candidates in a forked child with the patch active; keep the failing ones."""
     must_keep, runnable = set(), []
@@ -1312,11 +1316,7 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             concurrent.futures.ProcessPoolExecutor = InlineSynchronousPool
 
             def timeout_handler(signum, frame):
-                try:
-                    os.write(w_fd, json.dumps(sorted(n for n, *_ in runnable)).encode("utf-8"))
-                except Exception:
-                    pass
-                os._exit(0)
+                raise TestTimeout("alarm timeout")
 
             signal.signal(signal.SIGALRM, timeout_handler)
 
@@ -1329,7 +1329,7 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
                 for num, cls_obj, method_name, tid in runnable:
                     grouped.setdefault(cls_obj, []).append((num, method_name, tid))
             else:  # mode == "import"
-                signal.alarm(3)
+                signal.alarm(4)
                 try:
                     for k in list(sys.modules.keys()):
                         if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
@@ -1345,21 +1345,22 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
                     signal.alarm(0)
 
                 grouped = {}
-                for num, _cls_obj, method_name, tid in runnable:
-                    file_part, cls_part, _ = tid.split("::")
-                    mod_name = file_part[:-3].replace("/", ".")
-                    signal.alarm(2)
-                    try:
-                        test_mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
-                        if hasattr(test_mod, "ProcessPoolExecutor"):
-                            test_mod.ProcessPoolExecutor = InlineSynchronousPool
-                        fresh_cls = getattr(test_mod, cls_part)
-                        grouped.setdefault(fresh_cls, []).append((num, method_name, tid))
-                    except BaseException as e:
-                        log(f"child test import error {tid}: {e!r}")
-                        failing.add(num)
-                    finally:
-                        signal.alarm(0)
+                signal.alarm(6)
+                try:
+                    for num, _cls_obj, method_name, tid in runnable:
+                        file_part, cls_part, _ = tid.split("::")
+                        mod_name = file_part[:-3].replace("/", ".")
+                        try:
+                            test_mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+                            if hasattr(test_mod, "ProcessPoolExecutor"):
+                                test_mod.ProcessPoolExecutor = InlineSynchronousPool
+                            fresh_cls = getattr(test_mod, cls_part)
+                            grouped.setdefault(fresh_cls, []).append((num, method_name, tid))
+                        except BaseException as e:
+                            log(f"child test import error {tid}: {e!r}")
+                            failing.add(num)
+                finally:
+                    signal.alarm(0)
 
             for cls_obj, tlist in grouped.items():
                 suite = unittest.TestSuite([cls_obj(meth) for _, meth, _ in tlist])
@@ -1373,6 +1374,9 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
                         failing.update(n for n, _, _ in tlist)
                     else:  # a skipped test has no verdict: it stays
                         failing.update(n for n, meth, _ in tlist if meth in rec.failed_methods or meth in skipped)
+                except TestTimeout:
+                    failing.update(n for n, *_ in runnable)
+                    break
                 except BaseException:
                     failing.update(n for n, _, _ in tlist)
                 finally:
