@@ -20,13 +20,21 @@ How a test set is chosen, per changed file:
 from __future__ import annotations
 
 import ast
+import builtins
 import gzip
 import io
 import json
 import os
 import re
+import select as sys_select
+import signal
 import sys
 import tokenize
+import types
+import unittest
+import importlib
+import importlib.abc
+import importlib.util
 from pathlib import Path
 
 DATA = Path(os.environ.get("BLAST_DATA", "/data"))
@@ -945,6 +953,297 @@ def best_split(tests):
     return min((pack(tests, k) for k in range(1, MAX_WORKERS + 1)), key=lambda r: r[0])[1]
 
 
+# ---------------------------------------------------------------- in-memory test runner
+
+SKIP_CLASSES = {"TestExecutor"}  # its setUpClass loads the TPC data: too costly to run
+POOLED = set()  # tests that share a class-level process pool: never run here (filled in main)
+HEAVY_TESTS = {
+    "tests/test_parser.py::TestParser::test_max_nodes",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+}
+
+
+class RecordingResult(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.failed_methods = set()
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        tc = getattr(test, "test_case", test)
+        self.failed_methods.add(getattr(tc, "_testMethodName", "<ALL>"))
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        tc = getattr(test, "test_case", test)
+        self.failed_methods.add(getattr(tc, "_testMethodName", "<ALL>"))
+
+    def addSubTest(self, test, subtest, err):
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            tc = getattr(subtest, "test_case", test)
+            self.failed_methods.add(getattr(tc, "_testMethodName", "<ALL>"))
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        tc = getattr(test, "test_case", test)
+        self.failed_methods.add(getattr(tc, "_testMethodName", "<ALL>"))
+
+
+def code_objects(co, out=None):
+    """qualname -> code objects for every function/lambda compiled in a module."""
+    out = {} if out is None else out
+    for c in co.co_consts:
+        if isinstance(c, types.CodeType):
+            out.setdefault(c.co_qualname, []).append(c)
+            code_objects(c, out)
+    return out
+
+
+def _strip(co):
+    """A code object with line information removed, recursively (moved lines compare equal)."""
+    return co.replace(co_linetable=b"", co_firstlineno=1, co_exceptiontable=co.co_exceptiontable,
+                      co_consts=tuple(_strip(c) if isinstance(c, types.CodeType) else c for c in co.co_consts))
+
+
+def same_code(a, b):
+    return _strip(a) == _strip(b)
+
+
+def _shell(co):
+    """The code with nested function bodies blanked: what runs at import time for a module or class body."""
+    consts = []
+    for c in co.co_consts:
+        if isinstance(c, types.CodeType):
+            consts.append(_shell(c) if _is_class_body(c) else ("fn", c.co_qualname))
+        else:
+            consts.append(c)
+    return (co.co_code, tuple(consts), co.co_names, co.co_varnames, co.co_flags)
+
+
+def _is_class_body(co):
+    return co.co_name not in ("<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>") and \
+        "__qualname__" in co.co_names and "__module__" in co.co_names
+
+
+def live_function(mod, qualname):
+    """The function object a module exposes under qualname (attribute chain through classes), else None."""
+    cur = mod
+    parts = qualname.split(".")
+    for p in parts[:-1]:
+        cur = getattr(cur, "__dict__", {}).get(p)
+        if not isinstance(cur, type):
+            return None
+    attr = getattr(cur, "__dict__", {}).get(parts[-1])
+    if isinstance(attr, (staticmethod, classmethod)):
+        attr = attr.__func__
+    return attr if isinstance(attr, types.FunctionType) else None
+
+
+IMPORT_RAN = set()  # (file, first line, qualname) of sqlglot code that started while the parent imported
+
+
+def _pairs(o, n, parent_fn, out):
+    """Walk old/new code trees in step; append (old, new, top function or None) for every function pair.
+
+    Returns False when the trees do not have the same shape (functions added, removed or reordered).
+    """
+    oc = [c for c in o.co_consts if isinstance(c, types.CodeType)]
+    nc = [c for c in n.co_consts if isinstance(c, types.CodeType)]
+    if len(oc) != len(nc):
+        return False
+    for a, b in zip(oc, nc):
+        if a.co_qualname != b.co_qualname:
+            return False
+        top = parent_fn
+        if top is None and not _is_class_body(a):
+            top = (a, b)  # outermost function: the unit we swap
+        out.append((a, b, top))
+        if not _pairs(a, b, top, out):
+            return False
+    return True
+
+
+def plan_swaps(path, old_text, new_text):
+    """[(function, new code)] that makes the live process run new_text, or None when that is not provable.
+
+    Module and class bodies must be unchanged (same import-time code). Each outermost function that
+    contains a change must be live under its qualname (module or class attribute) with exactly the
+    pinned code, have no closure, and never have run while the parent imported. Nested functions and
+    lambdas inside it change with it. Anything else returns None and every candidate stays.
+    """
+    full = str(SRC / path)
+    old_co = compile(old_text, full, "exec", dont_inherit=True)
+    new_co = compile(new_text, full, "exec", dont_inherit=True)
+    if _shell(_strip(old_co)) != _shell(_strip(new_co)):
+        log(f"  no swap {path}: import-time code differs")
+        return None
+    pairs = []
+    if not _pairs(old_co, new_co, None, pairs):
+        log(f"  no swap {path}: functions added, removed or reordered")
+        return None
+    mod_name = path[:-3].replace("/", ".")
+    if mod_name.endswith(".__init__"):
+        mod_name = mod_name[: -len(".__init__")]
+    mod = sys.modules.get(mod_name)
+    if mod is None:
+        log(f"  no swap {path}: module not imported")
+        return None
+    tops = {}
+    for a, b, top in pairs:
+        if top is None:
+            continue  # class body: covered by _shell
+        if a.co_code != b.co_code or a.co_consts != b.co_consts or a.co_linetable != b.co_linetable \
+                or a.co_firstlineno != b.co_firstlineno or a.co_names != b.co_names:
+            tops[id(top[0])] = top
+    swaps = []
+    for o, n in tops.values():
+        q = o.co_qualname
+        if "<" in q:
+            log(f"  no swap {path}: {q} is not a named module/class function")
+            return None
+        fn = live_function(mod, q)
+        # Same free variables (e.g. only __class__ for super()): the new code reads the same cells.
+        if fn is None or not same_code(fn.__code__, o) or n.co_freevars != o.co_freevars:
+            log(f"  no swap {path}: {q} not live as pinned code")
+            return None
+        if not same_code(o, n) and (o.co_filename, o.co_firstlineno, o.co_qualname) in IMPORT_RAN:
+            log(f"  no swap {path}: {q} ran at import")
+            return None
+        swaps.append((fn, n))
+    return swaps
+
+
+def record_import_time():
+    """Record every sqlglot code object that starts while the parent imports (each fires once)."""
+    mon = sys.monitoring
+    tool = 5
+    mon.use_tool_id(tool, "imports")
+    prefix = str(SRC / "sqlglot") + os.sep
+
+    def started(code, offset):
+        if code.co_filename.startswith(prefix):
+            IMPORT_RAN.add((code.co_filename, code.co_firstlineno, code.co_qualname))
+        return mon.DISABLE
+
+    mon.register_callback(tool, mon.events.PY_START, started)
+    mon.set_events(tool, mon.events.PY_START)
+
+    def stop():
+        mon.set_events(tool, 0)
+        mon.register_callback(tool, mon.events.PY_START, None)
+        mon.free_tool_id(tool)
+        mon.restart_events()
+
+    return stop
+
+
+def verify_candidates(cand_nums, patch_text, test_registry, m):
+    """Run the runnable candidates in a forked child with the patch active; keep the failing ones.
+
+    Only when every changed file is an existing sqlglot .py module whose change is confined to
+    swappable function bodies (plan_swaps). Otherwise every candidate stays selected.
+    """
+    must_keep, runnable = set(), []
+    for num in cand_nums:
+        reg = test_registry.get(num)
+        if not reg:
+            must_keep.add(num)
+            continue
+        cls_obj, method_name, tid = reg
+        if cls_obj.__name__ in SKIP_CLASSES or tid in HEAVY_TESTS or tid in POOLED:
+            must_keep.add(num)
+        else:
+            runnable.append((num, cls_obj, method_name, tid))
+    if not runnable:
+        return cand_nums
+    try:
+        swaps = []
+        for f in parse_patch(patch_text):
+            path = f.get("new") or f.get("old") or ""
+            if not f.get("old") or not f.get("new") or f["old"] != f["new"]:
+                return cand_nums  # new, deleted or renamed file
+            if not (path.startswith("sqlglot/") and path.endswith(".py")):
+                return cand_nums  # tests, fixtures, data: not verified here
+            old_text = (SRC / path).read_text(encoding="utf-8")
+            plan = plan_swaps(path, old_text, apply_hunks(old_text, f.get("hunks", [])))
+            if plan is None:
+                return cand_nums
+            swaps.extend(plan)
+    except Exception as e:  # noqa: BLE001
+        log(f"plan error: {e!r}")
+        return cand_nums
+    if not swaps:
+        return cand_nums
+    try:
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+    except Exception as e:  # noqa: BLE001
+        log(f"fork error: {e!r}")
+        return cand_nums
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            for fn, code in swaps:
+                fn.__code__ = code
+            grouped = {}
+            for num, cls_obj, method_name, tid in runnable:
+                grouped.setdefault(cls_obj, []).append((num, method_name, tid))
+            failing = set()
+            for cls_obj, tlist in grouped.items():
+                suite = unittest.TestSuite([cls_obj(meth) for _, meth, _ in tlist])
+                rec = RecordingResult()
+                suite.run(rec)
+                skipped = {getattr(tc, "_testMethodName", "<ALL>") for tc, _ in rec.skipped}
+                if "<ALL>" in rec.failed_methods or "<ALL>" in skipped or rec.testsRun != len(tlist):
+                    failing.update(n for n, _, _ in tlist)
+                else:  # a skipped test has no verdict: it stays
+                    failing.update(n for n, meth, _ in tlist if meth in rec.failed_methods or meth in skipped)
+            os.write(w_fd, json.dumps(sorted(failing)).encode("utf-8"))
+        except BaseException as e:  # noqa: BLE001
+            log(f"child exception: {e!r}")
+            os.write(w_fd, json.dumps(sorted(n for n, *_ in runnable)).encode("utf-8"))
+        finally:
+            os.close(w_fd)
+            os._exit(0)
+    os.close(w_fd)
+    r_list, _, _ = sys_select.select([r_fd], [], [], 20.0)
+    if not r_list:
+        log(f"child timed out; killing pid {pid}")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        os.close(r_fd)
+        os.waitpid(pid, 0)
+        return cand_nums
+    raw = b""
+    while True:
+        chunk = os.read(r_fd, 65536)
+        if not chunk:
+            break
+        raw += chunk
+    os.close(r_fd)
+    _, status = os.waitpid(pid, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 and raw):
+        return cand_nums
+    try:
+        failing = set(json.loads(raw.decode("utf-8")))
+    except Exception:  # noqa: BLE001
+        return cand_nums
+    keep = set(must_keep) | (failing & {n for n, *_ in runnable})
+    # A failing test in a class-level process pool can break the pool for the tests after it.
+    for g in m.pool_groups:
+        nums = sorted(NUMBER[m.tests[i]] for i in g if m.tests[i] in NUMBER)
+        hit = [n for n in nums if n in keep]
+        if hit:
+            keep |= {n for n in nums if n >= hit[0] and n in set(cand_nums)}
+    return sorted(keep)
+
+
+NUMBER = {}
+
+
 def main() -> None:
     if "--import-baseline" in sys.argv:
         # Run at image build time: which sqlglot modules fail to import pristine.
@@ -961,11 +1260,45 @@ def main() -> None:
         log(f"map unavailable ({e!r}); running everything")
         m = None
     all_split = best_split(every)
+
+    # Pre-import sqlglot and test modules into parent memory
+    sys.path.insert(0, str(SRC))
+    NUMBER.update(number)
+    stop_recording = record_import_time()
+    import sqlglot  # noqa: F401
+
+    for py in sorted((SRC / "sqlglot").rglob("*.py")):  # lazily imported modules too, while recording
+        name = ".".join(py.relative_to(SRC).with_suffix("").parts)
+        if name.endswith(".__init__"):
+            name = name[: -len(".__init__")]
+        if name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(name)
+        except BaseException:  # noqa: BLE001
+            pass
+
+    test_registry = {}
+    for t in tests:
+        file_part, cls_part, method_part = t["id"].split("::")
+        mod_name = file_part[:-3].replace("/", ".")
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+            cls_obj = getattr(mod, cls_part)
+            test_registry[t["number"]] = (cls_obj, method_part, t["id"])
+        except Exception:
+            test_registry[t["number"]] = None
+    stop_recording()
+    if m is not None:
+        for g in m.pool_groups:
+            POOLED.update(m.tests[i] for i in g)
+
     for patch in sorted((DATA / "commits").glob("*.patch")):
         chosen = ALL
+        patch_text = patch.read_text(encoding="utf-8", errors="replace")
         if m is not None:
             try:
-                chosen = select(m, patch.read_text(encoding="utf-8", errors="replace"))
+                chosen = select(m, patch_text)
             except Exception as e:  # noqa: BLE001
                 log(f"{patch.stem}: {e!r}")
                 chosen = ALL
@@ -973,9 +1306,15 @@ def main() -> None:
             workers = all_split
             log(f"{patch.stem}: all tests")
         else:
-            nums = sorted({number[m.tests[i]] for i in chosen if m.tests[i] in number})
-            workers = best_split([(n, ms[n]) for n in nums])
-            log(f"{patch.stem}: {len(nums)} tests")
+            cands = sorted({number[m.tests[i]] for i in chosen if m.tests[i] in number})
+            if not cands:
+                workers = []
+                log(f"{patch.stem}: 0 tests")
+            else:
+                verified = verify_candidates(cands, patch_text, test_registry, m)
+                nums = sorted(verified)
+                workers = best_split([(n, ms[n]) for n in nums])
+                log(f"{patch.stem}: {len(nums)} tests (from {len(cands)} cands)")
         print(json.dumps({"commit": patch.stem, "workers": workers}))
 
 

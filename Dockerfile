@@ -10,6 +10,9 @@ RUN mkdir -p /app/src \
       sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa/tests \
  && rm /tmp/sqlglot.tar.gz
 
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+
 COPY selector.py map.json.gz /app/
 RUN python /app/selector.py --import-baseline > /app/import_baseline.json  && cat /app/import_baseline.json && chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]
