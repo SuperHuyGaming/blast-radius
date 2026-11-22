@@ -1,4 +1,10 @@
 .git
-tests_br
+.sqlglot-ref
+.work
+sample
+output.jsonl
 __pycache__
 *.pyc
+.pytest_cache
+.venv
+.DS_Store
