@@ -34,6 +34,25 @@ CO_OPTIMIZED = 0x1
 SMALL = 64 << 10
 BIG = 16 << 20
 STORE_CPU = 0.02  # CPU s of a step whose output is stored whatever its dependents are
+# The step costs come from a fixed file (maps/memo_fixed.bin: per query the step count, the CPU s of
+# every step, the steps whose output is stored for their cost, the optimize() CPU s), recorded once on
+# the pinned commit, so that the store and the costs in memo.bin do not depend on the build machine's
+# speed or load. A query whose step count differs from the file falls back to the measured CPU.
+FIXED = {}
+
+
+def load_fixed(path):
+    try:
+        with open(path, "rb") as f:
+            return marshal.loads(zlib.decompress(f.read()))
+    except Exception as e:  # noqa: BLE001
+        print("memo: no fixed step costs (%s); measured CPU decides" % e, file=sys.stderr)
+        return {}
+
+
+def fixed_of(q, n):
+    fx = FIXED.get(q)
+    return fx if fx is not None and fx.get("n") == n else None
 
 
 def setup(root):
@@ -163,6 +182,8 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
             if keys is None:
                 raise RuntimeError("plan key")
             steps = [None] * len(order)
+            fx = fixed_of(q, len(order))
+            hot = set(fx["store"]) if fx is not None else None
             run = {"keys": keys, "steps": steps, "order": [type(s).__name__ for s in order],
                    "feeds": [any(isinstance(d, (planner.Aggregate, planner.Sort, planner.SetOperation)) for d in s.dependents) for s in order],
                    "root": idx[id(plan.root)]}
@@ -205,7 +226,8 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
                     # (also a step that costs STORE_CPU or more: a step that runs in the stage check,
                     # because it is dirty or follows a step with another output, takes such an
                     # input from here instead of running it)
-                    if len(data) <= SMALL or ((run["feeds"][i] or i == run["root"] or dt >= STORE_CPU) and len(data) <= BIG):
+                    costly = (i in hot) if hot is not None else dt >= STORE_CPU
+                    if len(data) <= SMALL or ((run["feeds"][i] or i == run["root"] or costly) and len(data) <= BIG):
                         blob = data
                         if memo.state_hash(pickle.loads(zlib.decompress(data))) != h:
                             raise RuntimeError("stored output of step %d does not hash back" % i)
@@ -369,6 +391,7 @@ def main():
     root, stages_bin, out_dir = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
     jobs = int(sys.argv[4]) if len(sys.argv) > 4 else 4
     record = stages.load_map(stages_bin)[TEST_ID]
+    FIXED.update(load_fixed(os.path.join(HERE, "maps", "memo_fixed.bin")))
     te, schema, tables, sqls = setup(root)
     import sqlglot.executor.python  # noqa: F401  (imported before the forks)
 
@@ -403,6 +426,11 @@ def main():
             skipped[q] = o.get("err", "?")[-300:]
             continue
         n = len(o["keys"])
+        fx = fixed_of(q, n)
+        if fx is not None:
+            o["cpu"] = list(fx["cpu"])
+            if o["opt"] is not None and fx["opt"] is not None:
+                o["opt"]["cpu"] = fx["opt"]
         cover = o["cover"]
         if o["subq"]:
             u = sorted(set().union(*map(set, cover)))

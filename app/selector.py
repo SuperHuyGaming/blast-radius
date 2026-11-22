@@ -129,6 +129,15 @@ MANY_FAILURES = 8  # with this many failing tests, a long test on the same code 
 # A plain pytest run stops at collection when a test file cannot be imported (see finish()).
 # BR_STOP_AT_COLLECTION=0: such a commit also gets the tests that fail when they run.
 STOP_AT_COLLECTION = os.environ.get("BR_STOP_AT_COLLECTION", "1") == "1"
+# BR_COLL_RUN=1: the labels ran on past collection errors (pytest --continue-on-collection-errors).
+# The tests of the files that do not import fail and are selected without a run; the other
+# candidates run (or are held at the price of their selection beside those), and the answer is
+# those tests + the tests that fail at run time + the held tests that could fail.
+COLL_RUN = os.environ.get("BR_COLL_RUN", "1") == "1"
+if COLL_RUN:
+    STOP_AT_COLLECTION = False
+COLL_LOOSE = os.environ.get("BR_COLL_LOOSE", "1") == "1"  # any run may be held, not only the costly ones
+COLL_BUDGET = float(os.environ.get("BR_COLL_BUDGET", "inf"))  # CPU limit of the runs of such a commit
 # The stage check of the long executor test (stages.py), for a commit that would select that
 # test without a run: "1" on, "0" off. For validation: "always" = whenever the test is held,
 # "force" = the test is always held and checked.
@@ -471,7 +480,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "class_broken")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "class_broken", "coll_dead", "coll_names", "coll_extra", "vanished")
 
     def __init__(self, commit):
         self.commit = commit
@@ -488,6 +497,9 @@ class Plan:
         self.pre_keeps = None  # (the keeps and iters it was made from, reduced code per test): prepare_keeps
         self.broken = []  # modules that fail to import with the patch
         self.class_broken = []  # test modules whose setUpClass raises (they import): see finish()
+        self.coll_dead = set()  # COLL_RUN: tests that fail at collection, selected without a run
+        self.coll_names = set()  # (the modules that do not import, as choose() knew them)
+        self.coll_extra = set()  # tests that run a changed unit that also runs at import time
         self.times = {}  # test -> CPU seconds of its run (for logs)
         self.pool_died = []  # tests during which a class-level process pool died
         self.fpairs = []  # (old code, new code) of changed function bodies that also run at import
@@ -511,6 +523,7 @@ class Plan:
         self.tokcheck = []  # held long tests whose tokenize inputs the child tokenizes again (tokcheck.py)
         self.sure_infected = set()  # tests whose own evaluations of an edited comparison change (infect.py)
         self.added = []  # (test id, first later test) of test methods that the patch adds
+        self.vanished = set()  # tests of classes that the patch only renames: their ids are not in the full run
         self.watch = []  # (module, descriptor) of shared containers to watch (shared_write_watch)
         self.watched = None  # the statefp keys of the containers that the child watched (None: not reported)
         self.leaks = []  # (test, statefp key, changed entries or None): a watched container changed
@@ -935,6 +948,10 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             for ln in hit_lines:
                 if stmt_pex[ln]:
                     # the function also runs at import: its body change is known here
+                    if COLL_RUN:
+                        for l2 in hit_lines:
+                            if stmt_set[l2]:
+                                plan.coll_extra.update(maps.tests(stmt_set[l2]))
                     plan.fpairs.extend(pairs)
                     sl = plan.stmt_lines.setdefault(rel, set())
                     for l2 in hit_lines:
@@ -963,6 +980,10 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
                 touched.update(range(span_a[ln], span_b[ln] + 1) if span_a[ln] else (ln,))
         else:
             if unit_pex[ui]:
+                if COLL_RUN:
+                    # the import-time path decides; when the import breaks (choose()), the
+                    # tests that call the changed unit at run time are candidates too
+                    plan.coll_extra.update(maps.tests(unit_set[ui]))
                 return True
             plan.cands.update(maps.tests(unit_set[ui]))
             touched.update(range(s, e + 1))
@@ -1524,7 +1545,128 @@ def _hook_effect(fn):
     return False
 
 
-def _changed_hooks(plan: Plan, maps: Maps, rel, old_text, new_text):
+RENAMED_CLASSES = os.environ.get("BR_NO_RENAMED_CLASSES") != "1"
+# names in a class body that can make its behaviour depend on the class's own name or identity
+_NAME_WORDS = re.compile(
+    r"__name__|__qualname__|__class__|__module__|_testMethodName|\binspect\b|\bgetattr\b|\bglobals\(|\bvars\(|"
+    r"\blocals\(|__dict__|__subclasses__|\bmro\b|__mro__|__init_subclass__|(?<![\w.])(type|id|repr|str)\(\s*(self|cls)\b|"
+    r"\bsys\._getframe|\btraceback\b|\bunittest\.main|\bTestLoader\b|\bpytest\b|\brequest\b"
+)
+
+
+def _renamed_classes(old_text, new_text):
+    """{new name: old name} for top-level classes that the patch only renames: the old class
+    is gone, the new one has the same bases, keywords, decorators and body, no other
+    top-level class has that body, and the body names nothing that reads the class's own name
+    (_NAME_WORDS)."""
+    import ast
+
+    try:
+        old_tree, new_tree = ast.parse(old_text or ""), ast.parse(new_text or "")
+    except (SyntaxError, ValueError):
+        return {}
+
+    def shape(c):
+        return ast.dump(ast.Module(body=c.body, type_ignores=[])) + "|" + "|".join(
+            ast.dump(x) for x in c.bases + c.keywords + c.decorator_list)
+
+    old_c = {c.name: c for c in old_tree.body if isinstance(c, ast.ClassDef)}
+    new_c = {c.name: c for c in new_tree.body if isinstance(c, ast.ClassDef)}
+    gone = {n: shape(c) for n, c in old_c.items() if n not in new_c}
+    out = {}
+    for n, c in new_c.items():
+        if n in old_c:
+            continue
+        s = shape(c)
+        match = [o for o, so in gone.items() if so == s]
+        if len(match) != 1:
+            continue
+        body = ast.unparse(c)
+        if _NAME_WORDS.search(body):
+            continue
+        # the rest of the module must not read the old or new name (a registry, a subclass)
+        rest = ast.unparse(ast.Module(body=[x for x in new_tree.body if x is not c], type_ignores=[]))
+        if re.search(r"\b(%s|%s)\b" % (re.escape(n), re.escape(match[0])), rest):
+            continue
+        if not (n.startswith("Test") and match[0].startswith("Test")) and not _is_testcase(new_tree, c, 0):
+            # a plain class that pytest collects by its name: a new name can stop its runs
+            continue
+        out[n] = match[0]
+    return out
+
+
+DELETED_TESTS = os.environ.get("BR_NO_DELETED_TESTS") != "1"
+
+
+def _deleted_tests(plan, rel, old_text, new_text, old, new, renamed, test_ids):
+    """Test methods that the patch only deletes: the module is the pinned one without them (the
+    same tree otherwise), the class stays, nothing in the module names them any more, and their
+    bodies leave no state behind for later tests (_hook_effect). Their ids are not in the full
+    run, so they cannot fail, and the other tests run as before: plan.vanished."""
+    import ast
+
+    classes = {c for c, _ in new}
+    gone = [(c, n) for (c, n) in old if (c, n) not in new and c in classes and c not in renamed.values()]
+    if not gone:
+        return
+    try:
+        old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
+    except (SyntaxError, ValueError):
+        return
+    drop = set(gone)
+    for cdef in old_tree.body:
+        if isinstance(cdef, ast.ClassDef):
+            cdef.body = [f for f in cdef.body
+                         if not (isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and (cdef.name, f.name) in drop)]
+    if ast.dump(old_tree) != ast.dump(new_tree):
+        return
+    n_before = len(plan.vanished)
+    for c, n in gone:
+        if _hook_effect(old[(c, n)]) or re.search(r"\b%s\b" % re.escape(n), new_text):
+            continue
+        tid = "%s::%s::%s" % (rel, c, n)
+        plan.vanished.update(k for k, t in enumerate(test_ids) if t == tid or t.startswith(tid + "["))
+    if len(plan.vanished) > n_before:
+        plan.note.append("deleted tests: %d" % (len(plan.vanished) - n_before))
+
+
+def _is_testcase(tree, c, depth):
+    """True when the class is a unittest.TestCase subclass by its bases (in its module or in
+    the pinned test modules it imports): pytest collects those whatever their names are."""
+    import ast
+
+    if depth > 5:
+        return False
+    for b in c.bases:
+        if isinstance(b, ast.Attribute) and b.attr in ("TestCase", "IsolatedAsyncioTestCase") and isinstance(b.value, ast.Name) and b.value.id == "unittest":
+            return True
+        if not isinstance(b, ast.Name):
+            continue
+        local = [x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == b.id]
+        if local:
+            if _is_testcase(tree, local[-1], depth + 1):
+                return True
+            continue
+        for imp in tree.body:
+            if isinstance(imp, ast.ImportFrom) and not imp.level and imp.module:
+                for a in imp.names:
+                    if (a.asname or a.name) != b.id:
+                        continue
+                    if imp.module == "unittest" and a.name in ("TestCase", "IsolatedAsyncioTestCase"):
+                        return True
+                    if imp.module.startswith("tests."):
+                        try:
+                            with open(os.path.join(ROOT, imp.module.replace(".", "/") + ".py"), encoding="utf-8") as f:
+                                t2 = ast.parse(f.read())
+                        except (OSError, SyntaxError, ValueError):
+                            continue
+                        found = [x for x in t2.body if isinstance(x, ast.ClassDef) and x.name == a.name]
+                        if found and _is_testcase(t2, found[-1], depth + 1):
+                            return True
+    return False
+
+
+def _changed_hooks(plan: Plan, maps: Maps, rel, old_text, new_text, renamed=None):
     """Hooks (_INSTANCE_HOOKS, _CLASS_HOOKS, _MODULE_HOOKS) that the patch adds, removes or
     changes. One that can leave state behind (_hook_effect) selects every test from the first
     test of its class on (from 0 for a class that the pinned run does not list, such as a base
@@ -1549,6 +1691,9 @@ def _changed_hooks(plan: Plan, maps: Maps, rel, old_text, new_text):
         return out
 
     new, old = hooks(new_text), hooks(old_text) if old_text is not None else {}
+    if renamed:
+        # a hook of a class that the patch only renames runs as before
+        new = {((renamed.get(c, c)), h): fn for (c, h), fn in new.items()}
     test_ids = maps.meta["test_ids"]
     n_tests = len(test_ids)
     for key in set(new) | set(old):
@@ -1612,9 +1757,32 @@ def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text):
     old = methods(old_text) if old_text is not None else {}
     if new is None or old is None:
         return  # a file that does not parse fails at import: the import check covers it
-    _changed_hooks(plan, maps, rel, old_text, new_text)
+    renamed = _renamed_classes(old_text, new_text) if RENAMED_CLASSES else {}
+    if renamed:
+        plan.note.append("renamed classes %s" % sorted(renamed.items())[:3])
+        try:
+            back = ast.parse(new_text)
+            for c in back.body:
+                if isinstance(c, ast.ClassDef) and c.name in renamed:
+                    c.name = renamed[c.name]
+            same = ast.dump(back) == ast.dump(ast.parse(old_text))
+        except (SyntaxError, ValueError):
+            same = False
+        if same:
+            # the module is the pinned one but for the class names: it imports as before, the
+            # renamed classes run under their new ids, and the old ids are not in the full run
+            for old_name in renamed.values():
+                prefix = "%s::%s::" % (rel, old_name)
+                plan.vanished.update(n for n, tid in enumerate(test_ids) if tid.startswith(prefix))
+    _changed_hooks(plan, maps, rel, old_text, new_text, renamed)
+    if DELETED_TESTS:
+        _deleted_tests(plan, rel, old_text, new_text, old, new, renamed, test_ids)
     for (cls_name, name), fn in new.items():
         if (cls_name, name) in old:
+            continue
+        if cls_name in renamed and (renamed[cls_name], name) in old:
+            # the method of a class that the patch only renames: the full run runs it at the
+            # same place as the pinned run does (pytest orders by the file, not by the name)
             continue
         names = _KNOWN_TESTS.get((rel, cls_name))
         if names:
@@ -1626,6 +1794,9 @@ def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text):
         if _writes_shared_state(fn):
             plan.blind.update(range(start, len(test_ids)))
             plan.note.append("added test %s writes shared state" % name)
+
+
+PKG_REFS = os.environ.get("BR_NO_PKG_REFS") != "1"  # new modules of the tests package: only their importers (package_module_refs)
 
 
 def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
@@ -1727,7 +1898,11 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
                 # a new module is loaded only by its name: the tests that can reach that name
                 base = os.path.basename(path)[:-3]
                 word = os.path.basename(os.path.dirname(path)) if base == "__init__" else base
-                refs = patchrules.referencing_tests(maps, word)
+                refs = patchrules.package_module_refs(maps, path, text) if PKG_REFS else None
+                if refs is not None:
+                    plan.note.append("module %s of the tests package" % path)
+                else:
+                    refs = patchrules.referencing_tests(maps, word)
                 if refs is not None:
                     plan.cands.update(refs)
                     plan.note.append("new module, %d referencing tests" % len(refs))
@@ -1843,6 +2018,11 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
         if "import" in routes and "other" not in routes:
             plan.infect_fresh = set().union(*(t for t, _ in plan.infect_files))
     add_registry_candidates(plan, fps, maps)
+    if plan.vanished:
+        plan.cands -= plan.vanished
+        plan.blind -= plan.vanished
+        plan.data_cands -= plan.vanished
+        plan.note.append("%d tests leave the run (renamed classes, deleted tests)" % len(plan.vanished))
     if plan.added:
         fresh = True  # the added tests run in a child that imports the patched test files
     if fresh:
@@ -2791,7 +2971,7 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
     new code) of the function bodies that this child replaced."""
     st = plan.stage
     n = st["n"]
-    if broken or settings[1] or settings[2]:
+    if (broken and not COLL_RUN) or settings[1] or settings[2]:
         # modules that do not import, changed interpreter settings, a dead class pool: the
         # parent selects the test for another reason than the verdicts
         if DEBUG:
@@ -3221,6 +3401,8 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     os.write(wfd, b"D " + json.dumps(rows).encode() + b"\n")
                 t_diff = time.process_time()
                 import_all_tests()
+                if COLL_RUN:
+                    os.write(wfd, b"T\n")  # every test file imported: the parent knows plan.broken
                 if DEBUG:
                     sys.stderr.write("child %s import+diff %.3f tests %.3f\n" % (plan.commit, t_diff - t_child, time.process_time() - t_diff))
                 chunks = []
@@ -3794,6 +3976,7 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     t_cap = None
     added_open = None  # the first later test of an added test that runs now
     stage_open = False  # the child is inside its stage check (run_stage_check)
+    pending_keys = None  # COLL_RUN: the import state, until the child has imported every test file
     statm_fd = None
     if MEM_GUARD:
         try:
@@ -3885,10 +4068,20 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                     t_cap = None
                     cap = None
                     t_test = time.monotonic() + 2 * TEST_TIMEOUT * SLOWDOWN
-                elif line.startswith(b"D "):
-                    keys = None if line == b"D many" else json.loads(line[2:])
-                    if DEBUG:
-                        DEBUG_DKEYS[plan.commit] = keys
+                elif line.startswith(b"D ") or line == b"T":
+                    if line != b"T":
+                        keys = None if line == b"D many" else json.loads(line[2:])
+                        if DEBUG:
+                            DEBUG_DKEYS[plan.commit] = keys
+                        if COLL_RUN:
+                            pending_keys = [keys]  # the plan waits for the test-file imports ("T")
+                            t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
+                            continue
+                    else:
+                        if pending_keys is None:
+                            continue
+                        keys = pending_keys[0]
+                        pending_keys = None
                     todo = on_diff(keys)
                     allowed = todo.pop("allowed")
                     cap = todo.pop("cap")
@@ -4692,7 +4885,7 @@ def run(t_start, deadline, state):
             # that reads a data file of the patch (a fixture edited beside the code) can still
             # fail, so it stays selected
             selected.update(n for n in held if n in plan.data_cands)
-        elif plan.broken or not verdicts or unknown:
+        elif (plan.broken and not (plan.coll_dead and set(plan.broken) <= plan.coll_names)) or not verdicts or unknown:
             selected.update(held)
         else:
             # On labeled mutants, a long test fails together with another test of its class
@@ -4762,7 +4955,7 @@ def run(t_start, deadline, state):
                 "must": sorted(plan.must), "sure": sorted(plan.sure_infected.intersection(held)), "tokcheck": plan.tokcheck,
                 "times": {str(k): round(v, 4) for k, v in plan.times.items()},
                 "body": {str(k): round(v, 4) for k, v in plan.body.items()},
-                "suspects": sorted(plan.suspects), "skipped": sorted(plan.skipped), "protect": sorted(plan.protect),
+                "suspects": sorted(plan.suspects), "skipped": sorted(plan.skipped), "coll_dead": sorted(plan.coll_dead), "protect": sorted(plan.protect),
                 "guard": len(plan.guard), "blind": sorted(plan.blind), "econ": sorted(plan.econ),
                 "costs": {str(n): round(estimate_cost(n, plan, maps, seconds), 4) for n in ran},
                 "est": round(sum(estimate_cost(n, plan, maps, seconds) for n in ran), 3),
@@ -4786,6 +4979,22 @@ def run(t_start, deadline, state):
             plan.note.append("no shared container to watch")
             plan.watch = []
         cands = sorted(plan.cands - plan.blind)
+        if COLL_RUN and plan.broken and "__getattr__" not in plan.gone and not any("__getattr__" in x for x in plan.note):
+            # (not with a changed module __getattr__: the child holds submodules as attributes
+            # that the pytest run imports later or never, so its runs can pass where pytest fails)
+            # the tests of the files that do not import, and the tests that load a module that
+            # does not import: they fail in any case and are selected without a run
+            dead = set(patchrules.importer_tests(maps, [b for b in plan.broken if b not in plan.class_broken]))
+            for name in plan.broken:
+                if name not in plan.class_broken:
+                    dead.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
+            plan.coll_dead = dead
+            plan.coll_names = set(plan.broken)
+            if plan.coll_extra - plan.cands:
+                plan.note.append("%d run-time callers of import-time units" % len(plan.coll_extra - plan.cands))
+                plan.cands |= plan.coll_extra
+                cands = sorted(plan.cands - plan.blind)
+            cands = [n for n in cands if n not in dead]
         cost = {n: estimate_cost(n, plan, maps, seconds) for n in cands}
         if plan.mode != "hot" and "import state unchanged" not in plan.note:
             for cls_id, setup in CLASS_SETUP_SECONDS.items():
@@ -4817,6 +5026,8 @@ def run(t_start, deadline, state):
             # every candidate runs: one that does not run may leave a watched container changed
             # for the later tests, and finish() must then select all their readers
             budget = float("inf")
+        if plan.coll_dead:
+            budget = COLL_BUDGET  # the runs are priced beside the dead tests below
         # the verdicts of these tests decide about the long held tests: they run first
         long_held = [n for n in held if seconds[n] > QUIET_HOLD_SECONDS]
         protect_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in long_held}
@@ -4843,7 +5054,13 @@ def run(t_start, deadline, state):
             held += [n for n in ran if n not in keep_set]
             ran = [n for n in ran if n in keep_set]
         plan.econ = set()
-        if MARGINAL and not plan.watch and not plan.settings and "import state unchanged" not in plan.note:
+        if plan.coll_dead and not plan.watch and not plan.settings:
+            plan.econ = marginal_holds(plan, ran, held, cost, COLL_LOOSE)
+            if plan.econ:
+                held += [n for n in ran if n in plan.econ]
+                ran = [n for n in ran if n not in plan.econ]
+                plan.note.append("%d tests held beside the dead tests" % len(plan.econ))
+        elif MARGINAL and not plan.watch and not plan.settings and "import state unchanged" not in plan.note:
             # (with "import state unchanged", finish() drops the held tests when the runs pass:
             # there a held test costs nothing, and the runs are the evidence)
             plan.econ = marginal_holds(plan, ran, held, cost)
@@ -4869,7 +5086,7 @@ def run(t_start, deadline, state):
             settings_files[rel] = known
         return known
 
-    def marginal_holds(plan, ran, held, cost):
+    def marginal_holds(plan, ran, held, cost, loose=False):
         """The tests of 'ran' that are held after all, because their runs cost more CPU than
         their selection costs inside the answer of this commit.
 
@@ -4894,7 +5111,7 @@ def run(t_start, deadline, state):
         interpreter-wide setting (its run shows whether it leaves the setting changed)."""
         free = [
             n for n in ran
-            if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
+            if (loose or cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n])) and n not in plan.protect
             and seconds[n] <= QUIET_HOLD_SECONDS and tests[n]["id"] not in SCALED_IDS
         ]
         if not free:
@@ -4914,7 +5131,7 @@ def run(t_start, deadline, state):
         if not free:
             return set()
         # what the answer holds in any case (a long held test only when it is sure to be selected)
-        base = set(plan.blind)
+        base = set(plan.blind) | plan.coll_dead
         base.update(
             n for n in held
             if seconds[n] <= QUIET_HOLD_SECONDS or n in plan.must or n in plan.sure_infected or tests[n]["id"] in SCALED_IDS
@@ -5015,6 +5232,7 @@ def run(t_start, deadline, state):
         # that are cheap next to those seconds go on; the others are selected as they are.
         skip = set() if RUN_ALL or plan.watch else {
             n for n in ran if cost[n] > max(0.03, AFTER_FAIL_RATIO * seconds[n]) and n not in plan.protect
+            and not (plan.coll_dead and tests[n]["id"] in SCALED_IDS)
         }
         # A failing test of the class (or fixture) of a long held test selects that long
         # test (see finish). When failures have selected every long held test, and the
@@ -5228,7 +5446,7 @@ def run(t_start, deadline, state):
         if not todo:
             return [], set(), enders
         evidence = bad | plan.suspects
-        base = evidence | plan.blind | (plan.skipped & set(cost)) | {n for n in held if seconds[n] <= QUIET_HOLD_SECONDS}
+        base = evidence | plan.blind | plan.coll_dead | (plan.skipped & set(cost)) | {n for n in held if seconds[n] <= QUIET_HOLD_SECONDS}
         base |= long_by_evidence(evidence, held)
         unrun = base | set(todo) | long_by_evidence(evidence | set(todo), held)
         run_cost = RESTART_SECONDS.get(plan.mode, 1.5) + sum(cost.get(n, 0.0) for n in todo)

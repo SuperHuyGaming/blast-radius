@@ -559,3 +559,116 @@ def statement_around_lambda(old_lines, start, end, line, old_line, new_line):
     if best is None:
         return (start, end)
     return (best[0] + shift, best[1] + shift)
+
+
+_DYN_CALLS = {"import_module", "__import__", "find_spec", "spec_from_file_location", "run_path", "run_module",
+              "load_module", "exec_module", "SourceFileLoader", "load_source", "find_module", "find_loader",
+              "module_from_spec", "exec", "eval", "compile"}
+
+
+def _dyn_arg_safe(a):
+    """True for an argument of a dynamic import that names a sqlglot module for sure."""
+    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+        return a.value == "sqlglot" or a.value.startswith("sqlglot.")
+    if isinstance(a, ast.JoinedStr) and a.values and isinstance(a.values[0], ast.Constant):
+        v = a.values[0].value
+        return isinstance(v, str) and v.startswith("sqlglot.")
+    return False
+
+
+def package_module_refs(maps, path, patch_text):
+    """Tests that may load a new module inside the tests package (tests/ and every directory
+    below it down to the file hold an __init__.py). pytest puts the project root on sys.path
+    (the rootdir of the top package), not tests/, so the module has one name: tests.<...>.<name>,
+    reached by an import of that dotted name, a relative import from its package, or a dynamic
+    import. A file that does that, or that imports modules by a name it computes, brings its
+    tests (and the importers of a helper module). None when unsure: a file name that pytest
+    collects or loads by itself, a missing package, another file of the patch that names it, a
+    file that does not parse, or a helper module without known importers."""
+    if not path.endswith(".py"):
+        return None
+    parts = path[:-3].split("/")
+    if parts[0] != "tests" or len(parts) < 2:
+        return None
+    base = parts[-1]
+    if not base.isidentifier() or base in ("__init__", "__main__", "conftest") or base.startswith("test") or base.endswith("_test"):
+        return None
+    for i in range(1, len(parts)):
+        if not os.path.isfile(os.path.join(ROOT, *parts[:i], "__init__.py")):
+            return None
+    # (a sys.path change anywhere in the tests would give the module other names)
+    for rel in _tree_py_files():
+        if rel.startswith("tests/") and ("sys.path" in source(rel) or "PYTHONPATH" in source(rel)) and rel != "tests/leakcheck.py":
+            return None
+    word = re.compile(r"\b%s\b" % re.escape(base))
+    # another file of the patch that names the module
+    for sec in re.split(r"(?m)^diff --git ", patch_text):
+        head = sec.split("\n", 1)[0]
+        if path in head:
+            continue
+        for line in sec.splitlines():
+            if line.startswith("+") and not line.startswith("+++") and word.search(line):
+                return None
+    dotted = ".".join(parts)
+    pkg = ".".join(parts[:-1])
+    found = set()
+    files = test_files(maps)
+    for rel in _tree_py_files():
+        text = source(rel)
+        mentions = base in text and word.search(text) is not None
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return None
+        own = rel[:-3].split("/")
+        own_pkg = own[:-1] if own[-1] != "__init__" else own[:-1]
+        hit = False
+        # a collected test file without listed tests and without importers: only its top-level
+        # code runs (at collection), so hits inside its functions do not count
+        idle = rel not in files and os.path.basename(rel).startswith("test_") and not maps.meta["importers"].get(rel)
+        inner = set()
+        if idle:
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    inner.update(id(x) for x in ast.walk(fn) if x is not fn)
+        for node in ast.walk(tree):
+            if id(node) in inner:
+                continue
+            if isinstance(node, ast.Import):
+                if any(a.name == dotted or a.name.startswith(dotted + ".") for a in node.names):
+                    hit = True
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    up = own_pkg[:len(own_pkg) - (node.level - 1)] if node.level - 1 <= len(own_pkg) else []
+                    full = ".".join(up + ([node.module] if node.module else []))
+                else:
+                    full = node.module or ""
+                if full == dotted or full.startswith(dotted + "."):
+                    hit = True
+                elif full == pkg and any(a.name in (base, "*") for a in node.names):
+                    hit = True
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and mentions and base in node.value:
+                if dotted in node.value or "/".join(parts) in node.value:
+                    hit = True
+            elif isinstance(node, ast.Call):
+                f = node.func
+                name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else None
+                weak = name in ("exec", "eval", "compile") and not isinstance(f, ast.Name)
+                if name in _DYN_CALLS and not weak and (not node.args or not _dyn_arg_safe(node.args[0])) and (
+                    mentions or (rel.startswith("tests/") and name not in ("exec", "eval", "compile"))
+                ):
+                    # (a sqlglot module imports by a computed name only what its callers name:
+                    # the tests that mention the module)
+                    hit = True
+            if hit:
+                break
+        if not hit:
+            continue
+        if rel in files:
+            found.update(files[rel])
+        sid = maps.meta["importers"].get(rel)
+        if sid:
+            found.update(maps.tests(sid))
+        elif rel not in files:
+            return None
+    return found

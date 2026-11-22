@@ -64,28 +64,35 @@ ENV PYTHONHASHSEED=0 \
 #    setUpClass; if the check fails, the cache is removed and the selector runs setUpClass as before.
 #    DuckDB's answers to the SQL texts of the pinned tests are recorded too (build_duck_replay.py,
 #    duckreplay.py): a test that sends a recorded text gets the recorded answer, any other text
-#    runs in DuckDB. If the recording or its rehearsal fails, every query runs as before.
+#    runs in DuckDB. The recording is committed as a plain file (app/prebuilt/duck_replay.bin, made
+#    by the same script on the pinned tree; byte-identical across builds), so the build only
+#    rehearses it; if that fails, it is recorded here, and if that fails too, every query runs.
 #    Two more facts of the pinned tree are prepared here: whether any test file reads docstrings
 #    (build_docs_read.py; the selector otherwise reads all test files to find out), and the map
 #    files are stored without zlib compression (rawmaps.py; rawz.py reads both forms, and every
 #    converted file is read back and compared). If a step fails, the selector works as before.
 COPY app /app
 # The step memo of the stage check of test_execute_tpcds (build_memo.py, memo.py): the outputs of
-# the executor steps of every TPC-DS query on the pinned commit. If it fails, the check runs as before.
-RUN (cd /repo && SKIP_INTEGRATION=0 timeout 150 python /app/build_memo.py /repo /app/maps/stages.bin /app/maps 4) \
-    || (echo "no step memo" >&2; rm -f /app/maps/memo.bin /app/maps/memo.dat)
-RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
+# the executor steps of every TPC-DS query on the pinned commit. Which outputs are stored and the step
+# costs come from a fixed file (app/maps/memo_fixed.bin), not from this machine's timing. If it fails,
+# the check runs as before.
+RUN echo "step build_memo start $(date +%s)" && (cd /repo && SKIP_INTEGRATION=0 timeout 240 python /app/build_memo.py /repo /app/maps/stages.bin /app/maps 4) \
+    || (echo "no step memo" >&2; rm -f /app/maps/memo.bin /app/maps/memo.dat); echo "step build_memo end $(date +%s)"
+RUN echo "step exec_cache start $(date +%s)" && (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
-    && mkdir -p /app/cache \
-    && (timeout 240 python /app/build_duck_replay.py /repo /app/cache/duck_replay.bin --check \
+    && mkdir -p /app/cache && echo "step duck_replay start $(date +%s)" \
+    && (timeout 120 python /app/build_duck_replay.py /repo /app/cache/duck_replay.bin --from /app/prebuilt/duck_replay.bin --check \
+     || (echo "the committed DuckDB recording failed its check; recording it here" >&2; rm -f /app/cache/duck_replay.bin; \
+         timeout 240 python /app/build_duck_replay.py /repo /app/cache/duck_replay.bin --check) \
      || (echo "no DuckDB answer recording; every query runs" >&2; rm -f /app/cache/duck_replay.bin)) \
-    && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
+    && echo "step base_state start $(date +%s)" && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
      || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
-    && (python /app/build_docs_read.py /repo /app/maps /app/cache/docs_read.json \
+    && echo "step docs_read start $(date +%s)" && (python /app/build_docs_read.py /repo /app/maps /app/cache/docs_read.json \
      || (echo "no saved docs answer; the selector reads the test files" >&2; rm -f /app/cache/docs_read.json)) \
-    && (python /app/rawmaps.py /app/maps || echo "maps stay compressed" >&2) \
+    && echo "step rawmaps start $(date +%s)" && (python /app/rawmaps.py /app/maps || echo "maps stay compressed" >&2) \
+    && echo "step compile start $(date +%s)" \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
-    && chmod -R a+rX /app
+    && chmod -R a+rX /app && echo "step all end $(date +%s)"
 
 WORKDIR /repo
 CMD ["python", "/app/main.py"]

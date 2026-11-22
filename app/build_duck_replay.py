@@ -1,6 +1,10 @@
 """Records the DuckDB answers that rt/duckreplay.py replays (run at image build time).
 
 usage: python build_duck_replay.py REPO OUT_FILE [--check]
+       python build_duck_replay.py REPO OUT_FILE --from FILE [--check]   (FILE: a recording this
+           script made on the pinned tree, committed as a plain file; it is copied to OUT_FILE and
+           --check rehearses it as it does a fresh one, with every DuckDB test passing as the
+           pinned verdict)
        python build_duck_replay.py --rehearse REPO FILE VERDICTS.json   (used by --check)
 
 The tests of the pinned tests/test_optimizer.py that can reach a DuckDB connection run twice,
@@ -821,7 +825,21 @@ def main():
         rehearse(sys.argv[2], sys.argv[3], sys.argv[4], "--check-all" in sys.argv)
         return
     repo, out_path = sys.argv[1], sys.argv[2]
-    ids, verdicts = build(repo, out_path)
+    if "--from" in sys.argv:
+        import shutil
+
+        src = sys.argv[sys.argv.index("--from") + 1]
+        ids = in_child(lambda: duck_tests(setup_real(repo)))()
+        if not ids:
+            raise SystemExit("no DuckDB tests found")
+        verdicts = {t: False for t in ids}
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        shutil.copyfile(src, out_path + ".tmp")
+        os.replace(out_path + ".tmp", out_path)
+        print("%s: copied from %s (%d bytes); tests that can reach duckdb: %d" % (
+            out_path, src, os.path.getsize(out_path), len(ids)), file=sys.stderr)
+    else:
+        ids, verdicts = build(repo, out_path)
     if "--check" in sys.argv or "--check-all" in sys.argv:
         import json
         import subprocess
