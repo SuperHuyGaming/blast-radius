@@ -1280,8 +1280,8 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
             return cand_nums
     else:
         mode = "import"
-        if potential_savings < 2.0:
-            log(f"  cost gate skipped (import): savings {potential_savings:.3f}s < 2.0s")
+        if len(runnable) < 2 or potential_savings < 2.0:
+            log(f"  cost gate skipped (import): len {len(runnable)} < 2 or savings {potential_savings:.3f}s < 2.0s")
             return cand_nums
         req = 0.5 + 0.02 * len(runnable)
         if len(runnable) > 40 and potential_savings < req:
