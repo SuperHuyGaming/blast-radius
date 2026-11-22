@@ -52,6 +52,7 @@ else:
 
 import engine  # noqa: E402
 import patchrules  # noqa: E402
+import sideeffect  # noqa: E402
 from rawz import unz as _unz  # noqa: E402  (map blobs: raw in the image, zlib in the repo)
 from astwalk import walk as _walk  # noqa: E402
 
@@ -1486,6 +1487,94 @@ def shared_write_watch(units, old_text, new_text, groups):
 _KNOWN_TESTS = None
 
 
+# Methods that unittest runs around the tests of a class (or a module): an edit there acts on
+# every test of the class and of its subclasses, and the per-test runs of the child do not run
+# the class and module ones (setUpClass, tearDownClass, setUpModule, tearDownModule).
+_INSTANCE_HOOKS = frozenset(("setUp", "tearDown", "asyncSetUp", "asyncTearDown", "__init__", "run", "__call__", "debug",
+                             "doCleanups", "_callSetUp", "_callTearDown", "_callTestMethod", "_callCleanup"))
+_CLASS_HOOKS = frozenset(("setUpClass", "tearDownClass", "doClassCleanups", "__init_subclass__"))
+_MODULE_HOOKS = frozenset(("setUpModule", "tearDownModule", "load_tests"))
+
+
+def _hook_effect(fn):
+    """True when a hook body can leave state behind for later tests: a write into an object it
+    did not create (_writes_shared_state), or a bare call on anything but self, cls, super()
+    and its own names (logging.disable(...), sqlglot.something(...))."""
+    import ast
+
+    if _writes_shared_state(fn):
+        return True
+    local = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    for n in _walk(fn):
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For, ast.With)):
+            ts = n.targets if isinstance(n, ast.Assign) else ([n.target] if not isinstance(n, ast.With) else [i.optional_vars for i in n.items])
+            for t in ts:
+                if isinstance(t, ast.Name):
+                    local.add(t.id)
+    for n in _walk(fn):
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call):
+            f = n.value.func
+            while isinstance(f, (ast.Attribute, ast.Subscript, ast.Call)):
+                f = f.func if isinstance(f, ast.Call) else f.value
+            if isinstance(f, ast.Name) and (f.id in local or f.id == "super"):
+                continue
+            if isinstance(f, ast.Name) and f.id in ("print", "len", "isinstance", "hasattr", "getattr"):
+                continue
+            return True
+    return False
+
+
+def _changed_hooks(plan: Plan, maps: Maps, rel, old_text, new_text):
+    """Hooks (_INSTANCE_HOOKS, _CLASS_HOOKS, _MODULE_HOOKS) that the patch adds, removes or
+    changes. One that can leave state behind (_hook_effect) selects every test from the first
+    test of its class on (from 0 for a class that the pinned run does not list, such as a base
+    class of other files' classes); a class or module hook selects the tests of its class or
+    file, since the child's runs do not run it; an instance hook makes the tests of its class
+    candidates (their runs run it)."""
+    import ast
+
+    def hooks(text):
+        try:
+            tree = ast.parse(text or "")
+        except (SyntaxError, ValueError):
+            return {}
+        out = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _MODULE_HOOKS:
+                out[(None, node.name)] = node
+            elif isinstance(node, ast.ClassDef):
+                for fn in node.body:
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and (fn.name in _INSTANCE_HOOKS or fn.name in _CLASS_HOOKS):
+                        out[(node.name, fn.name)] = fn
+        return out
+
+    new, old = hooks(new_text), hooks(old_text) if old_text is not None else {}
+    test_ids = maps.meta["test_ids"]
+    n_tests = len(test_ids)
+    for key in set(new) | set(old):
+        a, b = old.get(key), new.get(key)
+        if a is not None and b is not None and ast.dump(a) == ast.dump(b):
+            continue
+        cls_name, name = key
+        if cls_name is None:
+            mine = [n for n, tid in enumerate(test_ids) if tid.split("::")[0] == rel]
+        else:
+            mine = sorted((_KNOWN_TESTS.get((rel, cls_name)) or {}).values())
+        if cls_name is None and not mine:
+            continue  # a module hook of a file without tests (in the pinned list) runs for none
+        first = mine[0] if mine else 0
+        if any(fn is not None and _hook_effect(fn) for fn in (a, b)):
+            plan.blind.update(range(first, n_tests))
+            plan.note.append("hook %s.%s can leave state behind: tests from %d on" % (cls_name, name, first))
+        elif name in _CLASS_HOOKS or name in _MODULE_HOOKS or not mine:
+            plan.blind.update(mine if mine else range(n_tests))
+            plan.note.append("class or module hook %s.%s: %d tests" % (cls_name, name, len(mine) if mine else n_tests))
+        else:
+            plan.cands.update(mine)
+            plan.lines["?"] = None
+            plan.note.append("hook %s.%s: %d tests of its class" % (cls_name, name, len(mine)))
+
+
 def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text):
     """Test methods that the patch adds to a test file (in the new text, not in the old one).
     The full run runs them too, at their place in the pytest order (a class's methods run in
@@ -1523,6 +1612,7 @@ def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text):
     old = methods(old_text) if old_text is not None else {}
     if new is None or old is None:
         return  # a file that does not parse fails at import: the import check covers it
+    _changed_hooks(plan, maps, rel, old_text, new_text)
     for (cls_name, name), fn in new.items():
         if (cls_name, name) in old:
             continue
@@ -1677,6 +1767,23 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
                 # not list the package __init__ files as imported
                 plan.cands.update(patchrules.tests_under(maps, os.path.dirname(path)))
                 plan.lines["?"] = None
+        if is_py and in_tree and not recoded and (
+            (path.startswith("sqlglot/") and (fresh or fp.status != "modify"))
+            or (path.startswith("tests/") and (fp.status != "modify" or sideeffect.touches_top_level(fp.groups)))
+        ):
+            # import-time code that changes state outside its own module (sideeffect.py):
+            # every test that runs after the import (or, for a test file, after collection) can see it
+            why = sideeffect.import_time_effects_fast(old_text, fp.new_text if fp.status != "delete" else None,
+                                                 fp.groups if fp.status == "modify" else None)
+            if why:
+                plan.blind.update(range(len(maps.meta["test_ids"])))
+                plan.note.append("import-time effect outside %s: %s" % (path, why))
+        if is_py and path.startswith("sqlglot/") and fp.status == "modify" and not recoded:
+            why = sideeffect.call_time_effects(old_text, fp.new_text, fp.groups)
+            if why:
+                # the state stays changed after the test that runs the line: every later test
+                plan.blind.update(range(len(maps.meta["test_ids"])))
+                plan.note.append("call-time effect outside the call in %s: %s" % (path, why))
         if is_py and path.startswith("sqlglot/") and fp.status == "modify" and not recoded:
             rec = maps.file(fp.old_path)
             watch = shared_write_watch(rec[0], old_text, fp.new_text, fp.groups) if rec is not None else []
@@ -4638,7 +4745,10 @@ def run(t_start, deadline, state):
                 if name in plan.class_broken:
                     continue  # the file imports; setUpClass raises when the tests run
                 unimportable.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
-            if unimportable and status == "END" and not plan.all_fail and "import does not end" not in plan.note:
+            if (unimportable and status == "END" and not plan.all_fail and "import does not end" not in plan.note
+                    and not any(n.startswith("import-time effect outside") for n in plan.note)):
+                # (not when import-time code changes outside state, sys.modules for one: the
+                # child's preloaded modules can then import where a fresh pytest process does not)
                 plan.note.append("collection stops: %d tests of files that do not import (of %d)" % (len(unimportable), len(selected)))
                 selected = unimportable
         if dry:

@@ -688,7 +688,50 @@ class StageCheck:
 
     # -- pool.LazyFuture calls this in place of the task ---------------------------------
 
+    # Mid-task form of the "slow" rule of run_task: a task that the check lets run cannot run
+    # past clock + 2 * (expected, its own later part included) + slack CPU seconds. Past that
+    # point the rule would end the check when the next task starts anyway; a task that does not
+    # end (patched code in a loop) used to run on until the CPU guard of the check (up to
+    # STAGE_GAIN times the seconds that it saves). The timer is ITIMER_PROF, whose SIGPROF ends
+    # the child as the CPU guard does (the parent: "stage check stopped", no verdict, the test
+    # is selected as without the check). Between tasks the guard's own limit holds again.
+    _guard_at = None  # process CPU time at which the guard of started() fires (inf: none)
+    _armed = False
+
+    def _arm(self, index):
+        if self.slack is None or os.environ.get("BR_NO_TASK_TIMER") == "1":
+            return
+        import signal
+
+        now = time.process_time()
+        if self._guard_at is None:
+            left = signal.getitimer(signal.ITIMER_PROF)[0]
+            self._guard_at = now + left if left > 0 else float("inf")
+        limit = self.clock + 2.0 * (self.expected + self.cpu.get(index, (0.0, 0.0))[1]) + self.slack
+        at = min(limit, self._guard_at)
+        if at == float("inf"):
+            return
+        signal.setitimer(signal.ITIMER_PROF, max(at - now, 0.001))
+        self._armed = True
+
+    def _disarm(self):
+        if not self._armed:
+            return
+        import signal
+
+        self._armed = False
+        if self._guard_at == float("inf"):
+            signal.setitimer(signal.ITIMER_PROF, 0)
+        else:
+            signal.setitimer(signal.ITIMER_PROF, max(self._guard_at - time.process_time(), 0.001))
+
     def run_task(self, index, fn, args, kwargs):
+        try:
+            return self._run_task(index, fn, args, kwargs)
+        finally:
+            self._disarm()
+
+    def _run_task(self, index, fn, args, kwargs):
         want = self.tasks.get(index)
         if want is None:
             # a query that the pinned test does not execute: the task is short and runs as it is
@@ -709,6 +752,7 @@ class StageCheck:
             self.seq.append("q")
             self.stop("sql text of task %d" % index)
             return None
+        self._arm(index)
         if index in self.later and self.memo is not None and index in self.memo[0].index["queries"] and index not in self.memo_full:
             if not self.spend(self.cpu.get(index, (0.0, 0.0))[0]):
                 self.seq.append("o")
