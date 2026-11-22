@@ -113,31 +113,7 @@ CLASS_SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0} if os.enviro
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
-# Short reruns (short_rerun in run): after a first failure, the child leaves the tests of
-# the 'skip' set unrun, and finish() selects them as they are. When those short tests cost at
-# least SHORT_MIN packed seconds in the answer, a second child runs them anyway (the most
-# recorded seconds per CPU second first, as far as the expected saving pays for the CPU): a
-# failing one stays selected, a passing one leaves the answer. BR_SHORT_RERUN=0 turns it off.
-SHORT_RERUN = os.environ.get("BR_SHORT_RERUN", "1") == "1"
-SHORT_MIN = float(os.environ.get("BR_SHORT_MIN", "2.0"))  # packed seconds of those tests at least
-SHORT_PASS = float(os.environ.get("BR_SHORT_PASS", "0.75"))  # share of them that pass (labeled mutants: 0.77)
-# charged seconds per estimated CPU second (a run costs about 0.7 of its estimate in local CPU,
-# and the scoring machine charges about 0.6 of that; the board measured about 0.59 per local CPU second)
-SHORT_PRICE = float(os.environ.get("BR_SHORT_PRICE", "0.6"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
-# A plain pytest run stops at collection when a test file cannot be imported (see finish()).
-# BR_STOP_AT_COLLECTION=0: such a commit also gets the tests that fail when they run.
-STOP_AT_COLLECTION = os.environ.get("BR_STOP_AT_COLLECTION", "1") == "1"
-# The stage check of the long executor test (stages.py), for a commit that would select that
-# test without a run: "1" on, "0" off. For validation: "always" = whenever the test is held,
-# "force" = the test is always held and checked.
-STAGE = os.environ.get("BR_STAGE", "1")
-MEMO = os.environ.get("BR_MEMO", "1") == "1"  # the step memo of the stage check (memo.py); BR_MEMO=0 turns it off
-# CPU seconds (as measured when the stage map was built) that a check may cost for each
-# second that leaving the test out of the answer saves. A check that proves a pass costs CPU
-# for all its tasks; at 1.3 it still pays when a CPU second is charged at 0.6 score seconds.
-STAGE_GAIN = float(os.environ.get("BR_STAGE_GAIN", "1.7"))
-STAGE_STATE_SECONDS = 0.6  # the snapshots of the module state for a check that proves a pass
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
@@ -234,7 +210,6 @@ class Maps:
         self._classmap = None
         self._faithful = None
         self._tight = None
-        self._stages = None
         try:
             with open(os.path.join(path, "cost.bin"), "rb") as f:
                 self.cost = marshal.loads(f.read())
@@ -356,24 +331,6 @@ class Maps:
                     self._tight = {}
         return self._tight
 
-    def stages(self):
-        """{test id: record} of the stage map (build_stages.py), each with the build-time
-        measurements under "cost"; empty without the two files."""
-        if self._stages is None:
-            import stages
-
-            self._stages = {}
-            try:
-                with open(os.path.join(self.path, "stage_cost.bin"), "rb") as f:
-                    costs = marshal.loads(f.read())
-                for test_id, record in stages.load_map(os.path.join(self.path, "stages.bin")).items():
-                    cost = costs.get(test_id)
-                    if cost and set(cost["cpu"]) == set(record["tasks"]):
-                        self._stages[test_id] = dict(record, cpu=cost["cpu"], cost=cost)
-            except (OSError, ValueError, EOFError, TypeError, KeyError, AttributeError):
-                self._stages = {}
-        return self._stages
-
     def faithful(self):
         """The tests whose method, compiled alone as apply_reduction does, equals the pinned
         method (build_faithful.py); empty without the map."""
@@ -408,7 +365,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "class_broken")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps")
 
     def __init__(self, commit):
         self.commit = commit
@@ -424,7 +381,6 @@ class Plan:
         self.iters = {}  # test -> ((kept paths, their prefixes), rewritten sites, edits): see iterred.py
         self.pre_keeps = None  # (the keeps and iters it was made from, reduced code per test): prepare_keeps
         self.broken = []  # modules that fail to import with the patch
-        self.class_broken = []  # test modules whose setUpClass raises (they import): see finish()
         self.times = {}  # test -> CPU seconds of its run (for logs)
         self.pool_died = []  # tests during which a class-level process pool died
         self.fpairs = []  # (old code, new code) of changed function bodies that also run at import
@@ -464,8 +420,6 @@ class Plan:
         self.body = {}  # test -> CPU seconds of the test alone, without class set-up (for logs)
         self.econ = set()  # tests held because their runs cost more than their selection (marginal_holds)
         self.settings = False  # a line that the patch adds names an interpreter-wide setting (SETTINGS_WORDS)
-        self.stage = None  # the stage check that the child may run for a held long test (stage_plan)
-        self.stage_info = None  # what that check found: {"n": test, "verdict": True (fails) / False (passes) / None, ...}
 
 
 CODING_RE = re.compile(r"coding[:=]\s*[-\w.]+")
@@ -2483,7 +2437,7 @@ def run_tokcheck(numbers, wfd):
     recorded inputs of these held long tests again (tokcheck.py). Each test that gets another
     token stream is reported ("M n"), and the parent selects it."""
     if not numbers or not TOKCHECK:
-        return ()
+        return
     os.write(wfd, b"M -1\n")  # the check takes time: the parent's clock for the setup restarts
     try:
         import tokcheck
@@ -2493,193 +2447,6 @@ def run_tokcheck(numbers, wfd):
         found = set(numbers)
     for n in sorted(found):
         os.write(wfd, b"M %d\n" % n)
-    return found
-
-
-def memo_dirty(plan, record=None):
-    """Parent side: what memo.prepare finds for the commit's changed functions ({"d": dirty step
-    ids, "full": tasks without the memo, "noopt": tasks whose optimize() may be answered from
-    the record}), or None (no memo). The pinned texts are read here, in the parent: the child
-    sees the patched tree."""
-    try:
-        import memo
-
-        store = memo.Store(MAPS)
-        if not store.ok():
-            return None
-        old = {}
-        for p in plan.files:
-            with open(os.path.join(ROOT, p), encoding="utf-8", newline="") as f:
-                old[p] = f.read()
-        return memo.prepare(store, plan.files, old, record)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def memo_cost(m, cpu, active, later):
-    """Build-time CPU seconds of the check's tasks with the memo (memo.prepare's answer m): a
-    task's early part without optimize() where the record answers it; a later task with a
-    record: its dirty steps, plus restoring the root's output; any other later task: to its end."""
-    import memo
-
-    store = memo.Store(MAPS)
-    queries = store.index["queries"]
-    dirty, full, noopt = set(m["d"]), set(m["full"]), set(m["noopt"])
-    total = 0.0
-    for i in active:
-        early, late = cpu.get(i, (0.0, 0.0))
-        rec = queries.get(i)
-        if i in noopt and rec is not None and rec.get("opt") is not None and os.environ.get("BR_MEMO_OPT", "1") == "1":
-            early = max(0.0, early - rec["opt"]["cpu"])
-        total += early
-        if i not in later:
-            continue
-        if rec is None or i in full:
-            total += late
-            continue
-        steps = [k for k in range(len(rec["keys"])) if "%d:%d" % (i, k) in dirty]
-        total += sum(rec["cpu"][k] for k in steps) + 0.01 + 0.002 * len(rec["keys"])
-    return total
-
-
-def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, settings, code_pairs, wfd):
-    """Child side, after the commit's other runs: the stage check of the held long test
-    (stages.py), when the parent would select that test without a run. It reports what it
-    found in an "X" line; the parent drops the test only on the verdict "passes".
-    seen: the verdicts that this child reported; broken: the modules that do not import here;
-    forced: held tests that are selected whatever the verdicts are; code_pairs: (old code,
-    new code) of the function bodies that this child replaced."""
-    st = plan.stage
-    n = st["n"]
-    if broken or settings[1] or settings[2]:
-        # modules that do not import, changed interpreter settings, a dead class pool: the
-        # parent selects the test for another reason than the verdicts
-        if DEBUG:
-            sys.stderr.write("stage check %s not run: broken %r settings %r\n" % (plan.commit, broken[:5], settings[1:]))
-        return
-    if STAGE not in ("always", "force"):
-        # the rule of finish() for a long held test, with what this child knows
-        failing = [k for k, bad in seen.items() if bad]
-        verdicts = [k for k, bad in seen.items() if bad is not None]
-        wanted = st["forced"] or n in forced
-        if not wanted and not (st["inert"] and not failing):
-            wanted = not verdicts or len(failing) + st["more"] >= MANY_FAILURES or any(k in st["deciders"] for k in failing)
-        if not wanted:
-            return
-    # What the check can save: the seconds that the test adds to the answer of this commit,
-    # next to the tests that are selected in any case (the failing tests, the tests that did
-    # not run after a failure, the other held tests). The check may cost STAGE_GAIN CPU
-    # seconds per second of that; its planned part (st["est"]) must fit, and the rest is the
-    # budget of the tasks that run on because their input differs.
-    seconds = [t["seconds"] for t in tests]
-    others = set(st["others"])
-    others.update(k for k, bad in seen.items() if bad is not False)
-    others.discard(n)
-    saving = packed_seconds(others | {n}, seconds) - packed_seconds(others, seconds)
-    budget = STAGE_GAIN * saving - st["est"]
-    if STAGE == "force":
-        budget = float("inf")
-    if budget < 0.0:
-        os.write(wfd, b"X " + json.dumps({"n": n, "verdict": None, "skip": "saves %.1f s, costs %.1f" % (saving, st["est"])}).encode() + b"\n")
-        return
-    import reduce
-    import runner
-    import stages
-
-    if GUARD and os.environ.get("BR_STAGE_AUDIT") != "1":
-        CPU_GUARD[n] = max(GUARD_MIN, min(1.5 * (st["est"] + min(budget, st["differ_most"])) + 3.0, STAGE_GAIN * saving + 1.0))  # (started() sets this limit; never more CPU than the check can save)
-    os.write(wfd, b"X start\n")
-    info = {"n": n, "verdict": None, "saving": round(saving, 2)}
-    t0 = time.process_time()
-    check = holder = None
-    try:
-        test_id = tests[n]["id"]
-        path, cls_name, _ = test_id.split("::")
-        record = MAPS_OBJ.stages()[test_id]
-        case = runner.load_case(test_id, n)  # loads the test module as a run does (class fixture hook)
-        module = sys.modules[path[:-3].replace("/", ".")]
-        cls = getattr(module, cls_name)
-        active = keeps[n][1] if keeps and n in keeps else None
-        if os.environ.get("BR_STAGE_AUDIT") == "1":
-            import stage_audit
-
-            check = stage_audit.AuditCheck(record, set(st["later"]), st["to_end"] + budget, active)
-        else:
-            check = stages.StageCheck(record, set(st["later"]), st["to_end"] + budget, active)
-            if st.get("memo") is not None:
-                try:
-                    import memo
-
-                    store = memo.Store(MAPS)
-                    m = st["memo"]
-                    if store.ok():
-                        check.memo = (store, set(m["d"]))
-                        check.memo_full = set(m["full"])
-                        check.noopt = set(m["noopt"])
-                        info["memo_dirty"] = [len(m["d"]), len(m["full"]), len(m["noopt"])]
-                except Exception as e:  # noqa: BLE001  (no memo: the check runs as before)
-                    info["memo_err"] = repr(e)[:200]
-        pairs = code_pairs + list(plan.fpairs or ())  # function bodies that the commit changes
-        alias = stages.code_alias(pairs) if pairs else None
-        # as for a test: the "S" line, the dialect registry of a full run, the CPU limit
-        started(n)
-        holder = stages.hold_state(record["effect"], alias)  # the module state before the check
-        before_settings = _interpreter_settings()
-        if not check.install(module, cls):
-            info["why"] = "execute() is not the pinned one"
-            return
-        results = []
-        reduce.STATE.task_hook = check.run_task
-        try:
-            if check.probe(case):
-                runner.run_tests([(n, test_id)], lambda number, failed: results.append(failed), False, keeps)
-            else:
-                results.append(False)  # (over: no verdict below)
-        finally:
-            reduce.STATE.task_hook = None
-            check.remove()
-            signal.setitimer(signal.ITIMER_PROF, 0)  # (started() set the CPU limit of the check)
-        info["t_run"] = round(time.process_time() - t0, 3)
-        info.update(same=len(check.same), ran=[[i, why] for i, why in check.ran[:8]], nran=len(check.ran),
-                    proved=len(check.proved), seq="".join(check.seq), spent=round(check.spent, 3), why=check.why,
-                    memo=getattr(check, "memo_stats", None), opt=getattr(check, "opt_stats", None),
-                    run=None if not results else results[0])
-        if not results or results[0] is None:
-            verdict = None
-        elif results[0]:
-            verdict = True  # an error in a task, or in the test outside its tasks: the test fails
-        elif not check.complete():
-            verdict = None  # the check ended early (another SQL text, other rows, the budget)
-        else:
-            verdict = False
-        if verdict is False:
-            # The tasks that stopped early count as passed only when the patched code left the
-            # interpreter settings alone and the module state as the pinned test leaves it:
-            # their later work reads both.
-            if _interpreter_settings() != before_settings:
-                info["state"] = "settings"
-                verdict = None
-            elif check.same or check.memo_used:
-                before = stages.held_state(holder)
-                ok, changed = stages.state_ok(record["effect"], before, alias) if before is not None else (False, [("no", "snapshot")])
-                if not ok:
-                    info["state"] = [list(map(str, k)) for k in changed[:5]]
-                    verdict = None
-        if hasattr(check, "report"):
-            info["audit"] = check.report()
-            info["would"] = verdict
-            verdict = None  # validation run: the answer stays what it is without the check
-        info["verdict"] = verdict
-    except Exception as e:  # noqa: BLE001  (no verdict: the parent treats the test as before)
-        info["error"] = repr(e)[:200]
-        info["verdict"] = None
-    finally:
-        signal.setitimer(signal.ITIMER_PROF, 0)
-        reduce.STATE.reset()
-        if holder is not None:
-            stages.release(holder)
-        info["cpu"] = round(time.process_time() - t0, 3)
-        os.write(wfd, b"X " + json.dumps(info).encode() + b"\n")
 
 
 def child_reporters(wfd):
@@ -2776,16 +2543,6 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
     import runner
 
     emit, started, settings, watches, _ = child_reporters(wfd)
-    seen = {}  # what this child reported, for run_stage_check: the verdicts,
-    broken_here = []  # the modules that do not import,
-    forced = set()  # the held tests whose token streams changed,
-    code_pairs = []  # and the function bodies that it replaced
-    if STAGE != "0":
-        report = emit
-
-        def emit(number, failed):
-            seen[number] = failed  # (None: not run after a failure, the parent selects it)
-            report(number, failed)
 
     try:
         signal.signal(signal.SIGPROF, signal.SIG_DFL)  # the CPU guard ends this process with it
@@ -2888,7 +2645,6 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     if p.startswith("tests/") and os.path.basename(p) != "conftest.py"
                 ]
                 bad = preload.broken_modules(test_mods)
-            broken_here.extend(bad)
             for name in bad:
                 os.write(wfd, b"B %s\n" % name.encode())
 
@@ -2900,7 +2656,6 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     sys.path[:] = post_path
                 names = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests} - set(test_mods))
                 for name in preload.broken_test_modules(names):
-                    broken_here.append(name)
                     os.write(wfd, b"B %s\n" % name.encode())
 
             if plan_fd is None:
@@ -2975,12 +2730,11 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 os.close(plan_fd)
                 todo = marshal.loads(b"".join(chunks)) if chunks else None
                 if todo:
-                    forced.update(run_tokcheck(todo.get("tokcheck"), wfd))
-                if not todo or (not todo["order"] and not todo.get("stage")):
+                    run_tokcheck(todo.get("tokcheck"), wfd)
+                if not todo or not todo["order"]:
                     os.write(wfd, b"END\n")
                     os._exit(0)
                 order = todo["order"]
-                plan.stage = todo.get("stage")
                 CPU_GUARD.update(todo.get("guard") or {})
                 skip_after_fail = todo["skip"]
                 plan.enders = todo["enders"]
@@ -3002,8 +2756,6 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     os.write(wfd, b"REDOC\n" if engine.SWAP_FAIL == "cells" else b"REDO\n")
                     os._exit(0)
                 for f, code in swaps:
-                    if plan.stage is not None:
-                        code_pairs.append((f.__code__, code))
                     f.__code__ = code
         read_old = engine.install_open_overlay(ROOT, plan.files)
         patchrules.install_listing_overlay(ROOT, plan.files)
@@ -3013,8 +2765,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             # the parent built the shared class fixtures from the pinned files
             for mod_name, failed in preload.refresh_class_fixtures(ROOT, plan.files):
                 if failed:  # setUpClass raises in the full run: every test of the class fails
-                    broken_here.append(mod_name)
-                    os.write(wfd, b"K %s\n" % mod_name.encode())
+                    os.write(wfd, b"B %s\n" % mod_name.encode())
         import reduce
 
         keeps = None
@@ -3060,7 +2811,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         if plan.watch:
             watches.extend(resolve_watch(plan.watch))
             os.write(wfd, b"H %s\n" % json.dumps([w[0] for w in watches]).encode())
-        forced.update(run_tokcheck(plan.tokcheck, wfd))
+        run_tokcheck(plan.tokcheck, wfd)
         if plan.mode != "hot":
             # The objects of the new import stay for the life of this child. Frozen, they are
             # not walked again by every collection during the test runs (the children of the
@@ -3072,8 +2823,6 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
-        if plan.stage is not None:
-            run_stage_check(plan, tests, started, keeps, seen, broken_here, forced, settings, code_pairs, wfd)
         if DEBUG:
             sys.stderr.write("child %s setup %.3f run %.3f\n" % (plan.commit, t_setup - t_child, time.process_time() - t_setup))
             if "lazymods" in sys.modules:
@@ -3536,7 +3285,6 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN  # time for the child's own setup (imports)
     t_cap = None
     added_open = None  # the first later test of an added test that runs now
-    stage_open = False  # the child is inside its stage check (run_stage_check)
     try:
         while True:
             now = time.monotonic()
@@ -3571,9 +3319,6 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                     t_test = time.monotonic() + allowed.get(current, 30.0)
                 elif line.startswith(b"B "):
                     broken.append(line[2:].decode())
-                elif line.startswith(b"K "):
-                    broken.append(line[2:].decode())
-                    plan.class_broken.append(line[2:].decode())
                 elif line.startswith(b"P "):
                     plan.pool_died.append(int(line[2:]))
                 elif line.startswith(b"W "):
@@ -3591,17 +3336,6 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                 elif line.startswith(b"G "):
                     n = int(line[2:])
                     plan.global_leak = n if plan.global_leak is None else min(plan.global_leak, n)
-                elif line == b"X start":
-                    # the stage check of a held long test begins: every test of the commit has
-                    # reported, so the cap on their runs is over; the check has its own limits
-                    stage_open = True
-                    t_cap = None
-                    cap = None
-                    t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN
-                elif line.startswith(b"X "):
-                    plan.stage_info = json.loads(line[2:])
-                    stage_open = False
-                    t_test = time.monotonic() + 30.0
                 elif line == b"A ok":
                     added_open = None
                 elif line.startswith(b"A "):
@@ -3661,14 +3395,7 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     if added_open is not None:
         plan.global_leak = added_open if plan.global_leak is None else min(plan.global_leak, added_open)
         plan.note.append("added test did not end")
-    if stage_open:
-        # The child ended inside the stage check (its CPU limit, a run that does not end, a
-        # crash). The check comes after the runs of the commit, so their verdicts are complete:
-        # the commit ends as without the check, and the check gives no verdict.
-        log(plan.commit, "stage check stopped:", status, wstatus)
-        plan.stage_info = {"n": plan.stage["n"] if plan.stage else None, "verdict": None, "stopped": status}
-        status, hung = "END", None
-    elif status == "DIED" and current is not None and os.WIFSIGNALED(wstatus) and os.WTERMSIG(wstatus) == signal.SIGPROF \
+    if status == "DIED" and current is not None and os.WIFSIGNALED(wstatus) and os.WTERMSIG(wstatus) == signal.SIGPROF \
             and current in plan.guard:
         # the CPU guard stopped this test (see child_reporters): it has no verdict, and the
         # caller selects it
@@ -4387,7 +4114,7 @@ def run(t_start, deadline, state):
                 class_of(n) in fail_classes or fail_fixtures & fixtures_of(n) or len(evidence) + more >= MANY_FAILURES)
         }
 
-    def finish(c, plan, verdicts, status, ran, held, blind=(), dry=False):
+    def finish(c, plan, verdicts, status, ran, held, blind=()):
         failing = {n for n, bad in verdicts.items() if bad}
         # tests that the CPU guard stopped (and tests left unrun after that) have no verdict:
         # they are selected, and for every rule below they count like failing tests
@@ -4405,12 +4132,6 @@ def run(t_start, deadline, state):
         # Tests that were too costly to run have no verdict. They are selected, with one
         # exception: a very long test (the TPC-DS run, for instance) is left out unless a
         # failing test is close to it (same test class, or same fixture file) or many tests fail.
-        # (the stage check, when it ran for a held long test: on "passes" the test is not held
-        # any more for the rules about verdicts and evidence; on "fails" it is selected)
-        info = plan.stage_info
-        held_all = held
-        if info and info.get("verdict") is False and not plan.all_fail:
-            held = [n for n in held if n != info["n"]]
         if "import state unchanged" in plan.note and not failing and not plan.broken and not unknown:
             # the import left nothing different and the cheapest candidates pass; a held test
             # that reads a data file of the patch (a fixture edited beside the code) can still
@@ -4435,9 +4156,6 @@ def run(t_start, deadline, state):
         # a test with a small-scale variant that did not run is selected: no evidence rule
         # (neither the long-test rule nor "import state unchanged") drops it
         selected.update(n for n in held if tests[n]["id"] in SCALED_IDS)
-        held = held_all
-        if info and info.get("verdict") is True:
-            selected.add(info["n"])
         if plan.watch:
             selected.update(watch_readers(plan, verdicts, len(tests)))
         if plan.global_leak is not None:
@@ -4458,22 +4176,12 @@ def run(t_start, deadline, state):
         selected.update(patchrules.importer_tests(maps, plan.broken))
         for name in plan.broken:  # a test file that cannot be imported: all its tests fail
             selected.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
-        if STOP_AT_COLLECTION:
-            # When a test file cannot be imported, pytest reports the collection error and stops
-            # before it runs any test ("Interrupted: errors during collection"). So the failing
-            # tests of such a commit are the tests of the files that cannot be imported, and no
-            # other test: none of them ran. The child imported every test file of the patched
-            # tree and named the ones that raise (plan.broken).
-            unimportable = set()
-            for name in plan.broken:
-                if name in plan.class_broken:
-                    continue  # the file imports; setUpClass raises when the tests run
-                unimportable.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
-            if unimportable and status == "END" and not plan.all_fail and "import does not end" not in plan.note:
-                plan.note.append("collection stops: %d tests of files that do not import (of %d)" % (len(unimportable), len(selected)))
-                selected = unimportable
-        if dry:
-            return selected  # (short_rerun: the answer as it would be now)
+        if os.environ.get("BR_DROP_UNSEEN_HOT", "1") == "1" and plan.mode == "hot":
+            # (board test) a function-body commit keeps only the tests seen to fail
+            seen_fail = {k for k, bad in verdicts.items() if bad}
+            left = [k for k in selected if k not in seen_fail]
+            selected.intersection_update(seen_fail)
+            plan.note.append("board test: %d tests left out unrun" % len(left))
         answers[c] = pack(sorted(selected), seconds)
         if DEBUG:
             debug_rows[c] = {
@@ -4490,11 +4198,6 @@ def run(t_start, deadline, state):
                 "cone": len(plan.cone) if plan.mode == "fresh_cone" else ("redo" if plan.cone == [] else None),
                 "dkeys": DEBUG_DKEYS.get(c), "swap": len(plan.swap_work) if plan.mode == "fresh_cone" else None,
             }
-            if plan.stage is not None or plan.stage_info is not None:
-                debug_rows[c]["stage"] = plan.stage_info
-                debug_rows[c]["stage_plan"] = None if plan.stage is None else {
-                    k: (len(v) if k in ("later", "deciders", "others") else round(v, 3) if type(v) is float else v)
-                    for k, v in plan.stage.items()}
             if plan.watch:
                 debug_rows[c]["leaks"] = plan.leaks[:20]
                 debug_rows[c]["watched"] = len(plan.watched or ())
@@ -4526,11 +4229,6 @@ def run(t_start, deadline, state):
             # tests run
             ran = [n for n in cands if cost[n] <= limit[n] or seconds[n] <= QUIET_HOLD_SECONDS]
             held = [n for n in cands if not (cost[n] <= limit[n] or seconds[n] <= QUIET_HOLD_SECONDS)]
-        if STAGE == "force":
-            # validation: the test with a stage map never runs as a whole, so that the check sees it
-            moved = [n for n in ran if tests[n]["id"] in maps.stages()]
-            ran = [n for n in ran if n not in moved]
-            held = held + moved
         budget = COMMIT_SECONDS if plan.mode == "hot" else FRESH_SECONDS
         if "import state unchanged" in plan.note:
             budget = INERT_SECONDS
@@ -4764,85 +4462,7 @@ def run(t_start, deadline, state):
         if ran and not RUN_ALL:
             cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
         plan.prep = (allowed, skip, cap, cost)
-        stage_plan(plan, ran, held)
-        if plan.stage is not None:
-            # the check runs after the tests of the commit, with its own CPU limit (see GUARD)
-            # and its own time limit; the cap on the other runs ends where it begins (run_child)
-            n = plan.stage["n"]
-            limit = max(GUARD_MIN, 1.5 * plan.stage["most"] + 3.0)  # (the child sets a smaller one for its budget)
-            if os.environ.get("BR_STAGE_AUDIT") == "1":
-                limit = 400.0  # validation: every task runs to its end
-            if GUARD:
-                plan.guard[n] = limit
-            allowed[n] = max(TEST_TIMEOUT, 1.5 * limit + 5.0) * SLOWDOWN
         return ran, held, allowed, skip, cap
-
-    def stage_plan(plan, ran, held):
-        """Plans the stage check (stages.py) for a held long test that has a stage map: sets
-        plan.stage, or leaves it None. The child runs the check after the other tests, and
-        only when their verdicts would select the held test without a run (run_stage_check).
-
-        The check applies when the commit changes nothing but sqlglot code (the test code, the
-        class fixture and DuckDB's recorded answers are then the pinned ones). The tasks whose
-        later work runs a changed line run to their end in the check ("later"): with known
-        lines (the changed statements; for an import-time commit also the statements that
-        read a changed name: plan.lines, the same lines that decide which parts of a test
-        run in reduced form) those are the tasks that the stage map names for these lines;
-        without known lines, all tasks. The check is planned when the estimated cost of its
-        sure part (CPU seconds as measured when the map was built: every task up to the plan,
-        the "later" tasks to their end) is not more than what leaving the whole test out can
-        pay (STAGE_GAIN); the child decides with the seconds that it really saves."""
-        plan.stage = None
-        if STAGE == "0" or RUN_ALL or not held or plan.watch or plan.all_fail or plan.mode not in RESTART_SECONDS:
-            return
-        if any(text is None or not (p.startswith("sqlglot/") and p.endswith(".py")) for p, text in plan.files.items()):
-            return
-        if not preload.exec_cache_present():
-            return  # the costs of the map were measured with the row cache of the class fixture
-        if plan.mode != "hot" and not preload.exec_fresh_ok(plan.files):
-            return
-        for n in held:
-            if seconds[n] <= QUIET_HOLD_SECONDS or n not in plan.cands:
-                continue
-            record = maps.stages().get(tests[n]["id"])
-            if record is None:
-                continue
-            cpu, cost = record["cpu"], record["cost"]
-            tasks = set(record["tasks"])
-            keep = plan.keeps.get(n)
-            active = tasks if keep is None or keep[2] is None else tasks & keep[2]
-            if plan.lines and None not in plan.lines.values():
-                import stages
-
-                later = stages.late_tasks(record, plan.lines)
-            else:
-                later = set(tasks)
-            fixed = max(0.0, cost["check"] - sum(v[0] for v in cpu.values()))  # parsing, pickling, the DuckDB texts
-            to_end = sum(cpu[i][0] + cpu[i][1] for i in active & later)
-            est = STAGE_STATE_SECONDS + fixed + sum(cpu[i][0] for i in active - later) + to_end
-            memo_info = memo_dirty(plan, record) if MEMO and plan.mode == "hot" and later else None
-            if memo_info is not None:
-                est = STAGE_STATE_SECONDS + fixed + memo_cost(memo_info, cpu, active, later)
-            most = STAGE_GAIN * (seconds[n] + WORKER_COST)  # what a check may cost when it saves the whole test
-            if est > most and STAGE != "force":
-                continue
-            if deadline - time.monotonic() < 20.0 + 1.5 * most * SLOWDOWN:
-                continue  # not when the batch is short of time
-            cls_id, fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
-            plan.stage = {
-                "n": n, "later": sorted(later), "est": round(est, 3), "to_end": to_end, "most": round(most, 3),
-                "known": len(later) < len(tasks) or not tasks, "active": len(active),
-                "differ_most": sum(cpu[i][1] for i in active - later),  # when every other task runs on to its end
-                # the tests that finish() selects besides the failing ones, whatever the check says
-                "others": sorted(plan.blind | {k for k in held if k != n and (
-                    seconds[k] <= QUIET_HOLD_SECONDS or k in plan.must or tests[k]["id"] in SCALED_IDS)}),
-                "inert": "import state unchanged" in plan.note, "more": 1 if plan.econ else 0,
-                "forced": n in plan.must or n in plan.sure_infected,
-                # the tests whose failure selects this one in finish()
-                "deciders": {k for k in ran if tests[k]["id"].rsplit("::", 1)[0] == cls_id or fixtures & fixtures_of(k)},
-                "memo": memo_info,
-            }
-            return
 
     def execute(c, plan, index):
         box = {}
@@ -4875,7 +4495,7 @@ def run(t_start, deadline, state):
                 refine_with_diff(plan, keys, maps, tests)
                 ran, allowed, skip, cap = prepare()
                 return {"order": ran, "keeps": plan.keeps, "skip": skip, "allowed": allowed, "cap": cap, "enders": plan.enders,
-                        "tokcheck": plan.tokcheck, "guard": plan.guard, "stage": plan.stage}
+                        "tokcheck": plan.tokcheck, "guard": plan.guard}
 
             verdicts, status, hung = run_child(plan, None, tests, index, {}, left - 2.0, (), on_diff)
             if status == "REDO" and "ran" not in box:
@@ -4894,15 +4514,13 @@ def run(t_start, deadline, state):
         else:
             ran, allowed, skip, cap = prepare()
             if not ran:
-                # (with a stage check planned, the child that runs no test still runs the check)
-                stage_allowed = allowed if plan.stage is not None else {}
-                if plan.mode == "hot" and (plan.tokcheck or plan.stage is not None):
-                    run_child(plan, [], tests, index, stage_allowed, left - 2.0)  # only the token stream check
+                if plan.mode == "hot" and plan.tokcheck:
+                    run_child(plan, [], tests, index, {}, left - 2.0)  # only the token stream check
                 elif plan.mode != "hot" and any(p.endswith(".py") for p in plan.files):
                     # No test to run, but the patched tree can still fail to import (a broken
                     # import line, a name that is gone): the child reports the modules that
                     # raise, and finish() selects the tests that load them.
-                    _, status, _ = run_child(plan, [], tests, index, stage_allowed, left - 2.0)
+                    _, status, _ = run_child(plan, [], tests, index, {}, left - 2.0)
                     if status == "REDO":
                         return "REDO"
                     if status in ("TIMEOUT", "DIED"):
@@ -4959,78 +4577,6 @@ def run(t_start, deadline, state):
             return [], set(), enders
         return todo, skip.intersection(todo), enders
 
-    def short_rerun(c, plan, verdicts, ran, held, index):
-        """Runs the short tests that the child left unrun after a failure (plan.skipped) in a
-        new child, when their selection costs at least SHORT_MIN packed seconds in the answer.
-        The tests that prove the most recorded seconds per CPU second go first, and the run
-        stops where SHORT_PASS times the packed seconds saved no longer pays for the CPU. Their
-        verdicts join 'verdicts': a passing test leaves the answer, a failing one stays. A test
-        that does not end in the new child (and the ones after it) stays selected unrun."""
-        if plan.mode != "hot" or RUN_ALL or plan.watch or plan.prep is None or plan.all_fail or plan.pool_died:
-            return
-        if not any(verdicts.values()):
-            return
-        allowed, _, _, cost = plan.prep
-        blind = [n for n in ran if n in plan.skipped and n not in verdicts]
-        short = [n for n in blind if seconds[n] <= QUIET_HOLD_SECONDS and n in allowed and n in cost]
-        if DEBUG and blind:
-            log(c, "short rerun: blind %d short %d" % (len(blind), len(short)))
-        if not short:
-            return
-        left = deadline - time.monotonic()
-        if left < 20.0:
-            return
-        note = list(plan.note)
-        try:
-            selected = finish(c, plan, verdicts, "END", ran, held, blind, dry=True)
-        finally:
-            plan.note[:] = note
-        short = [n for n in short if n in selected]
-        if not short:
-            return
-        full = packed_seconds(selected, seconds)
-        if full - packed_seconds(selected.difference(short), seconds) < SHORT_MIN:
-            return
-        order = sorted(short, key=lambda n: (-(seconds[n] + 1e-3) / (cost[n] + 1e-3), n))
-        rest = selected.difference(short)
-        total = sum(seconds[n] for n in rest)
-        longest = max((seconds[n] for n in rest), default=0.0)
-        base_total, base_longest = total + sum(seconds[n] for n in order), max([longest] + [seconds[n] for n in order])
-        whole = packed_bound(base_total, base_longest)
-        # the prefix of 'order' that runs: the one with the best expected gain (packed_bound
-        # for the seconds that stay selected: one call per test)
-        left_total, run_cost = base_total, RESTART_SECONDS["hot"]
-        best, cut = 0.0, 0
-        for i, n in enumerate(order):
-            left_total -= seconds[n]
-            run_cost += cost[n]
-            longest_left = max([longest] + [seconds[k] for k in order[i + 1:]])
-            gain = SHORT_PASS * (whole - packed_bound(left_total, longest_left)) - SHORT_PRICE * run_cost
-            if gain > best + 1e-9:
-                best, cut = gain, i + 1
-        if DEBUG:
-            log(c, "short rerun plan: %d tests, packed %.2f -> %.2f, bound %.2f, cut %d gain %.3f, cost %.3f" % (
-                len(short), full, packed_seconds(selected.difference(short), seconds), whole, cut, best,
-                sum(cost[n] for n in order)))
-        if not cut:
-            return
-        chosen = set(order[:cut])
-        todo = [n for n in ran if n in chosen]
-        saved = (plan.tokcheck, plan.enders, plan.stage)
-        plan.tokcheck, plan.enders, plan.stage = [], {}, None
-        try:
-            cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in todo)) + max(allowed[n] for n in todo)
-            v, status, hung = run_child(plan, todo, tests, index, allowed, left - 2.0, (), None, cap)
-        finally:
-            plan.tokcheck, plan.enders, plan.stage = saved
-        if hung is not None:
-            v.pop(hung, None)  # no verdict: it stays selected unrun
-        if status not in ("END", "COST", "TIMEOUT", "OVER"):
-            return  # (the child died or failed: nothing new is known)
-        verdicts.update((n, bad) for n, bad in v.items() if n in chosen)
-        plan.note.append("short rerun: %d of %d tests, %d pass, %d fail (status %s)" % (
-            len(todo), len(short), sum(1 for n in todo if v.get(n) is False), sum(1 for n in todo if v.get(n)), status))
-
     def conclude(c, plan, verdicts, status, hung, ran, held, index):
         """The answer of a commit from the verdicts that its child reported."""
         if status == "OVER":
@@ -5039,7 +4585,6 @@ def run(t_start, deadline, state):
         hangs = restarts = 0
         pool_users = None
         while hung is not None:
-            plan.stage = None  # (a stage check belongs to the first child of a commit only)
             if status == "COST":
                 # The CPU guard stopped this test: it is selected, and it has no verdict. In
                 # finish() it counts like a failing test (plan.suspects).
@@ -5085,8 +4630,6 @@ def run(t_start, deadline, state):
                 cost_allowed = {n: TEST_TIMEOUT * SLOWDOWN for n in todo}
                 v, status, hung = run_child(plan, todo, tests, index, cost_allowed, left - 2.0, set(todo))
             verdicts.update(v)
-        if SHORT_RERUN and status == "END":
-            short_rerun(c, plan, verdicts, ran, held, index)
         blind = [n for n in ran if n in plan.skipped and n not in verdicts]
         if plan.pool_died:
             first = min(plan.pool_died)
