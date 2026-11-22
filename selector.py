@@ -1138,7 +1138,7 @@ def record_import_time():
     return stop
 
 
-def verify_candidates(cand_nums, patch_text, test_registry, m):
+def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     """Run the runnable candidates in a forked child with the patch active; keep the failing ones.
 
     Only when every changed file is an existing sqlglot .py module whose change is confined to
@@ -1157,6 +1157,21 @@ def verify_candidates(cand_nums, patch_text, test_registry, m):
             runnable.append((num, cls_obj, method_name, tid))
     if not runnable:
         return cand_nums
+
+    # Cost gate: verify a commit only when (cost of candidates) - (cost of tests that must stay unrun)
+    # exceeds the estimated CPU of the child x 1.6 (official CPU is ~1.6x our local CPU).
+    cand_workers = best_split([(n, ms[n]) for n in cand_nums])
+    cand_cost = (max(sum(ms[i] for i in w) for w in cand_workers) + WORKER_COST_MS * len(cand_workers)) / 1000.0 if cand_workers else 0.0
+
+    unrun_workers = best_split([(n, ms[n]) for n in must_keep]) if must_keep else []
+    unrun_cost = (max(sum(ms[i] for i in w) for w in unrun_workers) + WORKER_COST_MS * len(unrun_workers)) / 1000.0 if unrun_workers else 0.0
+
+    potential_savings = max(0.0, cand_cost - unrun_cost)
+    child_cpu_est = 0.05 + sum(ms[num] for num, *_ in runnable) / 1000.0
+    if potential_savings <= child_cpu_est * 1.6:
+        log(f"  cost gate skipped: savings {potential_savings:.3f}s <= child cost {child_cpu_est * 1.6:.3f}s")
+        return cand_nums
+
     try:
         swaps = []
         for f in parse_patch(patch_text):
@@ -1261,61 +1276,82 @@ def main() -> None:
         m = None
     all_split = best_split(every)
 
-    # Pre-import sqlglot and test modules into parent memory
+    if m is not None:
+        for g in m.pool_groups:
+            POOLED.update(m.tests[i] for i in g)
+
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    patch_entries = []
+    touched_sqlglot_modules = set()
+    all_cand_nums = set()
+
+    for p in patches:
+        stem = p.stem
+        text = p.read_text(encoding="utf-8", errors="replace")
+        chosen = ALL
+        if m is not None:
+            try:
+                chosen = select(m, text)
+            except Exception as e:  # noqa: BLE001
+                log(f"{stem}: {e!r}")
+                chosen = ALL
+        if chosen is ALL:
+            patch_entries.append((stem, text, ALL))
+        else:
+            cands = sorted({number[m.tests[i]] for i in chosen if m.tests[i] in number})
+            patch_entries.append((stem, text, cands))
+            if cands:
+                all_cand_nums.update(cands)
+                for f in parse_patch(text):
+                    for key in ("old", "new"):
+                        path = f.get(key)
+                        if path and path.startswith("sqlglot/") and path.endswith(".py"):
+                            mod_name = path[:-3].replace("/", ".")
+                            if mod_name.endswith(".__init__"):
+                                mod_name = mod_name[: -len(".__init__")]
+                            touched_sqlglot_modules.add(mod_name)
+
+    # Pre-import ONLY touched sqlglot modules and candidate test modules
     sys.path.insert(0, str(SRC))
     NUMBER.update(number)
     stop_recording = record_import_time()
     import sqlglot  # noqa: F401
 
-    for py in sorted((SRC / "sqlglot").rglob("*.py")):  # lazily imported modules too, while recording
-        name = ".".join(py.relative_to(SRC).with_suffix("").parts)
-        if name.endswith(".__init__"):
-            name = name[: -len(".__init__")]
-        if name.endswith("__main__"):
-            continue
+    for mod_name in sorted(touched_sqlglot_modules):
         try:
-            importlib.import_module(name)
+            importlib.import_module(mod_name)
         except BaseException:  # noqa: BLE001
             pass
 
+    test_by_num = {t["number"]: t for t in tests}
     test_registry = {}
-    for t in tests:
+    for num in all_cand_nums:
+        t = test_by_num.get(num)
+        if not t:
+            continue
         file_part, cls_part, method_part = t["id"].split("::")
         mod_name = file_part[:-3].replace("/", ".")
         try:
             mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
             cls_obj = getattr(mod, cls_part)
-            test_registry[t["number"]] = (cls_obj, method_part, t["id"])
+            test_registry[num] = (cls_obj, method_part, t["id"])
         except Exception:
-            test_registry[t["number"]] = None
+            test_registry[num] = None
     stop_recording()
-    if m is not None:
-        for g in m.pool_groups:
-            POOLED.update(m.tests[i] for i in g)
 
-    for patch in sorted((DATA / "commits").glob("*.patch")):
-        chosen = ALL
-        patch_text = patch.read_text(encoding="utf-8", errors="replace")
-        if m is not None:
-            try:
-                chosen = select(m, patch_text)
-            except Exception as e:  # noqa: BLE001
-                log(f"{patch.stem}: {e!r}")
-                chosen = ALL
+    for stem, patch_text, chosen in patch_entries:
         if chosen is ALL:
             workers = all_split
-            log(f"{patch.stem}: all tests")
+            log(f"{stem}: all tests")
+        elif not chosen:
+            workers = []
+            log(f"{stem}: 0 tests")
         else:
-            cands = sorted({number[m.tests[i]] for i in chosen if m.tests[i] in number})
-            if not cands:
-                workers = []
-                log(f"{patch.stem}: 0 tests")
-            else:
-                verified = verify_candidates(cands, patch_text, test_registry, m)
-                nums = sorted(verified)
-                workers = best_split([(n, ms[n]) for n in nums])
-                log(f"{patch.stem}: {len(nums)} tests (from {len(cands)} cands)")
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
+            verified = verify_candidates(chosen, patch_text, test_registry, m, ms)
+            nums = sorted(verified)
+            workers = best_split([(n, ms[n]) for n in nums])
+            log(f"{stem}: {len(nums)} tests (from {len(chosen)} cands)")
+        print(json.dumps({"commit": stem, "workers": workers}))
 
 
 if __name__ == "__main__":
