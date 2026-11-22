@@ -93,6 +93,7 @@ class Verdicts(unittest.TestResult):
 _FAILED_IMPORTS = {}
 ON_IMPORT = {}  # module name -> function called once with the module after its first load here
 _PARSED_TEST_IDS = {}
+_CLASS_CACHE = {}
 
 
 def load_case(test_id: str, number: int):
@@ -119,7 +120,12 @@ def load_case(test_id: str, number: int):
         hook = ON_IMPORT.pop(name, None)
         if hook is not None:
             hook(mod)
-    case = getattr(mod, cls_name)(meth)
+    cls_key = (id(mod), cls_name)
+    cls = _CLASS_CACHE.get(cls_key)
+    if cls is None:
+        cls = getattr(mod, cls_name)
+        _CLASS_CACHE[cls_key] = cls
+    case = cls(meth)
     case._br_number = number
     return case
 
