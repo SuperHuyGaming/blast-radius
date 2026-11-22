@@ -1415,6 +1415,11 @@ def verify_candidates(cand_nums, patch_text, test_registry, m, ms):
     except Exception:  # noqa: BLE001
         return cand_nums
     keep = set(must_keep) | (failing & {n for n, *_ in runnable})
+    for g in m.pool_groups:
+        nums = sorted(NUMBER[m.tests[i]] for i in g if m.tests[i] in NUMBER)
+        hit = [n for n in nums if n in keep]
+        if hit:
+            keep |= {n for n in nums if n >= hit[0] and n in set(cand_nums)}
     return sorted(keep)
 
 
