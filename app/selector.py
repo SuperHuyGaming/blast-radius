@@ -113,6 +113,17 @@ CLASS_SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0} if os.enviro
 HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
+# Short reruns (short_rerun in run): after a first failure, the child leaves the tests of
+# the 'skip' set unrun, and finish() selects them as they are. When those short tests cost at
+# least SHORT_MIN packed seconds in the answer, a second child runs them anyway (the most
+# recorded seconds per CPU second first, as far as the expected saving pays for the CPU): a
+# failing one stays selected, a passing one leaves the answer. BR_SHORT_RERUN=0 turns it off.
+SHORT_RERUN = os.environ.get("BR_SHORT_RERUN", "1") == "1"
+SHORT_MIN = float(os.environ.get("BR_SHORT_MIN", "2.0"))  # packed seconds of those tests at least
+SHORT_PASS = float(os.environ.get("BR_SHORT_PASS", "0.75"))  # share of them that pass (labeled mutants: 0.77)
+# charged seconds per estimated CPU second (a run costs about 0.7 of its estimate in local CPU,
+# and the scoring machine charges about 0.6 of that)
+SHORT_PRICE = float(os.environ.get("BR_SHORT_PRICE", "0.3"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 # A plain pytest run stops at collection when a test file cannot be imported (see finish()).
 # BR_STOP_AT_COLLECTION=0: such a commit also gets the tests that fail when they run.
@@ -4315,7 +4326,7 @@ def run(t_start, deadline, state):
                 class_of(n) in fail_classes or fail_fixtures & fixtures_of(n) or len(evidence) + more >= MANY_FAILURES)
         }
 
-    def finish(c, plan, verdicts, status, ran, held, blind=()):
+    def finish(c, plan, verdicts, status, ran, held, blind=(), dry=False):
         failing = {n for n, bad in verdicts.items() if bad}
         # tests that the CPU guard stopped (and tests left unrun after that) have no verdict:
         # they are selected, and for every rule below they count like failing tests
@@ -4400,6 +4411,8 @@ def run(t_start, deadline, state):
             if unimportable and status == "END" and not plan.all_fail and "import does not end" not in plan.note:
                 plan.note.append("collection stops: %d tests of files that do not import (of %d)" % (len(unimportable), len(selected)))
                 selected = unimportable
+        if dry:
+            return selected  # (short_rerun: the answer as it would be now)
         answers[c] = pack(sorted(selected), seconds)
         if DEBUG:
             debug_rows[c] = {
@@ -4881,6 +4894,78 @@ def run(t_start, deadline, state):
             return [], set(), enders
         return todo, skip.intersection(todo), enders
 
+    def short_rerun(c, plan, verdicts, ran, held, index):
+        """Runs the short tests that the child left unrun after a failure (plan.skipped) in a
+        new child, when their selection costs at least SHORT_MIN packed seconds in the answer.
+        The tests that prove the most recorded seconds per CPU second go first, and the run
+        stops where SHORT_PASS times the packed seconds saved no longer pays for the CPU. Their
+        verdicts join 'verdicts': a passing test leaves the answer, a failing one stays. A test
+        that does not end in the new child (and the ones after it) stays selected unrun."""
+        if plan.mode != "hot" or RUN_ALL or plan.watch or plan.prep is None or plan.all_fail or plan.pool_died:
+            return
+        if not any(verdicts.values()):
+            return
+        allowed, _, _, cost = plan.prep
+        blind = [n for n in ran if n in plan.skipped and n not in verdicts]
+        short = [n for n in blind if seconds[n] <= QUIET_HOLD_SECONDS and n in allowed and n in cost]
+        if DEBUG and blind:
+            log(c, "short rerun: blind %d short %d" % (len(blind), len(short)))
+        if not short:
+            return
+        left = deadline - time.monotonic()
+        if left < 20.0:
+            return
+        note = list(plan.note)
+        try:
+            selected = finish(c, plan, verdicts, "END", ran, held, blind, dry=True)
+        finally:
+            plan.note[:] = note
+        short = [n for n in short if n in selected]
+        if not short:
+            return
+        full = packed_seconds(selected, seconds)
+        if full - packed_seconds(selected.difference(short), seconds) < SHORT_MIN:
+            return
+        order = sorted(short, key=lambda n: (-(seconds[n] + 1e-3) / (cost[n] + 1e-3), n))
+        rest = selected.difference(short)
+        total = sum(seconds[n] for n in rest)
+        longest = max((seconds[n] for n in rest), default=0.0)
+        base_total, base_longest = total + sum(seconds[n] for n in order), max([longest] + [seconds[n] for n in order])
+        whole = packed_bound(base_total, base_longest)
+        # the prefix of 'order' that runs: the one with the best expected gain (packed_bound
+        # for the seconds that stay selected: one call per test)
+        left_total, run_cost = base_total, RESTART_SECONDS["hot"]
+        best, cut = 0.0, 0
+        for i, n in enumerate(order):
+            left_total -= seconds[n]
+            run_cost += cost[n]
+            longest_left = max([longest] + [seconds[k] for k in order[i + 1:]])
+            gain = SHORT_PASS * (whole - packed_bound(left_total, longest_left)) - SHORT_PRICE * run_cost
+            if gain > best + 1e-9:
+                best, cut = gain, i + 1
+        if DEBUG:
+            log(c, "short rerun plan: %d tests, packed %.2f -> %.2f, bound %.2f, cut %d gain %.3f, cost %.3f" % (
+                len(short), full, packed_seconds(selected.difference(short), seconds), whole, cut, best,
+                sum(cost[n] for n in order)))
+        if not cut:
+            return
+        chosen = set(order[:cut])
+        todo = [n for n in ran if n in chosen]
+        saved = (plan.tokcheck, plan.enders, plan.stage)
+        plan.tokcheck, plan.enders, plan.stage = [], {}, None
+        try:
+            cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in todo)) + max(allowed[n] for n in todo)
+            v, status, hung = run_child(plan, todo, tests, index, allowed, left - 2.0, (), None, cap)
+        finally:
+            plan.tokcheck, plan.enders, plan.stage = saved
+        if hung is not None:
+            v.pop(hung, None)  # no verdict: it stays selected unrun
+        if status not in ("END", "COST", "TIMEOUT", "OVER"):
+            return  # (the child died or failed: nothing new is known)
+        verdicts.update((n, bad) for n, bad in v.items() if n in chosen)
+        plan.note.append("short rerun: %d of %d tests, %d pass, %d fail (status %s)" % (
+            len(todo), len(short), sum(1 for n in todo if v.get(n) is False), sum(1 for n in todo if v.get(n)), status))
+
     def conclude(c, plan, verdicts, status, hung, ran, held, index):
         """The answer of a commit from the verdicts that its child reported."""
         if status == "OVER":
@@ -4935,6 +5020,8 @@ def run(t_start, deadline, state):
                 cost_allowed = {n: TEST_TIMEOUT * SLOWDOWN for n in todo}
                 v, status, hung = run_child(plan, todo, tests, index, cost_allowed, left - 2.0, set(todo))
             verdicts.update(v)
+        if SHORT_RERUN and status == "END":
+            short_rerun(c, plan, verdicts, ran, held, index)
         blind = [n for n in ran if n in plan.skipped and n not in verdicts]
         if plan.pool_died:
             first = min(plan.pool_died)
