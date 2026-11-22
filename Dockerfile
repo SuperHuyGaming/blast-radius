@@ -1,19 +1,26 @@
-# Same base image (by digest) that the organizers labeled the commits in.
+# The scorer builds this on linux/amd64 and runs it with no network. The
+# digest is the image we labeled every commit in: its Python and SQLite
+# decide which sqlglot tests run, so keep it if your image runs them.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
-# Exact package set of the labeling environment (PyPI only).
-COPY requirements.lock /tmp/requirements.lock
-RUN pip install --no-cache-dir -r /tmp/requirements.lock
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# sqlglot at the pinned commit, precompiled so imports are cheap at run time.
-COPY tools/fetch_sqlglot.py /tmp/fetch_sqlglot.py
-RUN python /tmp/fetch_sqlglot.py /opt/sqlglot \
- && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
- && chmod -R a+rX /opt/sqlglot
+# The exact package set the commits were labeled with, so tests run here behave as they did there.
+COPY requirements.lock /app/requirements.lock
+RUN pip install -r /app/requirements.lock
 
-COPY br /app/br
-COPY maps /app/maps
-RUN python -m compileall -q /app/br && chmod -R a+rX /app
+# sqlglot at the pinned commit, from sqlglot's own repository, byte-compiled so the read-only run
+# never needs to write caches.
+COPY tools/fetch_sqlglot.py /app/fetch_sqlglot.py
+RUN python /app/fetch_sqlglot.py eb11aec4be8cb2122afe713a4816662c3f0fb2fa /opt/sqlglot \
+    && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
+    && chmod -R a+rX /opt/sqlglot
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app SKIP_INTEGRATION=0 BR_SQLGLOT=/opt/sqlglot BR_MAPS=/app/maps
-CMD ["python", "-m", "br.main"]
+# Runtime: selector, verifier and the maps built from the pinned commit's own test run.
+COPY selector.py verify.py verify_driver.py index.json.gz /app/
+RUN python -m compileall -q /app && chmod -R a+rX /app
+
+ENV BR_SQLGLOT=/opt/sqlglot
+CMD ["python", "/app/selector.py"]

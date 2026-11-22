@@ -1,20 +1,23 @@
-"""Build-time only: download sqlglot at the pinned commit into /opt/sqlglot."""
-import io, os, sys, tarfile, urllib.request
+"""Build step: download sqlglot at the pinned commit from sqlglot's own GitHub repository."""
+import io
+import shutil
+import sys
+import tarfile
+import time
+import urllib.request
 
-COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
-URL = f"https://github.com/tobymao/sqlglot/archive/{COMMIT}.tar.gz"
-DEST = sys.argv[1] if len(sys.argv) > 1 else "/opt/sqlglot"
-
-data = urllib.request.urlopen(URL, timeout=120).read()
-os.makedirs(DEST, exist_ok=True)
-with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-    prefix = f"sqlglot-{COMMIT}/"
-    for m in tf.getmembers():
-        if not m.name.startswith(prefix):
-            continue
-        rel = m.name[len(prefix):]
-        if not rel:
-            continue
-        m.name = rel
-        tf.extract(m, DEST, filter="data")
-print("fetched sqlglot", COMMIT, "->", DEST)
+commit, dest = sys.argv[1], sys.argv[2]
+url = f'https://github.com/tobymao/sqlglot/archive/{commit}.tar.gz'
+for attempt in range(5):
+    try:
+        data = urllib.request.urlopen(url, timeout=120).read()
+        break
+    except OSError as exc:
+        print(f'download failed ({exc}); retrying', file=sys.stderr)
+        time.sleep(3 * (attempt + 1))
+else:
+    raise SystemExit('could not download sqlglot')
+with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+    tar.extractall('/tmp/sqlglot-src', filter='data')
+shutil.move(f'/tmp/sqlglot-src/sqlglot-{commit}', dest)
+print('sqlglot', commit, '->', dest, file=sys.stderr)
