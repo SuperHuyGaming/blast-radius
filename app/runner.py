@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import importlib
 import os
+import sys
 import unittest
 from unittest.suite import _ErrorHolder
 
