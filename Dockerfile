@@ -1,19 +1,21 @@
-# Same base image (by digest) that the organizers labeled the commits in.
+# The digest is the image the organizers labeled every commit in.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
-# Exact package set of the labeling environment (PyPI only).
-COPY requirements.lock /tmp/requirements.lock
-RUN pip install --no-cache-dir -r /tmp/requirements.lock
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# sqlglot at the pinned commit, precompiled so imports are cheap at run time.
-COPY tools/fetch_sqlglot.py /tmp/fetch_sqlglot.py
-RUN python /tmp/fetch_sqlglot.py /opt/sqlglot \
- && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
- && chmod -R a+rX /opt/sqlglot
+# The environment the tests were labeled in.
+COPY requirements.lock /app/requirements.lock
+RUN pip install -r /app/requirements.lock
 
-COPY br /app/br
-COPY maps /app/maps
-RUN python -m compileall -q /app/br && chmod -R a+rX /app
+# sqlglot at the pinned commit, straight from its own repository.
+COPY tools/fetch_sqlglot.py /app/tools/fetch_sqlglot.py
+RUN python /app/tools/fetch_sqlglot.py /src
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app SKIP_INTEGRATION=0 BR_SQLGLOT=/opt/sqlglot BR_MAPS=/app/maps
-CMD ["python", "-m", "br.main"]
+COPY selector.py engine.py runner.py patchfmt.py pyscope.py blastkeys.py unitcheck.py /app/
+COPY mapsgz/ /app/maps/
+RUN gunzip /app/maps/*.gz \
+ && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app /src/sqlglot/sqlglot /src/sqlglot/tests \
+ && chmod -R a+rX /app /src
+
+ENV BLAST_SRC=/src/sqlglot BLAST_MAPS=/app/maps
+CMD ["python", "/app/selector.py"]

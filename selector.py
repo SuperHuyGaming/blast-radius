@@ -1,1062 +1,1420 @@
 """Blast Radius selector.
 
-For each patch to sqlglot (pinned eb11aec), pick the tests that could fail and
-pack them onto the cheapest number of workers.
+For each patch against the pinned sqlglot commit, print the tests that can fail.
 
-How a test set is chosen, per changed file:
-  * Python, only comments or blank lines changed (same token stream): no tests.
-  * Python that no longer compiles: every test.
-  * A changed line inside a function body: the tests that ran that statement
-    on the pinned commit (per-test coverage map, see mapgen/).
-  * A changed import-time statement (module or class level constant, def
-    header, new method): tests that ran code using the names it defines,
-    following names derived from them at import time; every test when the
-    chain reaches import-time use.
-  * A data file (fixtures): the tests that opened it on the pinned commit.
-  * Anything unknown: every test. A miss costs 300 s, running everything
-    about 37 s, so when in doubt the selector runs everything.
+How a patch is turned into tests:
+
+  1. Fixture and other data files: the tests recorded as opening that file.
+  2. A change inside a function body: the tests recorded as executing the
+     changed statement (or the whole function when the edit is not a plain
+     line-for-line replacement).
+  3. A change that takes effect at import time (class attributes, table
+     entries, decorators, module constants, functions called while importing):
+     a forked child imports the patched module and its dependents, compares
+     every class and module global with the original, and selects the tests
+     recorded as reading the attributes or looking up the keys that differ.
+  4. Anything not understood: every test.
+
+All records come from running the suite once at the pinned commit
+(tools/mapplugin.py).  Nothing here knows about any particular patch.
 """
 
-from __future__ import annotations
-
 import ast
-import gzip
-import io
 import json
+import marshal
 import os
-import re
 import sys
-import tokenize
-from pathlib import Path
+import time
 
-DATA = Path(os.environ.get("BLAST_DATA", "/data"))
-APP = Path(os.environ.get("BLAST_APP", "/app"))
-SRC = Path(os.environ.get("BLAST_SRC", str(APP / "src")))
+import patchfmt
+from pyscope import Focus
+
+T0 = time.monotonic()
+DATA = os.environ.get("BLAST_DATA", "/data")
+SRC = os.environ.get("BLAST_SRC", "/src/sqlglot")
+MAPS = os.environ.get("BLAST_MAPS", "/app/maps")
+DEBUG = os.environ.get("BLAST_DEBUG") == "1"
+DEADLINE = float(os.environ.get("BLAST_DEADLINE", "150"))  # seconds of wall clock for the batch
+WORKER_MS = 2000
 MAX_WORKERS = 8
-WORKER_COST_MS = 2000
-ALL = None  # "every test"
-UNKNOWN = object()  # "the map has nothing on this": callers fall back to another rule
-
-NO_EFFECT_PREFIXES = ("docs/", "posts/", "benchmarks/", "pdoc/", ".github/")
-NO_EFFECT_SUFFIXES = (".md", ".rst", ".txt", ".png", ".jpg", ".svg", ".gif")
-NO_EFFECT_FILES = {"LICENSE", "CHANGELOG.md", "README.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", ".gitignore"}
+PYTEST_CONFIG = {"pytest.ini", "tox.ini", "conftest.py", ".pytest.ini", "pytest.toml", ".pytest.toml"}
 
 
 def log(*a):
-    print(*a, file=sys.stderr)
+    print(*a, file=sys.stderr, flush=True)
 
 
-class Map:
-    def __init__(self, path: Path):
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            d = json.load(f)
-        self.tests = d["tests"]
-        self.sets = d["sets"]
-        self.lines = d["lines"]
-        self.opens = d["opens"]
-        self.refs = d["refs"]
-        self.derive = d["derive"]
-        self.import_use = set(d["import_use"])
-        self.classes = d.get("classes", {})
-        self.class_uses = d.get("class_uses", {})
-        self.qrefs = d.get("qrefs", {})
-        self.qderive = d.get("qderive", {})
-        self.str_names = set(d.get("str_names", []))
-        self.classes_import = set(d.get("classes_import", []))
-        self.cmp_differ = d.get("cmp_differ", {})
-        self.cmp_seen = set(d.get("cmp_seen", []))
-        self.pool_groups = [set(self.sets[g]) for g in d.get("pool_groups", []) if g != -1]
-        self.by_file: dict[str, set[int]] = {}
+class Maps:
+    def __init__(self, path):
+        self.path = path
+        self.head = _load(os.path.join(path, "head.bin"))
+        self.tests = self.head["tests"]
+        self.n = len(self.tests)
+        self.all_bits = (1 << self.n) - 1
+        self._index = _load(os.path.join(path, "lines.idx"))
+        # list-driven tests recorded one item at a time, as "<test id>#<index>"
+        self.unit_lists = self.head.get("unit_lists", {})
+        self.units = {}
+        self.unit_mask = 0
+        self.units_x = {}  # the same items, counting only what runs outside the optimizer
         for i, t in enumerate(self.tests):
-            self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
-        self.test_index = {t: i for i, t in enumerate(self.tests)}
-        self.pool_ast_pos: dict[int, int] = {}
-        for g in self.pool_groups:
-            files_classes: dict[str, dict[str, list[tuple[str, int]]]] = {}
-            for t_idx in g:
-                parts = self.tests[t_idx].split("::")
-                if len(parts) == 3:
-                    fpath, cname, mname = parts
-                    files_classes.setdefault(fpath, {}).setdefault(cname, []).append((mname, t_idx))
-            for fpath, classes in files_classes.items():
-                f_src = SRC / fpath
-                if not f_src.is_file():
-                    continue
-                try:
-                    tree = ast.parse(f_src.read_text(encoding="utf-8"))
-                    for node in tree.body:
-                        if isinstance(node, ast.ClassDef) and node.name in classes:
-                            ast_order = {}
-                            pos = 0
-                            for item in node.body:
-                                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
-                                    ast_order[item.name] = pos
-                                    pos += 1
-                            for mname, t_idx in classes[node.name]:
-                                if mname in ast_order:
-                                    self.pool_ast_pos[t_idx] = ast_order[mname]
-                except Exception as e:  # noqa: BLE001
-                    log(f"error parsing {fpath} for pool AST order: {e!r}")
+            if "#" in t:
+                base, idx = t.rsplit("#", 1)
+                if idx.endswith("@x"):
+                    self.units_x.setdefault(base, {})[int(idx[:-2])] = 1 << i
+                else:
+                    self.units.setdefault(base, {})[int(idx)] = 1 << i
+                self.unit_mask |= 1 << i
+        self._blob = None
+        self._lines = {}
+        self._reads = None
+        self._subs = None
+        self._file_bits = None
+        self.opens = {os.path.normpath(k) if not k.startswith("dir:") else "dir:" + os.path.normpath(k[4:] or "."): 0
+                      for k in self.head["opens"]}
+        for k, v in self.head["opens"].items():
+            nk = os.path.normpath(k) if not k.startswith("dir:") else "dir:" + os.path.normpath(k[4:] or ".")
+            self.opens[nk] |= v
 
-        self.generator_slots_span = (925, 948)
-        self.generator_init_span = (950, 1010)
-        gen_file = SRC / "sqlglot/generator.py"
-        if gen_file.is_file():
-            try:
-                slots_s = slots_e = init_s = init_e = None
-                for i, line in enumerate(gen_file.read_text(encoding="utf-8").splitlines(), 1):
-                    if line.startswith("    __slots__ = ("):
-                        slots_s = i
-                    elif slots_s and slots_e is None and line.strip().endswith(")"):
-                        slots_e = i
-                    elif line.startswith("    def __init__("):
-                        init_s = i
-                    elif init_s and init_e is None and line.startswith("    def "):
-                        init_e = i - 1
-                if slots_s and slots_e:
-                    self.generator_slots_span = (slots_s, slots_e)
-                if init_s and init_e:
-                    self.generator_init_span = (init_s, init_e)
-            except Exception as e:  # noqa: BLE001
-                log(f"error scanning generator.py spans: {e!r}")
-
-        self.dialect_generator_span = (1378, 1381)
-        dia_file = SRC / "sqlglot/dialects/dialect.py"
-        if dia_file.is_file():
-            try:
-                gen_s = gen_e = None
-                for i, line in enumerate(dia_file.read_text(encoding="utf-8").splitlines(), 1):
-                    if line.startswith("    def generator("):
-                        gen_s = i
-                    elif gen_s and gen_e is None and line.startswith("    def "):
-                        gen_e = i - 1
-                if gen_s and gen_e:
-                    self.dialect_generator_span = (gen_s, gen_e)
-            except Exception as e:  # noqa: BLE001
-                log(f"error scanning dialect.py spans: {e!r}")
-
-    def set_of(self, sid):
-        return ALL if sid == -1 else set(self.sets[sid])
-
-    def line(self, f, ln):
-        sid = self.lines.get(f, {}).get(str(ln))
-        return set() if sid is None else self.set_of(sid)
-
-    def span(self, f, lo, hi):
-        acc: set[int] = set()
-        fl = self.lines.get(f, {})
-        for ln in range(lo, hi + 1):
-            sid = fl.get(str(ln))
-            if sid is None:
-                continue
-            if sid == -1:
-                return ALL
-            acc.update(self.sets[sid])
-        return acc
-
-    def names(self, names, limit=60):
-        """Tests that ran code using these names, following import-time derivations."""
-        acc: set[int] = set()
-        seen = set()
-        todo = list(names)
-        while todo:
-            n = todo.pop()
-            if n in seen:
-                continue
-            seen.add(n)
-            if len(seen) > limit or n in self.import_use:
-                return ALL
-            sid = self.refs.get(n)
-            if sid == -1:
-                return ALL
-            if sid is not None:
-                acc.update(self.sets[sid])
-            todo.extend(self.derive.get(n, []))
-        return acc
-
-
-def add(acc, s):
-    if acc is ALL or s is ALL:
-        return ALL
-    acc |= s
-    return acc
-
-
-# ---------------------------------------------------------------- patches
-
-def parse_patch(text: str):
-    """-> list of (old_path, new_path, hunks); hunk = (old_start, new_start, [(tag, text)])."""
-    files = []
-    cur = None
-    hunk = None
-    for raw in text.split("\n"):
-        if raw.startswith("diff --git "):
-            cur = {"old": None, "new": None, "hunks": []}
-            files.append(cur)
-            m = re.match(r"diff --git a/(.*) b/(.*)$", raw)
-            if m:
-                cur["old"], cur["new"] = m.group(1), m.group(2)
-            hunk = None
-            continue
-        if cur is None:
-            continue
-        if raw.startswith("--- ") and hunk is None:
-            p = raw[4:].strip()
-            cur["old"] = None if p == "/dev/null" else p[2:] if p.startswith("a/") else p
-            continue
-        if raw.startswith("+++ ") and hunk is None:
-            p = raw[4:].strip()
-            cur["new"] = None if p == "/dev/null" else p[2:] if p.startswith("b/") else p
-            continue
-        m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
-        if m:
-            hunk = (int(m.group(1)), int(m.group(2)), [])
-            cur["hunks"].append(hunk)
-            continue
-        if hunk is not None and raw[:1] in (" ", "-", "+"):
-            hunk[2].append((raw[0], raw[1:]))
-        elif hunk is not None and raw.startswith("\\"):
-            continue
-        elif raw.startswith(("new file", "deleted file", "similarity", "rename ", "index ", "old mode", "new mode", "Binary")):
-            cur.setdefault("meta", []).append(raw)
-    return files
-
-
-def apply_hunks(old_text: str, hunks):
-    old = old_text.split("\n")
-    out = []
-    pos = 0  # 0-based index into old
-    for old_start, _new_start, lines in hunks:
-        start = max(old_start - 1, 0) if any(t != "+" for t, _ in lines) else old_start
-        out.extend(old[pos:start])
-        pos = start
-        for tag, text in lines:
-            if tag == " ":
-                out.append(old[pos] if pos < len(old) else text)
-                pos += 1
-            elif tag == "-":
-                pos += 1
+    def lines(self, rel):
+        d = self._lines.get(rel)
+        if d is None:
+            hit = self._index.get(rel)
+            if hit is None:
+                d = {}
             else:
-                out.append(text)
-    out.extend(old[pos:])
-    return "\n".join(out)
+                if self._blob is None:
+                    with open(os.path.join(self.path, "lines.bin"), "rb") as f:
+                        self._blob = f.read()
+                d = marshal.loads(self._blob[hit[0] : hit[0] + hit[1]])
+            self._lines[rel] = d
+        return d
 
-
-def changed_lines(hunks):
-    """-> (deleted old line numbers, [(new line no, old anchor line no)] for added lines)."""
-    dels, adds = [], []
-    for old_start, new_start, lines in hunks:
-        o, n = old_start, new_start
-        if all(t == "+" for t, _ in lines):
-            o = old_start + 1  # "-k,0" means insertion after old line k
-        for tag, text in lines:
-            if tag == " ":
-                o += 1
-                n += 1
-            elif tag == "-":
-                dels.append(o)
-                o += 1
+    def _read_entry(self, key):
+        if self._reads is None:
+            self._reads = _load(os.path.join(self.path, "reads.idx"))
+            self._read_cache = {}
+        hit = self._read_cache.get(key)
+        if hit is None:
+            loc = self._reads.get(key)
+            if loc is None:
+                hit = None
             else:
-                adds.append((n, o))
-                n += 1
-    return dels, adds
+                with open(os.path.join(self.path, "reads.bin"), "rb") as f:
+                    f.seek(loc[0])
+                    hit = marshal.loads(f.read(loc[1]))
+            self._read_cache[key] = hit
+        return hit
 
+    def attr_reads(self, cname):
+        """{attribute: tests that read it} for one class."""
+        return self._read_entry("a" + cname) or {}
 
-# ---------------------------------------------------------------- python analysis
+    def key_reads(self, label):
+        """{key: tests that look it up} for one dict or set, None when not recorded."""
+        return self._read_entry("k" + label)
 
-def code_tokens(text):
-    skip = {tokenize.COMMENT, tokenize.NL, tokenize.ENCODING}
-    return [(t.type, t.string) for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type not in skip]
+    @property
+    def lazy(self):
+        if not hasattr(self, "_lazy"):
+            try:
+                self._lazy = _load(os.path.join(self.path, "lazy.bin"))
+            except OSError:
+                self._lazy = {}
+        return self._lazy
 
+    @property
+    def probe(self):
+        if not hasattr(self, "_probe"):
+            try:
+                self._probe = _load(os.path.join(self.path, "probe.bin"))
+            except OSError:
+                self._probe = None
+        return self._probe
 
-def is_blank_or_comment(line: str) -> bool:
-    s = line.strip()
-    return not s or s.startswith("#")
+    @property
+    def reads(self):
+        self._read_entry("")
+        return self._reads
 
+    def subclasses(self, c):
+        if self._subs is None:
+            subs = {}
+            for x, info in self.head["class_info"].items():
+                for b in info["mro"]:
+                    subs.setdefault(b, []).append(x)
+            self._subs = subs
+        return self._subs.get(c) or [c]
 
-COMPOUND_FIELDS = ("body", "orelse", "finalbody")
+    def test_bit(self, test_id):
+        if not hasattr(self, "_bit"):
+            self._bit = {t: 1 << i for i, t in enumerate(self.tests)}
+        return self._bit.get(test_id, 0)
 
+    def file_bits(self, rel):
+        if self._file_bits is None:
+            fb = {}
+            for i, t in enumerate(self.tests):
+                f = t.split("::", 1)[0]
+                fb[f] = fb.get(f, 0) | (1 << i)
+            self._file_bits = fb
+        return self._file_bits.get(rel, 0)
 
-def child_blocks(stmt):
-    for f in COMPOUND_FIELDS:
-        b = getattr(stmt, f, None)
-        if b:
-            yield b
-    for h in getattr(stmt, "handlers", []) or []:
-        yield h.body
-    for c in getattr(stmt, "cases", []) or []:
-        yield c.body
-
-
-def header_span(stmt):
-    start = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
-    blocks = list(child_blocks(stmt))
-    if not blocks:
-        return start, stmt.end_lineno
-    first = min(b[0].lineno for b in blocks if b)
-    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        body0 = stmt.body[0]
-        first = min(getattr(body0, "decorator_list", []) and [d.lineno for d in body0.decorator_list] or [body0.lineno])
-    return start, max(start, first - 1)
-
-
-def locate(tree, ln):
-    """-> (stmt, in_function, is_header, enclosing top-level def) for the innermost statement at line ln."""
-    def walk(body, in_func, owner):
-        for stmt in body:
-            lo = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
-            if not (lo <= ln <= stmt.end_lineno):
+    def tests_importing(self, module):
+        """Tests whose file imports `module`, directly or through other modules."""
+        deps = self.head["deps"]
+        rdeps = getattr(self, "_rdeps", None)
+        if rdeps is None:
+            rdeps = {}
+            for m, ds in deps["deps"].items():
+                for d in ds:
+                    rdeps.setdefault(d, set()).add(m)
+            self._rdeps = rdeps
+        seen, stack, bits = set(), [module], 0
+        while stack:
+            m = stack.pop()
+            if m in seen:
                 continue
-            hlo, hhi = header_span(stmt)
-            is_def = isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-            if hlo <= ln <= hhi:
-                return stmt, in_func, True, owner
-            for block in child_blocks(stmt):
-                r = walk(block, in_func or is_def, owner if (in_func or not is_def) else stmt)
-                if r:
-                    return r
-            return stmt, in_func, True, owner  # e.g. an `else:` line
-        return None
-    return walk(tree.body, False, None)
+            seen.add(m)
+            rel = deps["files"].get(m)
+            if rel:
+                bits |= self.file_bits(rel)
+            stack.extend(rdeps.get(m, ()))
+        return bits
 
 
-def is_docstring(stmt):
-    """A bare string statement: never evaluated for its value (sqlglot doesn't read
-    docstrings, and pytest doesn't collect its doctests)."""
-    return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
+def _load(path):
+    with open(path, "rb") as f:
+        return marshal.load(f)
 
 
-def lambda_body_span(stmt, ln):
-    """(lo, hi) lines of the body of the innermost lambda inside stmt whose body holds
-    line ln; None if ln is not in a lambda body. A lambda body only runs when called."""
-    best = None
-    for n in ast.walk(stmt):
-        if isinstance(n, ast.Lambda):
-            b = n.body
-            if b.lineno <= ln <= b.end_lineno and (best is None or b.lineno >= best[0]):
-                best = (b.lineno, b.end_lineno)
-    return best
-
-
-def lambda_callers(m, path, lam, ln):
-    """Tests that called a lambda whose body spans lam, judged from its body lines that
-    ran only when called. ALL if the changed line ln itself also ran at import time."""
-    if m.line(path, ln) is ALL:
-        return ALL
-    acc: set[int] = set()
-    for l in range(lam[0], lam[1] + 1):
-        s = m.line(path, l)
-        if s is not ALL:
-            acc |= s
-    return acc
-
-
-def func_body_lines(node):
-    """Line ranges of every function body inside node (or node itself if a function)."""
-    out = []
-    for n in ast.walk(node):
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
-            out.append((n.body[0].lineno, n.end_lineno))
-    return out
-
-
-def defined_names(stmt):
-    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return [stmt.name]
-    targets = []
-    if isinstance(stmt, ast.Assign):
-        targets = stmt.targets
-    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
-        targets = [stmt.target]
-    names = []
-    for tg in targets:
-        for n in ast.walk(tg):
-            if isinstance(n, ast.Name):
-                names.append(n.id)
-            elif isinstance(n, ast.Attribute):
-                names.append(n.attr)
-    return names
-
-
-CHECK_SCRIPT = r"""
-import importlib, importlib.abc, importlib.util, json, pkgutil, sys
-src, patched = sys.argv[1], json.loads(sys.argv[2])
-sys.path.insert(0, src)
-sys.dont_write_bytecode = True
-
-class Finder(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path, target=None):
-        f = patched.get(name)
-        if f is None:
-            return None
-        is_pkg = f.endswith("__init__.py")
-        return importlib.util.spec_from_file_location(
-            name, f, submodule_search_locations=[src + "/" + name.replace(".", "/")] if is_pkg else None)
-
-sys.meta_path.insert(0, Finder())
-failed = []
-try:
-    import sqlglot
-    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
-        if info.name == "sqlglot.__main__":
-            continue
-        try:
-            importlib.import_module(info.name)
-        except BaseException as e:
-            failed.append(info.name)
-except BaseException:
-    failed.append("sqlglot")
-print(json.dumps(sorted(failed)))
-"""
-
-
-class ImportCheck:
-    """Imports every sqlglot module, pristine once and with a patched file swapped in,
-    in a subprocess. A patch passes when it makes no module fail to import."""
+# ---------------------------------------------------------------- one patch
+class Plan:
+    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only", "sites", "old")
 
     def __init__(self):
-        self.baseline = None
-        self.cache = {}
+        self.bits = 0
+        self.full = False
+        self.reload = {}  # module name -> (path, new source or None): import-time changes
+        self.notes = []
+        self.src = {}  # every patched python module -> (path, new source)
+        self.data = {}  # every edited file -> new text, for code that opens it
+        self.runnable = True  # tests can be run against the patched tree
+        self.source_only = True  # the patch only edits sqlglot's own python files
+        self.sites = 0  # separate places where it changes code
+        self.old = {}  # module -> original source, for patching function code in place
 
-    def run(self, patched):
-        import subprocess
-        try:
-            r = subprocess.run([sys.executable, "-I", "-c", CHECK_SCRIPT, str(SRC), json.dumps(patched)],
-                               capture_output=True, text=True, timeout=60, cwd="/tmp" if os.path.isdir("/tmp") else None)
-            return set(json.loads(r.stdout.strip().splitlines()[-1]))
-        except Exception as e:  # noqa: BLE001
-            log(f"import check error: {e!r}")
-            return None
 
-    def ok(self, path, new_text):
-        if not path.startswith("sqlglot/") or not path.endswith(".py"):
-            return False
-        key = (path, hash(new_text))
-        if key in self.cache:
-            return self.cache[key]
-        if self.baseline is None:
+def read_source(rel):
+    try:
+        with open(os.path.join(SRC, rel), "rb") as f:
+            return f.read().decode("utf-8", "surrogateescape")
+    except FileNotFoundError:
+        return None
+
+
+_tree_cache = {}
+
+
+def old_tree(rel, text):
+    hit = _tree_cache.get(rel)
+    if hit is None:
+        hit = _tree_cache[rel] = ast.parse(text.encode("utf-8", "surrogateescape"))
+    return hit
+
+
+def module_name(rel):
+    name = rel[:-3].replace("/", ".")
+    if name.endswith(".__init__"):
+        name = name[: -len(".__init__")]
+    return name
+
+
+def analyze(maps, text):
+    plan = Plan()
+    files = patchfmt.parse(text)
+    if not files:
+        if text.strip():
+            plan.full = True
+            plan.notes.append("unparsed patch")
+        return plan
+    for fp in files:
+        if fp.mode_only and fp.old == fp.new:
+            continue
+        paths = [p for p in (fp.old, fp.new) if p]
+        moved = fp.old != fp.new
+        for p in paths:
+            base = os.path.basename(p)
+            if base in PYTEST_CONFIG or (base == "__init__.py" and moved and not p.startswith("sqlglot/")):
+                plan.full = True
+                plan.notes.append(f"test configuration {p}")
+            if base in ("pyproject.toml", "setup.cfg") and "/" not in p:
+                if moved or any("pytest" in t for h in fp.hunks for tag, t in h[4] if tag == "+") or not _config_parses(fp):
+                    plan.full = True
+                    plan.notes.append(f"test configuration {p}")
+            if base in ("sitecustomize.py", "usercustomize.py"):
+                plan.full = True
+            if moved and p == fp.new and _shadows_import(p):
+                # the checkout is first on sys.path: a new top-level module or package
+                # there replaces whatever `import <name>` used to find (say, pandas)
+                plan.full = True
+                plan.notes.append(f"new importable name at the top level: {p}")
+        if plan.full:
+            return plan
+        if moved or fp.binary:
+            plan.runnable = False
+        elif fp.hunks:
+            old = read_source(fp.old)
             try:
-                self.baseline = set(json.loads((APP / "import_baseline.json").read_text()))
-            except Exception:  # noqa: BLE001 - not built in: compute it now
-                self.baseline = self.run({})
-        if self.baseline is None:
-            return False
-        import tempfile
-        mod = path[:-3].replace("/", ".")
-        if mod.endswith(".__init__"):
-            mod = mod[: -len(".__init__")]
-        fd, tmp = tempfile.mkstemp(suffix=".py", dir="/tmp" if os.path.isdir("/tmp") else None)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(new_text)
-        failed = self.run({mod: tmp})
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        good = failed is not None and failed <= self.baseline
-        self.cache[key] = good
-        log(f"import check {path}: {'ok' if good else 'FAILED'}")
-        return good
-
-
-IMPORTS = ImportCheck()
-
-
-def class_path(tree, ln):
-    """Names of the classes (not inside functions) whose body or header holds line ln."""
-    path = []
-    body = tree.body
-    while True:
-        for stmt in body:
-            lo = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
-            if isinstance(stmt, ast.ClassDef) and lo <= ln <= stmt.end_lineno:
-                path.append(stmt.name)
-                body = stmt.body
+                if old is None:
+                    raise patchfmt.PatchError("missing")
+                plan.data[fp.old] = patchfmt.apply(old, fp.hunks)
+            except patchfmt.PatchError:
+                plan.runnable = False
+        python = any(p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) for p in paths)
+        if moved or fp.binary or not all(p.endswith(".py") and p.startswith("sqlglot/") for p in paths):
+            plan.source_only = False
+        if any(p.endswith(".py") and not p.startswith(("sqlglot/", "tests/")) for p in paths):
+            plan.runnable = False  # scripts run by path are read straight from disk
+        if not moved and not fp.binary and _only_sql_comments(fp):
+            continue  # the fixture loader drops these lines before any test sees them
+        # whoever opens the file, or lists its directory when it appears or disappears
+        for p in paths:
+            if not python or moved or fp.binary:
+                # (readers of an edited python file are added once it is known to
+                # differ in more than comments and layout: they parse it)
+                key = os.path.normpath(p)
+                narrow = maps.head.get("opens_data", {}).get(key)
+                if narrow is not None and not moved and _sql_fixture_loads(plan, p):
+                    # loaded once per class by setUpClass, and it still loads:
+                    # only the tests that use this file's data can tell
+                    plan.bits |= _items_only(maps, plan, key, narrow)
+                else:
+                    plan.bits |= maps.opens.get(key, 0)
+            if moved:
+                plan.bits |= maps.opens.get("dir:" + (os.path.dirname(p) or "."), 0)
+        for p in paths:
+            if p.endswith(".py") and p.startswith(("sqlglot/", "tests/")):
                 break
         else:
-            return path
+            continue
+        if fp.binary:
+            plan.full = True
+            plan.notes.append("binary patch of a python file")
+            return plan
+        if moved:
+            _moved_python(maps, plan, fp)
+        else:
+            _edited_python(maps, plan, fp)
+        if plan.full:
+            return plan
+    return plan
 
 
-class PyFile:
-    def __init__(self, m: Map, path: str, old_text: str, new_text: str):
-        self.m, self.path = m, path
-        self.old_text, self.new_text = old_text, new_text
-        self.old_tree = ast.parse(old_text)
-        self.new_tree = ast.parse(new_text)
-        self.old_lines = old_text.split("\n")
-        self.new_lines = new_text.split("\n")
-        self.own_tests = m.by_file.get(path, set())
-        self.added_new: set[int] = set()
-        self.new_funcs = None
-
-    def narrow(self, stmt, users):
-        """For a plain class attribute (not a def or class), keep only the class's users
-        that also ran a line reading that attribute name. Only when every read of the
-        name is visible: not read at import time, never spelled as a string
-        (getattr/setattr), and known to the map."""
-        m = self.m
-        if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            return users
-        names = defined_names(stmt)
-        if not names:
-            return users
-        reads: set[int] = set()
-        for n in names:
-            if n in m.str_names or n in m.import_use or n in m.derive:
-                return users
-            sid = m.refs.get(n)
-            if sid is None or sid == -1:
-                return users
-            reads.update(m.sets[sid])
-        return users & reads
-
-    def class_level(self, stmt, cls, tree_is_old):
-        """A changed statement in the body (or header) of class `cls`: the tests that
-        used that class or a subclass, plus classes whose body copies from it.
-        UNKNOWN when the map knows nothing about the class."""
-        m = self.m
-        key = self.path + "::" + ".".join(cls)
-        sid = m.classes.get(key)
-        if sid is None:
-            return UNKNOWN
-        acc = m.set_of(sid)
-        if acc is ALL:
-            return ALL
-        if key in m.classes_import:
-            # The class is also used while sqlglot modules load. Only if every
-            # module still imports with the patch applied are the run-time users
-            # enough; otherwise the change can break whole test files.
-            if not IMPORTS.ok(self.path, self.new_text):
-                return ALL
-        if tree_is_old and isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for lo, hi in func_body_lines(stmt):
-                acc = add(acc, m.span(self.path, lo, hi))
-                if acc is ALL:
-                    return ALL
-        for name in defined_names(stmt):
-            # Direct reads like `Parser.FACTOR`, in function bodies or copied at import time.
-            for c in cls:
-                k = c + "." + name
-                q = m.qrefs.get(k)
-                if q is not None:
-                    acc = add(acc, m.set_of(q))
-                    if acc is ALL:
-                        return ALL
-                for d in m.qderive.get(k, []):
-                    acc = add(acc, ALL if d == "<ALL>" else m.names([d]))
-                    if acc is ALL:
-                        return ALL
-            for other, caps in m.class_uses.get(name, []):
-                if other == key or other.startswith(key + ".") or cls[0] not in caps:
-                    continue
-                osid = m.classes.get(other)
-                if osid is None:
-                    return ALL
-                acc = add(acc, m.set_of(osid))
-                if acc is ALL:
-                    return ALL
-        return acc
-
-    def import_level(self, stmt, tree_is_old):
-        """Tests affected by a changed import-time statement."""
-        m = self.m
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            return ALL
-        if self.path.startswith("sqlglot/"):
-            tree = self.old_tree if tree_is_old else self.new_tree
-            cls = class_path(tree, stmt.lineno)
-            if cls:
-                r = self.class_level(stmt, cls, tree_is_old)
-                if r is not UNKNOWN:
-                    return r
-        if self.own_tests and self.path.startswith("tests/"):
-            acc = set(self.own_tests)
-            names = defined_names(stmt)
-            return add(acc, m.names(names)) if names else acc
-        names = defined_names(stmt)
-        if not names:
-            return ALL
-        acc = m.names(names)
-        if acc is ALL:
-            return ALL
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if tree_is_old:
-                for lo, hi in func_body_lines(stmt):
-                    acc = add(acc, m.span(self.path, lo, hi))
-                    if acc is ALL:
-                        return ALL
-            elif not acc:
-                # A new definition nothing references. At module level, and not spelled
-                # as a string anywhere (getattr / registries), nothing can call it; in a
-                # class body it could be reached by dynamic dispatch (handled by class
-                # users before we get here), so stay safe.
-                at_module = stmt in self.new_tree.body
-                unused = all(n not in m.str_names and n not in m.refs and n not in m.derive for n in names)
-                if at_module and unused and self.path.startswith("sqlglot/"):
-                    return set()
-                return ALL
-        return acc
-
-    def old_line(self, ln):
-        if ln < 1 or ln > len(self.old_lines) or is_blank_or_comment(self.old_lines[ln - 1]):
-            return set()
-        r = locate(self.old_tree, ln)
-        if r is None:
-            return set()
-        stmt, in_func, is_header, _owner = r
-        if is_docstring(stmt):
-            return set()
-        if not in_func:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
-                return set()
-            lam = lambda_body_span(stmt, ln)
-            if lam is not None:
-                # Inside a lambda body: runs only when the lambda is called, which line
-                # coverage records. If those lines also ran at import time (lambda on the
-                # same line as other parts of the statement), fall back.
-                cov = lambda_callers(self.m, self.path, lam, ln)
-                if cov is not ALL:
-                    return cov
-            return self.import_level(stmt, True)
-        lo, hi = header_span(stmt) if is_header else (stmt.lineno, stmt.end_lineno)
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_header:
-            # nested def header: runs whenever the enclosing body reaches it
-            return self.m.span(self.path, lo, hi)
-        return self.m.span(self.path, lo, hi)
-
-    def added_line(self, new_ln, old_anchor):
-        if is_blank_or_comment(self.new_lines[new_ln - 1]):
-            return set()
-        # Inside a function that is entirely new: its body only runs if the function is
-        # called, which the rule for its `def` line decides.
-        if self.new_funcs is None:
-            self.new_funcs = [(min([n.lineno] + [d.lineno for d in n.decorator_list]), n.body[0].lineno, n.end_lineno)
-                              for n in ast.walk(self.new_tree)
-                              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
-        for lo, body_lo, hi in self.new_funcs:
-            if body_lo <= new_ln <= hi and all(
-                    l in self.added_new or is_blank_or_comment(self.new_lines[l - 1]) for l in range(lo, hi + 1)):
-                return set()
-        r = locate(self.new_tree, new_ln)
-        if r is None:
-            return set()
-        stmt, in_func, is_header, _owner = r
-        if is_docstring(stmt):
-            return set()
-        if not in_func:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
-                return set()
-            if lambda_body_span(stmt, new_ln) is not None:
-                # Added inside a lambda body: judge by the pinned neighbours, which must
-                # themselves be lambda-body lines with known callers.
-                acc: set[int] = set()
-                ok = True
-                checked = 0
-                for a in (old_anchor - 1, old_anchor):
-                    if not (1 <= a <= len(self.old_lines)) or is_blank_or_comment(self.old_lines[a - 1]):
-                        continue
-                    checked += 1
-                    ra = locate(self.old_tree, a)
-                    lam = lambda_body_span(ra[0], a) if ra is not None and not ra[1] else None
-                    if lam is None:
-                        ok = False
-                        break
-                    cov = lambda_callers(self.m, self.path, lam, a)
-                    if cov is ALL:
-                        ok = False
-                        break
-                    acc |= cov
-                if ok and checked:
-                    return acc
-            return self.import_level(stmt, False)
-        # Inside a function: runs when its neighbours on the pinned commit ran.
-        acc: set[int] = set()
-        for a in (old_anchor - 1, old_anchor):
-            if 1 <= a <= len(self.old_lines) and not is_blank_or_comment(self.old_lines[a - 1]):
-                ra = locate(self.old_tree, a)
-                if ra is None:
-                    continue
-                s2, f2, h2, _ = ra
-                if isinstance(s2, (ast.FunctionDef, ast.AsyncFunctionDef)) and h2 and not f2:
-                    for lo, hi in func_body_lines(s2)[:1]:
-                        acc = add(acc, self.m.span(self.path, lo, hi))
-                else:
-                    acc = add(acc, self.old_line(a))
-                if acc is ALL:
-                    return ALL
-        if not acc:
-            # neighbours never ran; widen to the enclosing statement block in the old tree
-            ra = locate(self.old_tree, max(1, min(old_anchor, len(self.old_lines))))
-            if ra is not None and ra[1]:
-                lo, hi = ra[0].lineno, ra[0].end_lineno
-                acc = self.m.span(self.path, lo, hi)
-        return acc
+_helpers = None
 
 
-# Operator swaps the map's probes can prove harmless for a test, by fact kind:
-#   isq: `is` <-> `==`, `is not` <-> `!=`   differs only where `a is b` != `a == b`
-#   tie: `<` <-> `<=`, `>` <-> `>=`         differs only where a == b
-#   and/or: 2-operand `and` <-> `or` in a condition: same truth value unless some
-#           operand was falsy (for `and`) / truthy (for `or`) in that evaluation
-_CMP_CLASS = {ast.Is: ("isq", ast.Eq), ast.Eq: ("isq", ast.Eq), ast.IsNot: ("isq", ast.NotEq),
-              ast.NotEq: ("isq", ast.NotEq), ast.Lt: ("tie", ast.Lt), ast.LtE: ("tie", ast.Lt),
-              ast.Gt: ("tie", ast.Gt), ast.GtE: ("tie", ast.Gt)}
+def _sql_fixture_loads(plan, path):
+    """Does the patched .sql fixture still go through the suite's own loaders
+    (tests/helpers.py at the pinned commit) without raising?"""
+    global _helpers
+    text = plan.data.get(path)
+    if text is None or not path.endswith(".sql") or "tests/helpers.py" in plan.data:
+        return False
+    try:
+        if _helpers is None:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("blast_pinned_helpers", os.path.join(SRC, "tests", "helpers.py"))
+            _helpers = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_helpers)
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=TMP) as d:
+            with open(os.path.join(d, "f.sql"), "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            _helpers.FIXTURES_DIR = d
+            list(_helpers.load_sql_fixture_pairs("f.sql"))
+            list(_helpers.load_sql_fixtures("f.sql"))
+        return True
+    except Exception:
+        return False
 
 
-def _bool_context(tree):
-    """ids of BoolOp nodes whose value is only used for its truth value."""
+def _load_pairs(text):
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir=TMP) as d:
+        with open(os.path.join(d, "f.sql"), "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        _helpers.FIXTURES_DIR = d
+        return list(_helpers.load_sql_fixture_pairs("f.sql"))
+
+
+def _items_only(maps, plan, path, bits):
+    """For a fixture that fills a list some tests walk item by item: keep, of
+    those tests' per-item records, only the items whose content changed."""
+    attrs = None
+    for files in maps.head.get("class_files", {}).values():
+        if files.get(path):
+            attrs = files[path]
+    if not attrs or len(attrs) != 1:
+        return bits
+    tests = [t for t, a in maps.unit_lists.items() if a == attrs[0] and t in maps.units]
+    if not tests:
+        return bits
+    try:
+        old = _load_pairs(read_source(path))
+        new = _load_pairs(plan.data[path])
+    except Exception:
+        return bits
+    if len(old) != len(new) or any(len(maps.units[t]) != len(old) for t in tests):
+        return bits
+    changed = [i for i, (x, y) in enumerate(zip(old, new)) if x != y]
+    for t in tests:
+        for b in list(maps.units[t].values()) + list(maps.units_x.get(t, {}).values()):
+            bits &= ~b
+        for i in changed:
+            bits |= maps.units[t][i] | maps.units_x.get(t, {}).get(i, 0)  # the query itself changed
+    return bits
+
+
+def _config_parses(fp):
+    """pytest reads these files at start-up; one it cannot parse stops the whole run."""
+    old = read_source(fp.old)
+    try:
+        new = patchfmt.apply(old or "", fp.hunks)
+        if fp.old.endswith(".toml"):
+            import tomllib
+
+            tomllib.loads(new)
+        else:
+            import configparser
+
+            cp = configparser.RawConfigParser(strict=True, interpolation=None)
+            cp.read_string(new)
+        return True
+    except Exception:
+        return False
+
+
+def _shadows_import(path):
+    parts = path.split("/")
+    if parts[0] in ("sqlglot", "tests"):
+        return False
+    if len(parts) == 1:
+        return parts[0].endswith((".py", ".pth", ".so", ".pyc"))
+    return len(parts) == 2 and parts[1] in ("__init__.py", "__init__.pyc")
+
+
+def _only_sql_comments(fp):
+    """An edit to a .sql fixture that only adds or removes empty lines and lines
+    starting with `--`. tests/helpers.py drops both before splitting statements,
+    and every .sql fixture is read through it."""
+    path = fp.old
+    if not (path and path.startswith("tests/fixtures/") and path.endswith(".sql")):
+        return False
+    changed = [t for h in fp.hunks for tag, t in h[4] if tag in "+-"]
+    if not changed or any(tag == "\\" for h in fp.hunks for tag, _ in h[4]):
+        return False
+    return all(t == "" or t.startswith("--") for t in changed)
+
+
+def _import_level_imports(focus):
+    """Modules named by import statements that run when the module is imported."""
     out = set()
-
-    def mark(e):
-        if isinstance(e, ast.BoolOp):
-            out.add(id(e))
-            for v in e.values:
-                mark(v)
-        elif isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.Not):
-            mark(e.operand)
-
-    for n in ast.walk(tree):
-        if isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)):
-            mark(n.test)
-        elif isinstance(n, ast.comprehension):
-            for c in n.ifs:
-                mark(c)
-        elif isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
-            mark(n.operand)
+    stack = list(focus.nodes())
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Import):
+            out.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = "." * node.level + (node.module or "")
+            out.add(base)
+            out.update(base + "." + a.name for a in node.names)
+        else:
+            stack.extend(ast.iter_child_nodes(node))
     return out
 
 
-_PURE_CALLS = {"isinstance", "len", "type", "bool", "issubclass"}
+LAZY_LOAD_TEST = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 
 
-def _pure(e):
-    """No side effects when evaluated (calls only to a few builtins)."""
-    if isinstance(e, (ast.Name, ast.Constant)):
+def _moved_python(maps, plan, fp):
+    """A python file created, deleted or renamed."""
+    plan.runnable = False
+    if fp.old and fp.old.endswith(".py") and fp.old.startswith(("sqlglot/", "tests/")):
+        name = module_name(fp.old)
+        for b in maps.lines(fp.old).values():
+            plan.bits |= b
+        plan.bits |= maps.file_bits(fp.old)
+        plan.bits |= maps.tests_importing(name)
+        if fp.old.startswith("sqlglot/"):
+            plan.reload[name] = (fp.old, None)
+        plan.notes.append(f"removed {fp.old}")
+    if fp.new and fp.new.endswith(".py") and fp.new.startswith(("sqlglot/", "tests/")):
+        name = module_name(fp.new)
+        files = maps.head["deps"]["files"]
+        old = read_source(fp.old) if fp.old else ""
+        try:
+            new = patchfmt.apply(old or "", fp.hunks)
+        except patchfmt.PatchError:
+            plan.full = True
+            return
+        pkg_dir = fp.new[:-3]
+        shadows = name in files or any(f.startswith(pkg_dir + "/") for f in files.values())
+        parent_pkg = os.path.dirname(fp.new) + "/__init__.py"
+        if fp.new.startswith("sqlglot/"):
+            if shadows or os.path.basename(fp.new) == "__init__.py":
+                plan.full = True
+                plan.notes.append(f"new module shadows {name}")
+                return
+            plan.reload[name] = (fp.new, new)
+        elif shadows:
+            plan.full = True
+        plan.notes.append(f"added {fp.new}")
+
+
+def _edited_python(maps, plan, fp):
+    rel = fp.old
+    old = read_source(rel)
+    if old is None:
+        plan.full = True
+        plan.notes.append(f"{rel} is not in the pinned tree")
+        return
+    try:
+        new = patchfmt.apply(old, fp.hunks)
+    except patchfmt.PatchError as e:
+        plan.full = True
+        plan.notes.append(f"cannot apply to {rel}: {e}")
+        return
+    if new == old:
+        return
+    is_test = rel.startswith("tests/")
+    name = module_name(rel)
+    plan.src[name] = (rel, new)
+    plan.old[name] = old
+    try:
+        new_tree = ast.parse(new.encode("utf-8", "surrogateescape"))
+    except (SyntaxError, ValueError, RecursionError):
+        plan.notes.append(f"{rel} no longer compiles")
+        if is_test:
+            plan.bits |= maps.tests_importing(name)
+        else:
+            plan.full = True
+        return
+
+    # the runs of removed and added lines, and the lines right around each run
+    blocks = []
+    old_lines, new_lines = set(), set()
+    for os_, ol, ns, nl, body in fp.hunks:
+        o, n = (os_ if ol else os_ + 1), (ns if nl else ns + 1)
+        block_old, block_new = [], []
+        for tag, t in body + [(" ", "")]:
+            if tag == "-":
+                block_old.append((o, t))
+                o += 1
+            elif tag == "+":
+                block_new.append((n, t))
+                n += 1
+            elif tag == " ":
+                if block_old or block_new:
+                    blocks.append((block_old, block_new))
+                    old_lines.update(ln for ln, _ in block_old)
+                    new_lines.update(ln for ln, _ in block_new)
+                    old_lines.update(((block_old[0][0] if block_old else o) - 1, o))
+                    new_lines.update(((block_new[0][0] if block_new else n) - 1, n))
+                    block_old, block_new = [], []
+                o += 1
+                n += 1
+    oi = Focus(old_tree(rel, old), old_lines)
+    ni = Focus(new_tree, new_lines)
+    if oi.keys() == ni.keys():
+        return  # comments and layout only
+    lazy_lines = maps.lazy.get(rel, ())
+    if lazy_lines:
+        for sc in oi.scopes:
+            if any(sc.start <= ln <= sc.end for ln in lazy_lines) and any(sc.start <= ln <= sc.end for ln in old_lines):
+                # the lazy dialect-loading path: which tests run it depends on test order
+                plan.full = True
+                plan.notes.append(f"{rel}: lazy loading path")
+                return
+    plan.bits |= maps.opens.get(os.path.normpath(rel), 0)  # tests that read this source file
+    if not is_test and _import_level_imports(ni) - _import_level_imports(oi):
+        # One test imports sqlglot in a fresh interpreter and checks that no dialect
+        # module came along; nothing recorded in this process can see that.
+        i = maps.test_bit(LAZY_LOAD_TEST)
+        if i:
+            plan.bits |= i
+            plan.notes.append(f"{rel}: new import at import level")
+    swap = _swap_tests(maps, rel, oi, ni)
+    if swap is not None:
+        plan.bits |= swap
+        plan.notes.append(f"{rel}: comparison swap, a different result in {bin(swap).count('1')} tests")
+        return
+    if oi.keys_nodoc() == ni.keys_nodoc():
+        # only docstrings differ; nothing in the suite reads them (doctests are not collected)
+        plan.notes.append(f"{rel}: docstrings only")
+        return
+    if _lazy_annotations(oi.tree) and _lazy_annotations(new_tree) and oi.keys_noann() == ni.keys_noann():
+        # with `from __future__ import annotations`, a function's annotations are
+        # never evaluated; nothing in sqlglot or its tests reads them back
+        plan.notes.append(f"{rel}: function annotations only")
+        return
+    lines = maps.lines(rel)
+    imp = maps.head["import_lines"].get(rel, frozenset())
+    lazy = maps.lazy.get(rel, ())
+    need = False
+    same_names = oi.names == ni.names
+    if not same_names:
+        need = True
+
+    def cover(rng):
+        bits = 0
+        for ln in rng:
+            b = lines.get(ln)
+            if b:
+                bits |= b
+        return bits
+
+    def runs_at_import(sc):
+        for ln in range(sc.start, sc.end + 1):
+            if ln in imp and sc.owns_body(ln):
+                return True
+        return False
+
+    def order_dependent(sc):
+        # code on the lazy dialect-loading path: who runs it depends on test order
+        return any(sc.start <= ln <= sc.end for ln in lazy)
+
+    bits = 0
+    for block_old, block_new in blocks:
+        r = [(ln, t2) for ln, t2 in block_old if _matters(oi, ln, t2)]
+        a = [(ln, t2) for ln, t2 in block_new if _matters(ni, ln, t2)]
+        if r or a:
+            plan.sites += 1
+        aligned = (
+            len(block_old) == len(block_new)
+            and same_names
+            and all(_indent(x[1]) == _indent(y[1]) for x, y in zip(block_old, block_new))
+        )
+        for ln, _ in r:
+            bits |= lines.get(ln, 0)
+            sc = oi.scope(ln)
+            if sc is None or not sc.owns_body(ln):
+                need = True
+                if sc is not None:
+                    bits |= cover(range(sc.start, sc.end + 1))
+                continue
+            if runs_at_import(sc):
+                need = True
+            if order_dependent(sc):
+                plan.full = True
+                plan.notes.append(f"{rel}: lazy loading path")
+                return
+            if sc.kind == "lambda":
+                bits |= cover(range(sc.start, sc.end + 1))
+                continue
+            hdr = oi.statement_lines(sc, ln) if aligned else None
+            bits |= cover(hdr if hdr is not None else range(sc.start, sc.end + 1))
+        if not aligned:
+            for ln, _ in a:
+                sc = ni.scope(ln)
+                if sc is None or not sc.owns_body(ln):
+                    need = True
+                    continue
+                named = sc.named()
+                oc = oi.by_qual.get(named.qual) if named is not None else None
+                if oc is None:
+                    need = True
+                    continue
+                if runs_at_import(oc):
+                    need = True
+                if order_dependent(oc):
+                    plan.full = True
+                    plan.notes.append(f"{rel}: lazy loading path")
+                    return
+                bits |= cover(range(oc.start, oc.end + 1))
+    plan.bits |= bits
+    if need:
+        if is_test:
+            plan.bits |= maps.tests_importing(name)
+            plan.notes.append(f"{rel}: test module changed at import level")
+        else:
+            plan.reload[name] = (rel, new)
+            plan.notes.append(f"{rel}: import-time change")
+
+
+# sibling comparison operators, and the probe flag that says they once disagreed
+SWAPS = {
+    ("Is", "Eq"): 2, ("Eq", "Is"): 2, ("IsNot", "NotEq"): 4, ("NotEq", "IsNot"): 4,
+    ("Lt", "LtE"): 8, ("LtE", "Lt"): 8, ("Gt", "GtE"): 16, ("GtE", "Gt"): 16,
+}
+
+
+def _swap_tests(maps, rel, old, new):
+    """For a patch that only swaps comparison operators for their siblings: the
+    tests during which, at the pinned commit, the two operators ever gave
+    different answers at those positions. Only those tests can see the patch.
+    None when the patch is anything else, or the record cannot answer."""
+    probe = maps.probe
+    if probe is None:
+        return None
+    if old.places() != new.places():
+        return None
+    swaps = []
+    for x, y in zip(old.nodes(), new.nodes()):
+        if not _same_but_ops(x, y, swaps):
+            return None
+    if not swaps:
+        return None
+    bits = 0
+    for line, col, _ in swaps:
+        hit = probe.get((rel, line, col))
+        if hit is None:
+            return None  # not recorded: no claim
+        flags, tests = hit
+        if flags & 2:
+            return None  # the operators disagree while sqlglot is being imported
+        bits |= tests
+    return bits
+
+
+def _same_but_ops(a, b, swaps):
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        if isinstance(a, ast.Compare):
+            if len(a.ops) != len(b.ops):
+                return False
+            for x, y in zip(a.ops, b.ops):
+                if type(x) is not type(y):
+                    flag = SWAPS.get((type(x).__name__, type(y).__name__))
+                    if flag is None or len(a.ops) != 1:
+                        return False
+                    swaps.append((a.lineno, a.col_offset, flag))
+            return _same_but_ops(a.left, b.left, swaps) and _same_but_ops(a.comparators, b.comparators, swaps)
+        for field in a._fields:
+            if not _same_but_ops(getattr(a, field, None), getattr(b, field, None), swaps):
+                return False
         return True
-    if isinstance(e, ast.Attribute):
-        return _pure(e.value)
-    if isinstance(e, ast.Subscript):
-        return _pure(e.value) and _pure(e.slice)
-    if isinstance(e, ast.Compare):
-        return _pure(e.left) and all(_pure(c) for c in e.comparators)
-    if isinstance(e, ast.UnaryOp):
-        return _pure(e.operand)
-    if isinstance(e, ast.BoolOp):
-        return all(_pure(v) for v in e.values)
-    if isinstance(e, (ast.Tuple, ast.List)):
-        return all(_pure(v) for v in e.elts)
-    if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id in _PURE_CALLS:
-        return not e.keywords and all(_pure(a) for a in e.args)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same_but_ops(x, y, swaps) for x, y in zip(a, b))
+    return a == b and type(a) is type(b)
+
+
+def _lazy_annotations(tree):
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            if any(a.name == "annotations" for a in node.names):
+                return True
     return False
 
 
-def probe_swaps(path, old_tree, new_text):
-    """If the change only swaps operators the map's probes cover, return the fact keys
-    ("kind|path:line:col" at pinned positions) whose recorded tests are the only ones
-    that can behave differently; else None."""
-    try:
-        new_tree = ast.parse(new_text)
-    except SyntaxError:
-        return None
-    boolctx = _bool_context(old_tree)
-    keys = []
-    for x, y in zip(ast.walk(old_tree), ast.walk(new_tree)):
-        if type(x) is not type(y):
-            if isinstance(x, (ast.cmpop, ast.boolop)) and isinstance(y, (ast.cmpop, ast.boolop)):
-                continue  # operator nodes: judged at their Compare / BoolOp below
-            return None
-        if isinstance(x, ast.Compare):
-            ox, oy = [type(o) for o in x.ops], [type(o) for o in y.ops]
-            if ox != oy:
-                if len(ox) != 1 or len(oy) != 1 or ox[0] not in _CMP_CLASS or oy[0] not in _CMP_CLASS:
-                    return None
-                (kx, nx), (ky, ny) = _CMP_CLASS[ox[0]], _CMP_CLASS[oy[0]]
-                if kx != ky or nx is not ny:
-                    return None
-                keys.append(f"{kx}|{path}:{x.lineno}:{x.col_offset}")
-        elif isinstance(x, ast.BoolOp) and type(x.op) is not type(y.op):
-            # Flipping the operator also changes whether the second operand runs at
-            # all, so it must have no side effects.
-            if len(x.values) != 2 or len(y.values) != 2 or id(x) not in boolctx or not _pure(x.values[1]):
-                return None
-            kind = "and" if isinstance(x.op, ast.And) else "or"
-            keys.append(f"{kind}|{path}:{x.lineno}:{x.col_offset}")
-    if not keys:
-        return None
-
-    class Norm(ast.NodeTransformer):
-        def visit_Compare(self, node):
-            self.generic_visit(node)
-            node.ops = [(_CMP_CLASS[type(o)][1] if type(o) in _CMP_CLASS else type(o))() for o in node.ops]
-            return node
-
-        def visit_BoolOp(self, node):
-            self.generic_visit(node)
-            node.op = ast.And()
-            return node
-
-    if ast.dump(Norm().visit(ast.parse(ast.unparse(old_tree)))) != ast.dump(Norm().visit(ast.parse(new_text))):
-        return None
-    return keys
+def _indent(t):
+    return len(t) - len(t.lstrip())
 
 
-class _StripAnnotations(ast.NodeTransformer):
-    def _blank(self, node, field):
-        if getattr(node, field, None) is not None:
-            setattr(node, field, ast.Constant(None))
-
-    def visit_arg(self, node):
-        self._blank(node, "annotation")
-        return node
-
-    def visit_FunctionDef(self, node):
-        self.generic_visit(node)
-        self._blank(node, "returns")
-        return node
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_AnnAssign(self, node):
-        self.generic_visit(node)
-        node.annotation = ast.Constant(None)
-        return node
-
-
-def annotation_only(old_text, new_text):
-    """True if, in a module using `from __future__ import annotations` (annotations are
-    stored as strings, never evaluated), the change only touches type annotations."""
-    try:
-        old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
-    except SyntaxError:
-        return False
-    def future(tree):
-        return any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and
-                   any(a.name == "annotations" for a in n.names) for n in tree.body)
-    if not (future(old_tree) and future(new_tree)):
-        return False
-    return ast.dump(_StripAnnotations().visit(old_tree)) == ast.dump(_StripAnnotations().visit(new_tree))
-
-
-def select_file(m: Map, f) -> set | None:
-    old_path, new_path = f["old"], f["new"]
-    path = new_path or old_path
-    if path is None:
-        return ALL
-    if old_path and new_path and old_path != new_path:
-        return ALL  # rename
-    if path in NO_EFFECT_FILES or path.startswith(NO_EFFECT_PREFIXES) or path.endswith(NO_EFFECT_SUFFIXES):
-        if path not in m.opens:
-            return set()
-    if not path.endswith(".py"):
-        if path in m.opens:
-            return m.set_of(m.opens[path])
-        if path.startswith("tests/") and old_path is not None:
-            return set()  # a data file under tests/ that no test reads
-        return ALL
-    # Python
-    if path.startswith(("sqlglot/", "tests/")) is False:
-        if path in m.opens:
-            return m.set_of(m.opens[path])
-        return ALL
-    if old_path is None or new_path is None:
-        return ALL  # new or deleted module
-    if path.startswith("sqlglot/") and not m.lines.get(path) and path not in m.opens:
-        # The pinned run never executed a line of this module (e.g. the CLI in
-        # __main__.py): no test imports it, so no test can see the change.
-        return set()
-    src = SRC / path
-    if not src.is_file():
-        return ALL
-    old_text = src.read_text(encoding="utf-8")
-    new_text = apply_hunks(old_text, f["hunks"])
-    try:
-        compile(new_text, path, "exec")
-    except SyntaxError:
-        return ALL if not path.startswith("tests/") or not m.by_file.get(path) else set(m.by_file[path])
-    try:
-        if code_tokens(old_text) == code_tokens(new_text):
-            return set()
-        if path.startswith("sqlglot/") and annotation_only(old_text, new_text):
-            return set()  # sqlglot reads no annotations at run time (only parameter names)
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        return ALL
-    pf = PyFile(m, path, old_text, new_text)
-    dels, adds = changed_lines(f["hunks"])
-    pf.added_new = {n for n, _ in adds}
-    if path.startswith("sqlglot/") and m.cmp_seen:
-        keys = probe_swaps(path, pf.old_tree, new_text)
-        if keys and all(k in m.cmp_seen for k in keys):
-            # Only operator swaps at spots the map probed: a test can only behave
-            # differently if, in some evaluation it made, the recorded fact held there.
-            acc = set()
-            for ln in dels:
-                acc = add(acc, pf.old_line(ln))
-                if acc is ALL:
-                    break
-            differ: set | None = set()
-            for k in keys:
-                sid = m.cmp_differ.get(k)
-                if sid is not None:
-                    differ = add(differ, m.set_of(sid))
-            if acc is ALL:
-                return ALL if differ is ALL else differ
-            return acc if differ is ALL else acc & differ
-    acc: set[int] = set()
-    for ln in dels:
-        acc = add(acc, pf.old_line(ln))
-        if acc is ALL:
-            return ALL
-    for n, o in adds:
-        acc = add(acc, pf.added_line(n, o))
-        if acc is ALL:
-            return ALL
-    return acc
-
-
-def select(m: Map, patch_text: str):
-    files = parse_patch(patch_text)
-    if not files:
-        return ALL
-    acc: set[int] = set()
-    for f in files:
-        try:
-            s = select_file(m, f)
-        except Exception as e:  # noqa: BLE001 - any surprise means "run everything"
-            log(f"error on {f.get('new') or f.get('old')}: {e!r}")
-            s = ALL
-        acc = add(acc, s)
-        if acc is ALL:
-            return ALL
-    # 1. Scoped & order-aware process pool guard (Approach A):
-    # ProcessPool crashes only occur when changing optimizer or expressions core logic.
-    # In pytest, TestOptimizer tests execute in AST definition order. A crash only breaks
-    # tests running at or after the crashing test in sequential AST execution order.
-    opt_expr_change = any((f.get("new") or f.get("old") or "").startswith(("sqlglot/optimizer/", "sqlglot/expressions/")) for f in files)
-    if opt_expr_change:
-        for g in m.pool_groups:
-            inter = acc & g
-            if inter:
-                min_pos = min(m.pool_ast_pos.get(n, n) for n in inter)
-                after = {n for n in g if m.pool_ast_pos.get(n, n) >= min_pos}
-                acc |= after
-
-    # 2. Disjoint oracle dialect scoping for test_execute_tpcds (Approach A):
-    # test_execute_tpcds (21.45s) compares DuckDB against PythonExecutor. Non-DuckDB dialects
-    # cannot propagate to DuckDB DataFrame assertions (PIE theorem P == False).
-    tpcds_exec_idx = m.test_index.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
-    if tpcds_exec_idx is not None and tpcds_exec_idx in acc:
-        all_paths = [f.get("new") or f.get("old") or "" for f in files]
-        if all_paths and all(
-            (p.startswith("sqlglot/dialects/") or p.startswith("sqlglot/typing/"))
-            and not any(d in p for d in ("duckdb", "postgres"))
-            for p in all_paths
-        ):
-            acc.remove(tpcds_exec_idx)
-
-    # 3. Semantic AST constructor filtering for test_generator_memory (Approach B):
-    # test_generator_memory (6.69s) only calls dialect().generator() 1,000x; never calls generate() or *_sql.
-    # If code compiles cleanly, changes outside Generator.__init__ / __slots__ cannot fail it.
-    gen_mem_idx = m.test_index.get("tests/test_generator.py::TestGenerator::test_generator_memory")
-    if gen_mem_idx is not None and gen_mem_idx in acc:
-        def touches_generator_construction(files):
-            for f in files:
-                path = f.get("new") or f.get("old") or ""
-                if path.startswith("tests/"):
-                    return True
-                if path == "sqlglot/generator.py":
-                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
-                    if any("__slots__" in l or "def __init__" in l for l in hunk_lines):
-                        return True
-                    for old_start, _, lns in f.get("hunks", []):
-                        old_len = sum(1 for tag, _ in lns if tag in (" ", "-"))
-                        old_end = old_start + max(old_len - 1, 0)
-                        if m.generator_slots_span and not (old_end < m.generator_slots_span[0] or old_start > m.generator_slots_span[1]):
-                            return True
-                        if m.generator_init_span and not (old_end < m.generator_init_span[0] or old_start > m.generator_init_span[1]):
-                            return True
-                elif path.startswith("sqlglot/generators/"):
-                    return True
-                elif path == "sqlglot/dialects/dialect.py":
-                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
-                    if any("def generator" in l or "generator_class" in l or "Generator" in l for l in hunk_lines):
-                        return True
-                    for old_start, _, lns in f.get("hunks", []):
-                        old_len = sum(1 for tag, _ in lns if tag in (" ", "-"))
-                        old_end = old_start + max(old_len - 1, 0)
-                        gen_span = getattr(m, "dialect_generator_span", (1375, 1385))
-                        if not (old_end < gen_span[0] or old_start > gen_span[1]):
-                            return True
-                elif path.startswith("sqlglot/dialects/"):
-                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
-                    if any("Generator" in l or "generator =" in l or "def __init__" in l or "__slots__" in l for l in hunk_lines):
-                        return True
-            return False
-
-        if not touches_generator_construction(files):
-            acc.remove(gen_mem_idx)
-
-    # 4. Semantic filtering for test_max_nodes (Approach B):
-    # test_max_nodes (28.82s) only tests Parser._node_count and Parser.__init__.
-    # Deselect if parser.py, tokens.py, and tests/ are untouched.
-    max_nodes_idx = m.test_index.get("tests/test_parser.py::TestParser::test_max_nodes")
-    if max_nodes_idx is not None and max_nodes_idx in acc:
-        all_paths = [f.get("new") or f.get("old") or "" for f in files]
-        if not any(p.startswith("tests/") or p in ("sqlglot/parser.py", "sqlglot/tokens.py") for p in all_paths):
-            acc.remove(max_nodes_idx)
-    return acc
+def _matters(info, line, text):
+    s = text.strip()
+    if s and not s.startswith("#"):
+        return True
+    return info.in_string(line)
 
 
 # ---------------------------------------------------------------- packing
-
-def pack(tests, count):
-    workers = [[] for _ in range(count)]
-    loads = [0] * count
-    for number, ms in sorted(tests, key=lambda t: -t[1]):
-        i = loads.index(min(loads))
-        workers[i].append(number)
-        loads[i] += ms
-    workers = [w for w in workers if w]
-    return max(loads) + WORKER_COST_MS * len(workers), workers
-
-
-def best_split(tests):
+def pack(tests, ms):
+    """Split tests over workers to minimize busiest load + 2 s per worker."""
     if not tests:
         return []
-    return min((pack(tests, k) for k in range(1, MAX_WORKERS + 1)), key=lambda r: r[0])[1]
+    order = sorted(tests, key=lambda t: -ms[t])
+    best = None
+    for k in range(1, min(MAX_WORKERS, len(order)) + 1):
+        loads = [0] * k
+        groups = [[] for _ in range(k)]
+        for t in order:
+            i = loads.index(min(loads))
+            loads[i] += ms[t]
+            groups[i].append(t)
+        cost = max(loads) + WORKER_MS * k
+        if best is None or cost < best[0]:
+            best = (cost, groups)
+        if max(loads) <= ms[order[0]]:
+            break
+    return [g for g in best[1] if g]
 
 
-def main() -> None:
-    if "--import-baseline" in sys.argv:
-        # Run at image build time: which sqlglot modules fail to import pristine.
-        r = IMPORTS.run({})
-        print(json.dumps(sorted(r) if r is not None else None))
-        return
-    tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    number = {t["id"]: t["number"] for t in tests}
-    ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
-    every = [(t["number"], ms[t["number"]]) for t in tests]
+def pack_cost(tests, ms):
+    groups = pack(tests, ms)
+    if not groups:
+        return 0.0
+    return (max(sum(ms[t] for t in g) for g in groups) + WORKER_MS * len(groups)) / 1000.0
+
+
+# ---------------------------------------------------------------- running tests
+HEAVY_CPU = float(os.environ.get("BLAST_HEAVY", "2.5"))  # never run a test estimated above this
+MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
+# Running candidate tests here costs CPU that the board charges in full (the scoring
+# machines are several times slower than where this was tuned) and buys little once
+# equivalent comparison swaps are recognized, so it is off unless asked for.
+VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
+VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
+REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.079"))  # warm-up CPU where the costs were measured
+TMP = os.environ.get("TMPDIR", "/tmp")
+RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a child gets once it starts running tests
+DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
+DROP_NAMES = [x for x in os.environ.get("BLAST_DROP_NAMES", "").split(",") if x]
+INFER = os.environ.get("BLAST_INFER", "0") == "1"
+INFER_MIN = int(os.environ.get("BLAST_INFER_MIN", "1"))
+# Witnesses: when a slow test is selected for a one-place source change, run the
+# fast tests selected for the same place; if every one passes, the change is
+# taken to be invisible to the slow ones too. Off unless asked for.
+WITNESS = os.environ.get("BLAST_WITNESS", "0") == "1"
+WITNESS_MIN = int(os.environ.get("BLAST_WITNESS_MIN", "10"))
+SLOW_MS = 2000
+UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
+UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))
+UNIT_GIVE_UP = int(os.environ.get("BLAST_UNIT_GIVE_UP", "0"))  # more changed items than this: keep the test
+GC_FREEZE = os.environ.get("BLAST_GC_FREEZE", "1") == "1"
+UNIT_WORTH = float(os.environ.get("BLAST_UNIT_WORTH", "0.9"))  # CPU worth spending per second a cleared test saves
+EXEC = os.environ.get("BLAST_EXEC", "1") == "1"  # settle executed TPC queries by the table sqlglot's executor returns
+EXEC_TESTS = (
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+)
+STAGE = os.environ.get("BLAST_STAGE", "1") == "1"  # settle optimizer-only items by comparing the optimizer's output  # how often such a test turns out to pass
+
+
+class Ctx:
+    """What the parent knows about the batch, shared with its children by fork."""
+
+    def __init__(self, maps, tj):
+        self.maps = maps
+        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tj}
+        self.number = {t["id"]: t["number"] for t in tj}
+        self.id_of = {t["number"]: t["id"] for t in tj}
+        self.everything = [t["number"] for t in tj]
+        self.bit_number = [self.number.get(t) for t in maps.tests]
+        self.bit_of = {t: i for i, t in enumerate(maps.tests)}
+        known = {n for n in self.bit_number if n is not None}
+        self.unmapped = [n for n in self.everything if n not in known]
+        self.speed = 2.0
+        self.child_limit = 15.0  # seconds a child may take; set from the measured warm-up
+        try:
+            self.calib = _load(os.path.join(MAPS, "calib.bin"))
+        except OSError:
+            self.calib = None
+
+    def numbers(self, bits):
+        out = []
+        bn = self.bit_number
+        while bits:
+            low = bits & -bits
+            n = bn[low.bit_length() - 1]
+            if n is not None:
+                out.append(n)
+            bits ^= low
+        if out and self.unmapped:
+            out.extend(self.unmapped)
+        return out
+
+    def est(self, test_id):
+        c = self.calib["test_cpu"].get(test_id)
+        return None if c is None else self.speed * c + 0.003
+
+    def run_set(self, bits, fixed, infer=False, data_change=False):
+        """Which candidate tests to run, and the CPU that is expected to cost.
+
+        Running pays when the tests it may drop cost more to select than to run."""
+        if self.calib is None:
+            return [], 0.0
+        nums = self.numbers(bits)
+        if not nums:
+            return [], 0.0
+        light, heavy = [], []
+        cpu = fixed
+        classes = set()
+        for n in nums:
+            tid = self.id_of[n]
+            e = self.est(tid)
+            if e is None or e > HEAVY_CPU:
+                heavy.append(n)
+            else:
+                light.append(n)
+                cpu += e
+                cls = tid.rsplit("::", 1)[0]
+                if cls not in classes:
+                    classes.add(cls)
+                    cpu += self.speed * self.calib["class_cpu"].get(cls, 0.05)
+        if not light:
+            return [], 0.0
+        gain = pack_cost(nums, self.ms) - pack_cost(heavy, self.ms)
+        if infer and heavy:
+            gain = pack_cost(nums, self.ms)  # passing light tests may clear the heavy ones too
+        # how often every test of a static selection passes, by its size
+        # (measured on labeled mutants of the pinned commit)
+        n = len(nums)
+        p = 0.2 if n == 1 else 0.16 if n <= 10 else 0.2 if n <= 50 else 0.14
+        if data_change:
+            p = 0.03  # an edited fixture nearly always fails the tests that read it
+        run_cpu = cpu - fixed
+        expected_cpu = fixed + run_cpu * (p + (1 - p) * 0.5)  # a failure stops the run early
+        # when some fail, about half of a larger selection still turns out to pass
+        partial = 0.0 if data_change else (1 - p) * 0.45 * max(0.0, gain - WORKER_MS / 1000.0)
+        if p * gain + partial <= expected_cpu * MARGIN:
+            return [], 0.0
+        light.sort(key=lambda n: self.est(self.id_of[n]))
+        order = []
+        seen = {}
+        for n in light:  # cheapest first, keeping each class together
+            cls = self.id_of[n].rsplit("::", 1)[0]
+            seen.setdefault(cls, []).append(n)
+        for group in seen.values():
+            order.extend(group)
+        return [self.id_of[n] for n in order], cpu
+
+
+def witness_plan(ctx, plan, bits):
+    """Fast tests to run as witnesses for the slow ones in the selection."""
+    if not WITNESS or ctx.calib is None or not plan.source_only or plan.sites != 1 or not plan.runnable:
+        return [], 0.0
+    nums = ctx.numbers(bits & ~ctx.maps.unit_mask)
+    slow = [n for n in nums if ctx.ms[n] >= SLOW_MS]
+    if not slow:
+        return [], 0.0
+    fast = []
+    cpu = 0.0
+    classes = set()
+    for n in nums:
+        if ctx.ms[n] >= SLOW_MS:
+            continue
+        tid = ctx.id_of[n]
+        e = ctx.est(tid)
+        if e is None:
+            return [], 0.0  # a fast test that cannot be run here: no full set of witnesses
+        fast.append((e, n))
+        cpu += e
+        cls = tid.rsplit("::", 1)[0]
+        if cls not in classes:
+            classes.add(cls)
+            cpu += ctx.speed * ctx.calib["class_cpu"].get(cls, 0.05)
+    cpu += 0.3 * ctx.speed
+    if len(fast) < WITNESS_MIN or cpu > 0.6 * pack_cost(nums, ctx.ms):
+        return [], 0.0
+    fast.sort()
+    seen = {}
+    for e, n in fast:  # cheapest first, keeping each class together
+        seen.setdefault(ctx.id_of[n].rsplit("::", 1)[0], []).append(ctx.id_of[n])
+    return [t for group in seen.values() for t in group], cpu
+
+
+def unit_plan(ctx, bits):
+    """List-driven tests in the selection that can be settled item by item.
+
+    Returns ([(test id, attribute, items to run, items to check)], CPU estimate).
+    An item the change reaches is *run* (the whole test on that one item), unless
+    the change only reaches the item inside the calls that turn the query text
+    into trees and SQL (parsing, the optimizer, transpiling): then it is enough to
+    *check* that those calls still return exactly what they returned at the pinned
+    commit (digests kept in the maps); the rest of the item is code the change
+    does not touch, fed the same input.
+    A test qualifies when that is expected to cost less than selecting it blind."""
+    maps = ctx.maps
+    if not UNITS or ctx.calib is None or not maps.unit_lists:
+        return [], 0.0
+    nums = ctx.numbers(bits & ~maps.unit_mask)
+    if not nums:
+        return [], 0.0
+    secs = maps.head["secs"]
+    digests = maps.head.get("unit_fp", {})
+    cand = []
+    for t, attr in maps.unit_lists.items():
+        tb = maps.test_bit(t)
+        n = ctx.number.get(t)
+        if not (bits & tb) or n is None:
+            continue
+        idxs = sorted(i for i, b in maps.units.get(t, {}).items() if bits & b)
+        if not idxs:
+            continue  # selected for a reason no single item accounts for
+        fp = digests.get(t) or []
+        xs = maps.units_x.get(t)
+        run, check = [], []
+        for i in idxs:
+            if STAGE and xs is not None and not (bits & xs.get(i, 0)) and i < len(fp) and fp[i]:
+                check.append(i)
+            else:
+                run.append(i)
+        if EXEC and t in EXEC_TESTS and all(i < len(fp) and fp[i] for i in idxs):
+            # settled without DuckDB: digests of what the parser, the optimizer and
+            # the transpiler return, and of the table sqlglot's executor returns
+            ms_of = lambda i: fp[i][-1] if isinstance(fp[i][-1], int) else 0  # noqa
+            run.sort(key=ms_of)
+            executed = [i for i in check if len(fp[i]) > 1]
+            est_run = (sum(ms_of(i) + 3 for i in run) / 1000.0 + (0.1 if run else 0.0)) * ctx.speed
+            est_check = (0.022 * len(executed) + 0.003 * (len(check) - len(executed))) * ctx.speed
+            cand.append((ctx.ms[n], t, None, run, check, est_run, est_check, n))
+            continue
+        est_run = sum(secs[maps.units[t][i].bit_length() - 1] for i in run) * ctx.speed
+        est_check = 0.022 * len(check) * ctx.speed  # parse, optimize and transpile one query
+        cand.append((ctx.ms[n], t, attr, run, check, est_run, est_check, n))
+    if not cand:
+        return [], 0.0
+    cand.sort(reverse=True)
+    cls = cand[0][1].rsplit("::", 1)[0]
+    load = 0.3 * ctx.speed  # importing the test module and what it imports
+    setup = ctx.speed * ctx.calib["class_cpu"].get(cls, 0.6)  # the class fixture, only needed to run items
+    jobs, cpu = [], 0.0
+    loaded = fixture = False
+    left = list(nums)
+    for ms, t, attr, run, check, est_run, est_check, n in cand:
+        if t.rsplit("::", 1)[0] != cls:
+            continue
+        without = [x for x in left if x != n]
+        saving = pack_cost(left, ctx.ms) - pack_cost(without, ctx.ms)
+        fixed = (0.0 if loaded else load) + (setup if run and attr and not fixture else 0.0)
+        # a failing item or a changed digest ends the work early, so a test that
+        # will stay selected costs little; one that will be cleared costs it all
+        cost = fixed + 0.6 * est_run + 0.5 * est_check
+        if attr is None and (fixed + est_run) * MARGIN > UNIT_WORTH * saving:
+            continue
+        if UNIT_PASS * saving > cost * MARGIN:
+            jobs.append((t, attr, run, check, UNIT_WORTH * saving))
+            cpu += fixed + est_run + est_check
+            loaded = True
+            fixture = fixture or bool(run and attr)
+            left = without
+    return jobs, cpu
+
+
+def _send(fd, obj):
+    b = marshal.dumps(obj)
+    os.write(fd, len(b).to_bytes(4, "little") + b)
+
+
+def child_main(ctx, warm, plan, verify, w):
+    import resource
+
+    import engine
+
+    # a patch can make sqlglot spin forever at import; CPU spent here is charged
+    cpu_limit = int(ctx.child_limit) + 1
     try:
-        m = Map(APP / "map.json.gz")
-    except Exception as e:  # noqa: BLE001
-        log(f"map unavailable ({e!r}); running everything")
-        m = None
-    all_split = best_split(every)
-    for patch in sorted((DATA / "commits").glob("*.patch")):
-        chosen = ALL
-        if m is not None:
-            try:
-                chosen = select(m, patch.read_text(encoding="utf-8", errors="replace"))
-            except Exception as e:  # noqa: BLE001
-                log(f"{patch.stem}: {e!r}")
-                chosen = ALL
-        if chosen is ALL:
-            workers = all_split
-            log(f"{patch.stem}: all tests")
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + int(RUN_LIMIT) + 2))
+    except (ValueError, OSError):
+        pass
+
+    def more_time():
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit + int(RUN_LIMIT), cpu_limit + int(RUN_LIMIT) + 2))
+        except (ValueError, OSError):
+            pass
+
+    sq = {m: v for m, v in plan.src.items() if m.startswith("sqlglot")}
+    sq.update(plan.reload)
+    tsrc = {m: v for m, v in plan.src.items() if m.startswith("tests")}
+    bits, notes = plan.bits, []
+    c0 = time.process_time()
+    swapped = False
+    if sq and not plan.reload and not tsrc and plan.source_only and getattr(warm, "findex", None) is not None:
+        # only function bodies changed: give the loaded functions their new code
+        swapped = all(engine.swap_code(warm, rel, plan.old.get(m, ""), text) for m, (rel, text) in sq.items())
+    if swapped:
+        notes.append("patched in place")
+    elif sq:
+        dbits, dnotes, broken, _ = engine.state_diff(warm, sq, diff=bool(plan.reload))
+        notes.append(f"reload+diff {time.process_time() - c0:.2f}s")
+        bits |= dbits
+        notes += dnotes
+        if broken:
+            _send(w, (bits, notes))
+            return
+    _send(w, (bits, notes))
+    if not plan.runnable:
+        return
+    prepared = []
+
+    def prepare():
+        if not prepared:
+            import tempfile
+
+            import runner
+
+            tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
+            runner.prepare(SRC, tsrc, plan.data, tmp, fresh=not swapped)
+            prepared.append(tmp)
+
+    # list-driven slow tests: run just the items the change reaches
+    jobs, ucpu = unit_plan(ctx, bits)
+    if jobs:
+        import runner
+
+        more_time()
+        u0 = time.process_time()
+        prepare()
+        digests = ctx.maps.head.get("unit_fp", {})
+        to_run = []
+        ok = {}
+        for t, attr, run, check, budget in jobs:  # the cheap comparison first
+            if attr is None:
+                fp = digests.get(t) or []
+                sp = ctx.speed
+
+                def exec_cost(i, fp=fp, sp=sp):
+                    if i < 0:
+                        return 0.022 * sp  # one comparison of the pure calls
+                    d = fp[i] if i < len(fp) and fp[i] else ()
+                    return (d[-1] + 3) / 1000.0 * sp if d and isinstance(d[-1], int) else 0.0
+
+                ok[t] = runner.items_settled(
+                    SRC, t, check, run, fp, exec_cost, lambda cpu, b=budget: cpu * MARGIN <= b
+                ) is True
+                continue
+            changed = runner.items_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP) if check else []
+            ok[t] = changed is not None and len(run) + len(changed) <= max(len(run), UNIT_GIVE_UP)
+            if ok[t] and (run or changed):
+                # items whose optimizer output moved get run in full, like the others
+                to_run.append((t, attr, sorted(set(run) | set(changed))))
+        res = runner.run_units(SRC, to_run, 4.0 * ctx.speed + 2.0) if to_run else {}
+        ran = {t for t, _, _ in to_run}
+        cleared = []
+        for t, attr, run, check, budget in jobs:
+            if ok[t] and (t not in ran or (res is not None and res.get(t))):
+                bits &= ~ctx.maps.test_bit(t)
+                cleared.append(t.rsplit("::", 1)[1])
+        notes.append(
+            f"units {[(t.rsplit('::', 1)[1], len(r), len(c)) for t, _, r, c, _ in jobs]} est {ucpu:.2f}s "
+            f"took {time.process_time() - u0:.2f}s, cleared {cleared}"
+        )
+        _send(w, (bits, notes))
+    wit, wcpu = witness_plan(ctx, plan, bits)
+    if wit:
+        import runner
+
+        more_time()
+        w0 = time.process_time()
+        prepare()
+        west = {tid: ctx.est(tid) or 1.0 for tid in wit}
+        failed, _, ran = runner.run(
+            SRC, wit, lambda tid: 3.0 * west[tid] + 0.3, keep_going=lambda failed, done: not failed
+        )
+        for tid in ran:
+            if tid not in failed:
+                bits &= ~(1 << ctx.bit_of[tid])  # ran here and passed
+        if not failed and len(ran) == len(wit):
+            notes.append(f"witnesses: all {len(ran)} fast tests pass, clearing {len(ctx.numbers(bits & ~ctx.maps.unit_mask))} slow")
+            bits = 0
         else:
-            nums = sorted({number[m.tests[i]] for i in chosen if m.tests[i] in number})
-            workers = best_split([(n, ms[n]) for n in nums])
-            log(f"{patch.stem}: {len(nums)} tests")
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
+            notes.append(f"witnesses: {len(failed)} of {len(ran)} run failed")
+        notes.append(f"witness est {wcpu:.2f}s took {time.process_time() - w0:.2f}s")
+        _send(w, (bits, notes))
+    if not verify:
+        return
+    # after a re-import the test modules are imported again; they are small
+    fixed = (0.03 if (swapped or not sq) else 0.08) * ctx.speed
+    infer = INFER and plan.source_only
+    ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer, bool(plan.data) and not plan.src)
+    if not ids_run:
+        return
+    import runner
+
+    more_time()
+    t0 = time.process_time()
+    prepare()
+    tmp = prepared[0]
+    c1 = time.process_time()
+    speed = ctx.speed
+    cpu_of = ctx.calib["test_cpu"]
+    est = {tid: ctx.est(tid) or 1.0 for tid in ids_run}
+    nums_all = ctx.numbers(bits)
+
+    def keep_going(failed, done):
+        if not failed:
+            return True
+        # with a failure in hand, the rest only pays if dropping it shrinks the cost
+        left = [t for t in ids_run if t not in done]
+        if not left:
+            return False
+        drop = {ctx.number[t] for t in done if t not in failed}
+        now = [n for n in nums_all if n not in drop]
+        after = [n for n in now if ctx.id_of[n] not in left]
+        return pack_cost(now, ctx.ms) - pack_cost(after, ctx.ms) > sum(est[t] for t in left) * MARGIN
+
+    failed, _, ran = runner.run(
+        SRC, ids_run, lambda tid: 3.0 * est[tid] + 0.3, keep_going=keep_going
+    )
+    for tid in ran:
+        if tid not in failed:
+            bits &= ~(1 << ctx.bit_of[tid])
+    if infer and not failed and len(ran) == len(ids_run) and len(ran) >= INFER_MIN:
+        # Experiment: every test cheap enough to run exercises the change and passes;
+        # take that as evidence the expensive ones pass too.
+        notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
+        bits = 0
+    notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
+    _send(w, (bits, notes))
+
+
+def start_child(ctx, warm, plan, verify):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            child_main(ctx, warm, plan, verify, w)
+        except BaseException as e:  # noqa
+            import traceback
+
+            try:
+                os.write(2, f"child failed: {e!r}\n{traceback.format_exc()[-1500:]}\n".encode())
+            except Exception:
+                pass
+        finally:
+            if DEBUG:
+                import resource
+
+                ru = resource.getrusage(resource.RUSAGE_SELF)
+                os.write(2, f"self {plan.cid if hasattr(plan, 'cid') else ''} user {ru.ru_utime:.3f} sys {ru.ru_stime:.3f} minflt {ru.ru_minflt} majflt {ru.ru_majflt}\n".encode())
+            os._exit(0)
+    os.close(w)
+    return pid, r
+
+
+def _frames(buf):
+    out = []
+    i = 0
+    while i + 4 <= len(buf):
+        n = int.from_bytes(buf[i : i + 4], "little")
+        if i + 4 + n > len(buf):
+            break
+        out.append(marshal.loads(bytes(buf[i + 4 : i + 4 + n])))
+        i += 4 + n
+    return out
+
+
+def run_children(ctx, warm, plans, jobs):
+    """jobs: list of (cid, verify). Two at a time, one per core."""
+    import select
+
+    if GC_FREEZE:
+        import gc
+
+        # what is loaded now is shared with every child: keep the collector from
+        # walking it there (and from dirtying the shared pages)
+        gc.collect()
+        gc.freeze()
+    queue = list(jobs)
+    running = {}  # fd -> [cid, pid, buffer, deadline]
+    while queue or running:
+        while queue and len(running) < 2:
+            cid, verify = queue.pop(0)
+            plan = plans[cid]
+            elapsed = time.monotonic() - T0
+            if elapsed > DEADLINE:
+                if plan.reload:
+                    plan.full = True
+                    plan.notes.append("out of time")
+                continue
+            verify = verify and VERIFY and elapsed < VERIFY_UNTIL
+            try:
+                pid, r = start_child(ctx, warm, plan, verify)
+            except Exception as e:
+                if plan.reload:
+                    plan.full = True
+                plan.notes.append(f"fork failed: {e!r}")
+                continue
+            running[r] = [cid, pid, bytearray(), time.monotonic() + ctx.child_limit]
+        if not running:
+            continue
+        now = time.monotonic()
+        wait = max(0.0, min(v[3] for v in running.values()) - now)
+        ready, _, _ = select.select(list(running), [], [], wait)
+        for r in ready:
+            b = os.read(r, 1 << 20)
+            if b:
+                entry = running[r]
+                if not entry[2]:
+                    entry[3] += RUN_LIMIT  # it answered; what follows is test running
+                entry[2] += b
+                continue
+            _finish(plans, running.pop(r), r, False)
+        now = time.monotonic()
+        for r in [r for r, v in running.items() if v[3] <= now]:
+            _finish(plans, running.pop(r), r, True)
+
+
+def _finish(plans, entry, r, killed):
+    cid, pid, buf, _ = entry
+    os.close(r)
+    if killed:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+    used = None
+    try:
+        ru = os.wait4(pid, 0)[2]
+        used = ru.ru_utime + ru.ru_stime
+    except OSError:
+        pass
+    plan = plans[cid]
+    if DEBUG and used is not None:
+        log(f"cpu {cid} {used:.3f}")
+    frames = []
+    try:
+        frames = _frames(buf)
+    except Exception as e:
+        plan.notes.append(f"bad frames {e!r}")
+    if killed:
+        plan.notes.append("child timed out")
+    if not frames:
+        if plan.reload:
+            plan.full = True  # what changed at import time is unknown
+        plan.notes.append("child gave no answer")
+        return
+    bits, notes = frames[-1]
+    plan.bits = bits
+    plan.notes.extend(notes)
+    if any(n.startswith("broken sqlglot") for n in notes):
+        # a module that no longer imports breaks whatever loads it, often lazily
+        # through the dialect registry: far more tests than any map shows
+        plan.full = True
+
+
+# ---------------------------------------------------------------- driver
+def main():
+    with open(os.path.join(DATA, "tests.json"), "rb") as f:
+        tj = json.load(f)["tests"]
+    maps = Maps(MAPS)
+    ctx = Ctx(maps, tj)
+    t_maps = time.process_time()
+
+    commits_dir = os.path.join(DATA, "commits")
+    ids = sorted(f[:-6] for f in os.listdir(commits_dir) if f.endswith(".patch"))
+    plans = {}
+    for cid in ids:
+        try:
+            with open(os.path.join(commits_dir, cid + ".patch"), "rb") as f:
+                text = f.read().decode("utf-8", "surrogateescape")
+            plans[cid] = analyze(maps, text)
+        except Exception as e:  # anything unexpected: run everything for this commit
+            p = Plan()
+            p.full = True
+            p.notes.append(f"analysis failed: {e!r}")
+            plans[cid] = p
+
+    t_plan = time.process_time()
+    jobs = []
+    for cid in ids:
+        p = plans[cid]
+        if p.full:
+            continue
+        if p.reload:
+            jobs.append((cid, p.runnable))
+        elif p.runnable and p.bits and ctx.calib is not None:
+            slow = WITNESS and any(ctx.ms[n] >= SLOW_MS for n in ctx.numbers(p.bits & ~maps.unit_mask))
+            if VERIFY or slow or (UNITS and any(p.bits & maps.test_bit(t) for t in maps.unit_lists)):
+                jobs.append((cid, VERIFY))
+    if jobs:
+        warm = None
+        try:
+            import engine
+
+            t0 = time.process_time()
+            if any(v for _, v in jobs) and VERIFY:
+                _preload_test_deps()  # before sqlglot: it checks whether unittest is loaded
+            warm = engine.Warm(SRC, maps)
+            warm_cpu = warm.import_cpu  # the machine's speed is judged by the import alone
+            ctx.speed = min(8.0, max(1.0, warm_cpu / REF_WARM))
+            if os.environ.get("BLAST_SPEED"):
+                ctx.speed = float(os.environ["BLAST_SPEED"])  # for repeatable experiments
+            # re-importing everything and comparing it costs a few times the first import
+            ctx.child_limit = min(15.0, max(4.0, 25.0 * warm_cpu + 2.0))
+            log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}, child limit {ctx.child_limit:.1f}s")
+            maps.reads  # the index, loaded before forking so children share it
+        except Exception as e:
+            log(f"warm-up failed: {e!r}")
+        if warm is None:
+            for cid, _ in jobs:
+                if plans[cid].reload:
+                    plans[cid].full = True
+        else:
+            # verification-only jobs: skip those whose static set is not worth running
+            kept = []
+            wanted = set()
+            for cid, verify in jobs:
+                p = plans[cid]
+                if p.reload:
+                    kept.append((cid, verify))
+                    continue
+                sq = [m for m in p.src if m.startswith("sqlglot")]
+                in_place = p.source_only and len(sq) == len(p.src)
+                fixed = (0.03 if in_place or not sq else 0.002 * len(warm.dependents(sq)) + 0.01) * ctx.speed
+                ids_run = (
+                    ctx.run_set(p.bits & ~maps.unit_mask, fixed, INFER and p.source_only, bool(p.data) and not p.src)[0]
+                    if verify
+                    else []
+                )
+                if ids_run and in_place:
+                    wanted.update(t.split("::")[0] for t in ids_run)
+                if unit_plan(ctx, p.bits)[0] or witness_plan(ctx, p, p.bits)[0]:
+                    kept.append((cid, verify))
+                elif ids_run:
+                    kept.append((cid, True))
+            if wanted:
+                # Function-body patches are applied in place in each child, so the test
+                # modules can be imported once here and shared by all of them.
+                import importlib
+
+                t0 = time.process_time()
+                for path in sorted(wanted):
+                    try:
+                        importlib.import_module(path[:-3].replace("/", "."))
+                    except Exception as e:
+                        log(f"cannot import {path}: {e!r}")
+                import resource  # noqa: loaded here so no child pays for importing them
+                import shutil  # noqa
+                import tempfile  # noqa
+
+                import runner  # noqa
+
+                try:
+                    warm.findex = engine.function_index(SRC)
+                except Exception as e:
+                    log(f"no function index: {e!r}")
+                log(f"shared test modules {len(wanted)}, function index, {time.process_time() - t0:.2f}s cpu")
+            # import-time changes first: they matter most if time runs short
+            kept.sort(key=lambda j: not plans[j[0]].reload)
+            run_children(ctx, warm, plans, kept)
+
+    out = []
+    for cid in ids:
+        p = plans[cid]
+        tests = ctx.everything if p.full else ctx.numbers(p.bits)
+        if DROP_MS and not p.full:
+            tests = [t for t in tests if ctx.ms[t] < DROP_MS]  # experiment: how much do slow tests cost
+        if DROP_NAMES and not p.full:
+            tests = [t for t in tests if not any(x in ctx.id_of[t] for x in DROP_NAMES)]  # experiment
+        workers = pack(tests, ctx.ms)
+        out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+        if DEBUG:
+            log(cid, "FULL" if p.full else len(tests), "; ".join(p.notes)[-300:])
+    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+    sys.stdout.flush()
+    log(f"done {len(ids)} commits in {time.monotonic() - T0:.2f}s wall, {time.process_time():.2f}s cpu (parent): "
+        f"start+maps {t_maps:.2f}, analysis {t_plan - t_maps:.2f}, jobs {len(jobs)}")
+
+
+def _preload_test_deps():
+    """Third-party modules the tests import, loaded once before forking."""
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    for m in ("unittest", "unittest.mock", "sqlite3", "decimal", "tempfile", "concurrent.futures",
+              "multiprocessing", "tracemalloc", "pytz", "duckdb", "numpy", "pandas", "pandas.testing"):
+        try:
+            __import__(m)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
