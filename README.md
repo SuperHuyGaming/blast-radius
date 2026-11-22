@@ -1,7 +1,5 @@
 # nap-time: Blast Radius entry of team 67
 
-This branch is the MIT-licensed work of Jason Scheffel (team 67), taken unchanged from https://github.com/jason-scheffel/nap-time at commit b7d1306. See LICENSE.
-
 This repository is an entry for the RWX Blast Radius track of the Builders Buildathon 2026.
 For each code change to sqlglot (commit `eb11aec`), the program prints the tests that fail on it and a split across workers.
 

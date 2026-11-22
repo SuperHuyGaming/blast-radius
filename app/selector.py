@@ -3270,6 +3270,13 @@ def main():
         import traceback
 
         traceback.print_exc(file=sys.stderr)
+    if state["tests"] is not None and state.get("number") is None and os.environ.get("BR_TPCDS", "1") == "1":
+        try:
+            import tpcds_proof
+
+            tpcds_proof.refine(state["answers"], state["tests"], ROOT, DATA, deadline, log, pack)
+        except BaseException as e:  # noqa: BLE001
+            log("tpcds proof failed:", repr(e))
     # every commit gets a line; a commit without an answer gets every test (never a miss)
     tests = state["tests"]
     commits = state["commits"]

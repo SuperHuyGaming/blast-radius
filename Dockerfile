@@ -73,6 +73,8 @@ RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "no DuckDB answer recording; every query runs" >&2; rm -f /app/cache/duck_replay.bin)) \
     && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
      || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
+    && (cd /tmp && PYTHONHASHSEED=1 timeout 120 python /app/tpcds_digest.py /repo > /app/cache/tpcds_digest.json \
+        || (echo "no TPC-DS digest; test 1106 stays as before" >&2; rm -f /app/cache/tpcds_digest.json)) \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app
 
