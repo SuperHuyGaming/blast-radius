@@ -51,6 +51,7 @@ else:
     engine_keep_code = False
 
 import engine  # noqa: E402
+import procmodel  # noqa: E402
 import patchrules  # noqa: E402
 import sideeffect  # noqa: E402
 from rawz import unz as _unz  # noqa: E402  (map blobs: raw in the image, zlib in the repo)
@@ -142,6 +143,9 @@ COLL_BUDGET = float(os.environ.get("BR_COLL_BUDGET", "inf"))  # CPU limit of the
 # test without a run: "1" on, "0" off. For validation: "always" = whenever the test is held,
 # "force" = the test is always held and checked.
 STAGE = os.environ.get("BR_STAGE", "1")
+# The inline stage check (inline_check): a long test with a stage map that the child runs is
+# first checked in a forked process; only its "passes" counts, else the test runs as before.
+INLINE_STAGE = os.environ.get("BR_INLINE_STAGE", "1") == "1"
 MEMO = os.environ.get("BR_MEMO", "1") == "1"  # the step memo of the stage check (memo.py); BR_MEMO=0 turns it off
 # CPU seconds (as measured when the stage map was built) that a check may cost for each
 # second that leaving the test out of the answer saves. A check that proves a pass costs CPU
@@ -228,6 +232,15 @@ RSS_LIMIT = float(os.environ.get("BR_RSS_LIMIT_MB", "2560")) * 1048576
 CG_LIMIT = float(os.environ.get("BR_CG_LIMIT_MB", "3400")) * 1048576
 MEM_POLL = 0.05
 MEM_GUARD = os.environ.get("BR_NO_MEM_GUARD") != "1"
+# Memory valve (procmodel.py: automatic garbage collection is off): past these, the child (and,
+# for the container's memory, this process) collects and turns collection back on. Below the
+# guard's limits; measured: test_max_nodes peaks at 1637 MB with collection on, 1785 MB off (and
+# 21 instead of 39 CPU seconds), so a valve at 1.5 GB would only cost CPU; two such children at
+# once peak at 3257 MB with the valve, as with collection on (3255 MB).
+VALVE_RSS = float(os.environ.get("BR_VALVE_MB", "2048")) * 1048576
+VALVE_CG = float(os.environ.get("BR_VALVE_CG_MB", "2900")) * 1048576
+VALVE_ON = procmodel.GC_OFF
+_VALVED = set()
 SLOTS_RULE = os.environ.get("BR_NO_SLOTS") != "1"
 
 
@@ -246,12 +259,41 @@ def wall_limit():
 _CG_FD = []
 
 
+def _container_used():
+    """The container's anonymous and shared memory (memory.stat); OSError or ValueError when
+    it cannot be read."""
+    with open("/sys/fs/cgroup/memory.stat") as f:
+        used = 0
+        for row in f:
+            k, _, v = row.partition(" ")
+            if k in ("anon", "shmem"):
+                used += int(v)
+    return used
+
+
+def open_valve(pid, why):
+    """The memory valve (procmodel.py): the child turns automatic garbage collection back on
+    and collects (SIGUSR1), once per child."""
+    if pid in _VALVED:
+        return
+    _VALVED.add(pid)
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError:
+        return
+    log("memory valve:", why, "pid", pid)
+
+
 def memory_over(pid, statm_fd):
-    """A reason string when the child (or the container) uses too much memory, else None."""
+    """A reason string when the child (or the container) uses too much memory, else None.
+    Below those limits, the memory valve opens for the child past VALVE_RSS (its resident
+    memory) or VALVE_CG (the container's), and for this process too past VALVE_CG."""
     try:
         rss = int(os.pread(statm_fd, 128, 0).split()[1]) * 4096
         if rss > RSS_LIMIT:
             return "child resident %d MB" % (rss >> 20)
+        if rss > VALVE_RSS and VALVE_ON:
+            open_valve(pid, "child resident %d MB" % (rss >> 20))
     except (OSError, ValueError, IndexError):
         pass
     if not _CG_FD:
@@ -263,20 +305,40 @@ def memory_over(pid, statm_fd):
     if fd is not None:
         try:
             cur = int(os.pread(fd, 64, 0))
-            if cur > CG_LIMIT:
+            if cur > CG_LIMIT or (VALVE_ON and cur > VALVE_CG and pid not in _VALVED):
                 # memory.current counts the page cache too: the anonymous and shared memory
                 # decide (memory.stat)
-                with open("/sys/fs/cgroup/memory.stat") as f:
-                    used = 0
-                    for row in f:
-                        k, _, v = row.partition(" ")
-                        if k in ("anon", "shmem"):
-                            used += int(v)
+                used = _container_used()
                 if used > CG_LIMIT:
                     return "container memory %d MB" % (used >> 20)
+                if VALVE_ON and used > VALVE_CG:
+                    open_valve(pid, "container memory %d MB" % (used >> 20))
+                    procmodel.valve()
         except (OSError, ValueError):
             pass
     return None
+
+
+def valve_poll(pid, statm_fd):
+    """The memory valve alone (no limit ends the child), for the fixture batch child."""
+    if statm_fd is None or pid in _VALVED:
+        return
+    try:
+        rss = int(os.pread(statm_fd, 128, 0).split()[1]) * 4096
+        if rss > VALVE_RSS:
+            open_valve(pid, "child resident %d MB" % (rss >> 20))
+            return
+    except (OSError, ValueError, IndexError):
+        pass
+    if _CG_FD and _CG_FD[0] is not None:
+        try:
+            if int(os.pread(_CG_FD[0], 64, 0)) > VALVE_CG:
+                used = _container_used()
+                if used > VALVE_CG:
+                    open_valve(pid, "container memory %d MB" % (used >> 20))
+                    procmodel.valve()
+        except (OSError, ValueError):
+            pass
 
 
 def log(*a):
@@ -480,7 +542,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "class_broken", "coll_dead", "coll_names", "coll_extra", "vanished")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "istage", "class_broken", "coll_dead", "coll_names", "coll_extra", "vanished")
 
     def __init__(self, commit):
         self.commit = commit
@@ -523,6 +585,7 @@ class Plan:
         self.tokcheck = []  # held long tests whose tokenize inputs the child tokenizes again (tokcheck.py)
         self.sure_infected = set()  # tests whose own evaluations of an edited comparison change (infect.py)
         self.added = []  # (test id, first later test) of test methods that the patch adds
+        self.istage = None  # the inline stage check of a long test that runs (inline_plan)
         self.vanished = set()  # tests of classes that the patch only renames: their ids are not in the full run
         self.watch = []  # (module, descriptor) of shared containers to watch (shared_write_watch)
         self.watched = None  # the statefp keys of the containers that the child watched (None: not reported)
@@ -2962,6 +3025,150 @@ def memo_cost(m, cpu, active, later):
     return total
 
 
+def _inline_verdict(plan: Plan, tests, case, real, code_pairs):
+    """Forked process of inline_check: the test once with the hooks of the stage check
+    (stages.StageCheck, no budget, no probe). False: it passes (every task that ran to its end
+    gave the pinned rows; the tasks that stopped where the plan is built had the pinned input,
+    and then the fixture rows, the interpreter settings and the module state are as the pinned
+    test leaves them, as in run_stage_check). True: it failed here. None: no verdict."""
+    import reduce
+    import stages
+
+    st = plan.istage
+    n = st["n"]
+    test_id = tests[n]["id"]
+    path = test_id.split("::")[0]
+    record = MAPS_OBJ.stages()[test_id]
+    module = sys.modules[path[:-3].replace("/", ".")]
+    cls = type(case)
+    active = reduce.STATE.keep_tasks
+    check = stages.StageCheck(record, set(st["later"]), float("inf"), None if active is None else set(active))
+    check.slack = None
+    if st.get("memo") is not None:
+        import memo
+
+        store = memo.Store(MAPS)
+        m = st["memo"]
+        if store.ok():
+            check.memo = (store, set(m["d"]))
+            check.memo_full = set(m["full"])
+            check.noopt = set(m["noopt"])
+            check.notext = set(m.get("notext", ()))
+            check.nomid = set(m.get("nomid", ()))
+            check.hook_changed = m.get("hook_edit", True) is not False
+            rowh = store.index.get("rowh")
+            check.rowh = rowh if type(rowh) is dict and rowh else None
+    pairs = list(code_pairs) + list(plan.fpairs or ())
+    alias = stages.code_alias(pairs) if pairs else None
+    holder = stages.hold_state(record["effect"], alias)
+    try:
+        return _inline_run(plan, check, module, cls, case, real, record, holder, alias)
+    finally:
+        stages.release(holder)
+
+
+def _inline_run(plan, check, module, cls, case, real, record, holder, alias):
+    import reduce
+    import stages
+
+    before_settings = _interpreter_settings()
+    if not check.install(module, cls):
+        return None
+    reduce.STATE.task_hook = check.run_task
+    try:
+        module.initializer(getattr(module, record["schema"]), getattr(case, record["tables"]))
+        if not check.rows_start():
+            return None
+        try:
+            real()
+            failed = not case._outcome.success
+        except BaseException:  # noqa: BLE001  (an error, a failed subtest, a skip: the real run decides)
+            failed = True
+    finally:
+        reduce.STATE.task_hook = None
+        check.remove()
+    if DEBUG:
+        sys.stderr.write("inline check %s: failed %s over %s why %s seq %s\n" % (plan.commit, failed, check.over, check.why, "".join(check.seq)))
+    if failed:
+        return True
+    if not check.complete():
+        return None
+    if _interpreter_settings() != before_settings:
+        return None
+    if check.same or check.memo_used:
+        if not check.rows_ok():
+            return None
+        before = stages.held_state(holder)
+        ok = stages.state_ok(record["effect"], before, alias)[0] if before is not None else False
+        if not ok:
+            return None
+    return False
+
+
+def inline_check(plan: Plan, tests, code_pairs, settings):
+    """Child side: the wrapper of the method of the long test of plan.istage (runner.INLINE).
+    The method first runs in a forked process with the hooks of the stage check
+    (_inline_verdict); when that proves a pass, the method returns at once (the test passes).
+    Any other outcome, or a changed interpreter setting or a dead class pool before the test:
+    the method runs here as it is, as without the check."""
+
+    def wrap(case, real):
+        def method(*args, **kwargs):
+            if settings[1] or settings[2] or args or kwargs:
+                return real(*args, **kwargs)
+            left = signal.getitimer(signal.ITIMER_PROF)[0]
+            # the forked run's CPU limit: twice the estimate of the plain run and 2 s more (past
+            # it the plain run below decides), never more than this process has left
+            n = plan.istage["n"]
+            est = plan.prep[3].get(n, 0.0) if plan.prep is not None else 0.0
+            limit = max(GUARD_MIN, 2.0 * est * SLOWDOWN + 2.0)
+            if left > 0:
+                limit = min(limit, left)
+            rfd, wfd2 = os.pipe()
+            sys.stderr.flush()
+            pid = os.fork()
+            if pid == 0:
+                code = b"N"
+                try:
+                    os.close(rfd)
+                    signal.signal(signal.SIGPROF, signal.SIG_DFL)
+                    signal.setitimer(signal.ITIMER_PROF, limit)
+                    v = _inline_verdict(plan, tests, case, real, code_pairs)
+                    code = b"P" if v is False else (b"F" if v else b"N")
+                except BaseException:  # noqa: BLE001
+                    code = b"N"
+                try:
+                    os.write(wfd2, code)
+                finally:
+                    os._exit(0)
+            os.close(wfd2)
+            data = b""
+            while True:
+                try:
+                    chunk = os.read(rfd, 16)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                data += chunk
+            os.close(rfd)
+            try:
+                _, wst = os.waitpid(pid, 0)
+            except ChildProcessError:
+                wst = 1
+            if wst == 0 and data == b"P":
+                return None
+            if wst == 0 and data == b"F":
+                # (an error or a failed comparison in the run with the hooks: the test fails,
+                # as run_stage_check counts it; the test is selected)
+                raise AssertionError("inline stage check: the test fails")
+            return real(*args, **kwargs)
+
+        return method
+
+    return wrap
+
+
 def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, settings, code_pairs, wfd):
     """Child side, after the commit's other runs: the stage check of the held long test
     (stages.py), when the parent would select that test without a run. It reports what it
@@ -3441,7 +3648,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     os.write(wfd, b"REDOC\n" if engine.SWAP_FAIL == "cells" else b"REDO\n")
                     os._exit(0)
                 for f, code in swaps:
-                    if plan.stage is not None:
+                    if plan.stage is not None or plan.istage is not None:
                         code_pairs.append((f.__code__, code))
                     f.__code__ = code
         read_old = engine.install_open_overlay(ROOT, plan.files)
@@ -3508,6 +3715,9 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             gc.freeze()
         t_setup = time.process_time()
         settings[0] = _interpreter_settings()
+        runner.INLINE.clear()
+        if plan.istage is not None and plan.mode == "hot" and plan.istage["n"] in order and not broken_here:
+            runner.INLINE[plan.istage["n"]] = inline_check(plan, tests, code_pairs, settings)
         runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
@@ -3858,13 +4068,24 @@ def run_fixture_batch_child(batch, tests, time_left):
     t_end = time.monotonic() + time_left
     t_test = time.monotonic() + SETUP_TIMEOUT * SLOWDOWN  # time for the child's own setup
     allowed, cap, t_cap = {}, None, None
+    statm_fd = None
+    if VALVE_ON:
+        try:
+            statm_fd = os.open("/proc/%d/statm" % pid, os.O_RDONLY)
+        except OSError:
+            pass
+    t_mem = time.monotonic() + MEM_POLL
     try:
         while True:
             now = time.monotonic()
             if now >= t_end or now >= t_test or (t_cap is not None and now >= t_cap):
                 status = "TIMEOUT"
                 break
-            ready, _, _ = select.select([r], [], [], max(0.01, min(t_end, t_test, t_cap or t_end) - now))
+            if statm_fd is not None and now >= t_mem:
+                t_mem = now + MEM_POLL
+                valve_poll(pid, statm_fd)
+            wait = max(0.01, min(t_end, t_test, t_cap or t_end) - now)
+            ready, _, _ = select.select([r], [], [], min(wait, MEM_POLL) if statm_fd is not None else wait)
             if not ready:
                 continue
             chunk = os.read(r, 65536)
@@ -3917,6 +4138,8 @@ def run_fixture_batch_child(batch, tests, time_left):
     finally:
         # as in run_child: the child must not run on, and no zombie may stay
         os.close(r)
+        if statm_fd is not None:
+            os.close(statm_fd)
         try:
             os.killpg(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -4626,6 +4849,7 @@ def release_pin_if_slow():
 
 
 def main():
+    procmodel.install()
     pin_to_one_cpu()
     t_start = time.monotonic()
     deadline = t_start + wall_limit()
@@ -4676,7 +4900,9 @@ def main():
     try:
         with open("/sys/fs/cgroup/cpu.stat") as f:
             cg = " ".join(f.read().split("\n")[:3])
-    except OSError:
+        with open("/sys/fs/cgroup/memory.peak") as f:
+            cg += " memory.peak_mb %d" % (int(f.read()) >> 20)
+    except (OSError, ValueError):
         pass
     log("done in", round(time.monotonic() - t_start, 2), "s wall; cpu", round(sum(os.times()[:4]), 2), cg)
     # the answers are written (os.write): skip the interpreter teardown (module cleanup, duckdb
@@ -5262,6 +5488,7 @@ def run(t_start, deadline, state):
             cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
         plan.prep = (allowed, skip, cap, cost)
         stage_plan(plan, ran, held)
+        inline_plan(plan, ran)
         if plan.stage is not None:
             # the check runs after the tests of the commit, with its own CPU limit (see GUARD)
             # and its own time limit; the cap on the other runs ends where it begins (run_child)
@@ -5273,6 +5500,40 @@ def run(t_start, deadline, state):
                 plan.guard[n] = limit
             allowed[n] = max(TEST_TIMEOUT, 1.5 * limit + 5.0) * SLOWDOWN
         return ran, held, allowed, skip, cap
+
+    def inline_plan(plan, ran):
+        """The inline form of the stage check (inline_check) for a long test with a stage map
+        that the child runs (reduced or whole): plan.istage, or None. Same conditions as
+        stage_plan: a function-body commit that changes nothing but sqlglot code, the row
+        cache of the class fixture, and a task that can stop where its plan is built."""
+        plan.istage = None
+        if not INLINE_STAGE or STAGE == "0" or RUN_ALL or plan.mode != "hot" or plan.watch or plan.all_fail:
+            return
+        if any(text is None or not (p.startswith("sqlglot/") and p.endswith(".py")) for p, text in plan.files.items()):
+            return
+        if not preload.exec_cache_present():
+            return
+        for n in ran:
+            if plan.stage is not None and plan.stage["n"] == n:
+                continue
+            record = maps.stages().get(tests[n]["id"])
+            if record is None:
+                continue
+            tasks = set(record["tasks"])
+            keep = plan.keeps.get(n)
+            active = tasks if keep is None or keep[2] is None else tasks & set(keep[2])
+            if plan.lines and None not in plan.lines.values():
+                import stages
+
+                later = stages.late_tasks(record, plan.lines)
+            else:
+                later = set(tasks)
+            if not (active - later):
+                continue  # every task runs to its end: the check cannot stop one early
+            memo_info = memo_dirty(plan, record) if MEMO and later else None
+            plan.istage = {"n": n, "later": sorted(later), "memo": memo_info}
+            plan.note.append("inline stage check: %d of %d tasks" % (len(active - later), len(active)))
+            return
 
     def stage_plan(plan, ran, held):
         """Plans the stage check (stages.py) for a held long test that has a stage map: sets

@@ -89,6 +89,7 @@ class Verdicts(unittest.TestResult):
             self.class_errors.append(test.description)
 
 
+INLINE = {}  # test number -> wrap(case, method): the wrapper of its method (selector.inline_check)
 _FAILED_IMPORTS = {}
 ON_IMPORT = {}  # module name -> function called once with the module after its first load here
 
@@ -155,6 +156,10 @@ def run_tests(items, emit, stop_after_fail=False, keeps=None, started=None, skip
             continue
         if keeps and number in keeps:
             case._br_keep = keeps[number]
+        if number in INLINE:
+            name = case._testMethodName
+            real = getattr(case, name)
+            setattr(case, name, functools.wraps(real)(INLINE[number](case, real)))
         if enders or number in skip_after_fail:
             _skip_when_failed(case, result_box, number in skip_after_fail)
         suite.addTest(case)
