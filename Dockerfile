@@ -87,12 +87,20 @@ RUN echo "step exec_cache start $(date +%s)" && (timeout 120 python /app/build_e
      || (echo "no DuckDB answer recording; every query runs" >&2; rm -f /app/cache/duck_replay.bin)) \
     && echo "step base_state start $(date +%s)" && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
      || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
+    && echo "step parse_cache start $(date +%s)" && (python /app/build_parse_cache.py /repo /app/cache/parse_cache.bin \
+     || (echo "no parse cache; the stage check parses the query texts" >&2; rm -f /app/cache/parse_cache.bin /app/cache/parse_cache_cover.bin)) \
     && echo "step docs_read start $(date +%s)" && (python /app/build_docs_read.py /repo /app/maps /app/cache/docs_read.json \
      || (echo "no saved docs answer; the selector reads the test files" >&2; rm -f /app/cache/docs_read.json)) \
     && echo "step rawmaps start $(date +%s)" && (python /app/rawmaps.py /app/maps || echo "maps stay compressed" >&2) \
     && echo "step compile start $(date +%s)" \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app && echo "step all end $(date +%s)"
+
+# The pinned side of the step memo's changed-function check (memo.build_old: the function spans
+# and the blanked module of every sqlglot/**/*.py, read back and compared with the live
+# computation). If it fails, the parent parses the pinned files as before.
+RUN (cd /app && python -c "import memo, sys; print('memo_old', memo.build_old('/repo', '/app/cache/memo_old.bin'), file=sys.stderr)" \
+     && chmod a+r /app/cache/memo_old.bin) || (echo "no memo_old" >&2; rm -f /app/cache/memo_old.bin)
 
 WORKDIR /repo
 CMD ["python", "/app/main.py"]

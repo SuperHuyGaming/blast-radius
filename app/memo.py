@@ -83,6 +83,40 @@ class _TieWriter(_KeyWriter):
         return (r[0], r[1], tuple(state))
 
 
+class _TypeBlindWriter(_KeyWriter):
+    """_KeyWriter without the type annotation (the _type slot) of sqlglot objects: two optimized
+    expressions with equal type-blind fingerprints are the same graph (parents, strings, meta,
+    cached hashes, every other slot) but for the DataType objects that their nodes carry as
+    _type. Only the type-only shortcut of the stage check uses it (StageCheck.type_only)."""
+
+    def reducer_override(self, obj):
+        r = super().reducer_override(obj)
+        if r is NotImplemented or type(r) is not tuple or len(r) != 3:
+            return r
+        info = self.info.get(type(obj))
+        if info is None or info[0] != 0 or "_type" not in info[2]:
+            return r
+        state = list(r[2])
+        state[info[2].index("_type")] = None
+        return (r[0], r[1], tuple(state))
+
+
+def type_sig(expression):
+    """A cheap necessary condition for equal type-blind fingerprints (16 bytes, or None): the class
+    names of the nodes in walk order. Only a filter: tb_fp decides."""
+    try:
+        h = hashlib.blake2b(digest_size=16)
+        h.update("\n".join([type(n).__qualname__ for n in expression.walk()]).encode())
+        return h.digest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def tb_fp(expression):
+    """Type-blind fingerprint of an optimized expression (16 bytes) or None."""
+    return _key_fp(expression, _TypeBlindWriter)
+
+
 def _key_fp(obj, writer=_KeyWriter):
     buf = io.BytesIO()
     w = writer(buf, None)
@@ -175,6 +209,158 @@ def plan_keys(order, idx):
     except Exception:  # noqa: BLE001
         return None
     return keys
+
+
+def loose_keys(order, idx, ctes):
+    """plan_keys without the parent pointers (_TieWriter): key i covers the definitions of steps
+    0..i of the canonical order with everything that they reach downward (type annotations
+    included), but not the tree above them; the last entry is the fingerprint of plan.ctes (the
+    With that the executor attaches to its subqueries). None when a key cannot be written."""
+    buf = io.BytesIO()
+    w = _TieWriter(buf, None)
+    h = hashlib.blake2b(digest_size=16)
+    keys = []
+    try:
+        for s in order:
+            state = {k: v for k, v in vars(s).items() if k not in ("dependencies", "dependents")}
+            w.dump(("%s.%s" % (type(s).__module__, type(s).__qualname__), sorted(idx[id(d)] for d in s.dependencies), state))
+            if w.opaque:
+                return None
+            h.update(buf.getbuffer())
+            buf.seek(0)
+            buf.truncate()
+            keys.append(h.copy().digest())
+    except Exception:  # noqa: BLE001
+        return None
+    c = _key_fp(("ctes", ctes), _TieWriter)
+    if c is None:
+        return None
+    keys.append(c)
+    return keys
+
+
+# --- the audit of the type-only shortcut (build time, pinned tree) ------------------------
+# The statements of the pinned extent of a task's later work (plan, executor frame, steps, post:
+# build_memo "anyl") that can reach data above a step's own subtree (parent pointers, ancestors,
+# dynamic attribute access, generic copies) or read a type annotation. A task gets the type-only
+# shortcut only when every such statement of its extent is one of REVIEWED (path, line, text of
+# the statement's first line), each read by hand on the pinned commit:
+#   - reads of the structure above a node (isinstance of a parent, truthiness of an ancestor,
+#     hash-cache invalidation upward, replace() inside a copy): the structure above is the same
+#     when the optimized expressions are equal but for _type (type-blind fingerprint);
+#   - reads of a type annotation: Expr.__deepcopy__ (copies it along with the subtree that it
+#     copies) and the Python generator's Div/DPipe (is_type of the children of the node that it
+#     generates): both act on subtrees that the executor reaches downward from a step's
+#     definition, whose types the loose keys compare;
+#   - class-level dispatch (dir/getattr of a generator class), EXTRACT's getattr on a row value,
+#     Plan.dag's self.root (a Step);
+#   - the save and restore of the executor's _ctes in PythonExecutor.execute: plan.ctes is not read
+#     otherwise (a task whose extent plans a subquery reads it in _register_subquery: no shortcut),
+#     so the loose keys leave it out (their last entry).
+_AUDIT_ATTRS = {"parent", "find_ancestor", "parent_select", "root", "depth", "same_parent", "_parent", "__dict__",
+                "__slots__", "f_back", "f_locals", "f_globals", "type", "_type", "is_type", "is_data_type", "meta",
+                "_meta", "meta_get", "to_s", "__repr__", "_to_s", "__getstate__", "__reduce__", "__reduce_ex__",
+                "ctes", "_ctes"}
+_AUDIT_CALLS = {"getattr", "vars", "deepcopy", "attrgetter", "globals", "locals", "dir", "__getattribute__",
+                "getmembers", "repr", "dumps", "getrefcount", "get_referrers", "get_referents"}
+REVIEWED = {
+    ("sqlglot/planner.py", 25): "nodes = {self.root}",
+    ("sqlglot/expressions/core.py", 1074): "node = node.parent",
+    ("sqlglot/expressions/core.py", 1095): "node = node.parent",
+    ("sqlglot/optimizer/normalize.py", 89): "return not any(",
+    ("sqlglot/generator.py", 79): "for attr_name in dir(cls):",
+    ("sqlglot/generator.py", 87): "dispatch[expr_cls] = getattr(cls, attr_name)",
+    ("sqlglot/expressions/core.py", 1015): "if node._type is not None:",
+    ("sqlglot/expressions/core.py", 1016): "copy._type = deepcopy(node._type)",
+    ("sqlglot/expressions/core.py", 1017): "if node._meta is not None:",
+    ("sqlglot/expressions/core.py", 1019): "meta = copy._meta = dict(node._meta)",
+    ("sqlglot/expressions/core.py", 1022): "meta[k] = deepcopy(v)",
+    ("sqlglot/expressions/core.py", 1280): "parent = self.parent",
+    ("sqlglot/optimizer/scope.py", 1111): "if (",
+    ("sqlglot/optimizer/scope.py", 1127): "if (",
+    ("sqlglot/generator.py", 1057): "if (",
+    ("sqlglot/expressions/core.py", 1045): "return deepcopy(self)",
+    ("sqlglot/expressions/core.py", 1241): "for node in self.dfs(prune=lambda n: bool(n.parent and type(n) is not self.__class__)):",
+    ("sqlglot/executor/env.py", 249): "ENV = {",
+    ("sqlglot/dialects/dialect.py", 1302): "if isinstance(identifier.parent, exp.Func):",
+    ("sqlglot/expressions/core.py", 1174): "ancestor = self.parent",
+    ("sqlglot/expressions/core.py", 1176): "ancestor = ancestor.parent",
+    ("sqlglot/generators/python.py", 78): 'if e.args.get("typed") and not (',
+    ("sqlglot/generators/python.py", 87): "if e.this.is_type(exp.DataType.Type.ARRAY) or e.expression.is_type(exp.DataType.Type.ARRAY):",
+    ("sqlglot/expressions/core.py", 989): "t = self._type",
+    ("sqlglot/expressions/core.py", 990): "return t is not None and t.is_type(*dtypes)",
+    # plan.ctes (a copy of the With apart from plan.expression, read by the executor only when it
+    # plans a subquery, python.py _register_subquery, which is not reviewed): saved and restored
+    ("sqlglot/executor/python.py", 33): "ctes, scope = self._ctes, self._outer_scope",
+    ("sqlglot/executor/python.py", 34): "self._ctes, self._outer_scope = plan.ctes, outer_scope",
+}
+
+
+def _stmt_index(src):
+    tree = ast.parse(src)
+    best = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.stmt):
+            span = node.end_lineno - node.lineno
+            for ln in range(node.lineno, node.end_lineno + 1):
+                b = best.get(ln)
+                if b is None or span < b[0]:
+                    best[ln] = (span, node)
+    return best
+
+
+def _stmt_flagged(st):
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        exprs = list(st.decorator_list) + [st.args] + ([st.returns] if st.returns is not None else [])
+    elif isinstance(st, ast.ClassDef):
+        exprs = list(st.decorator_list) + list(st.bases) + list(st.keywords)
+    else:
+        exprs = []
+        for f, v in ast.iter_fields(st):
+            if f in ("body", "orelse", "finalbody", "handlers", "cases"):
+                continue
+            for x in (v if isinstance(v, list) else [v]):
+                if isinstance(x, ast.AST) and not isinstance(x, ast.stmt):
+                    exprs.append(x)
+    for e in exprs:
+        for n in ast.walk(e):
+            if isinstance(n, ast.Attribute) and n.attr in _AUDIT_ATTRS and isinstance(n.ctx, ast.Load):
+                return True  # (a store of a parent pointer or a type reads nothing)
+            if isinstance(n, ast.Name) and n.id in _AUDIT_CALLS:
+                return True
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _AUDIT_CALLS:
+                return True
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in _AUDIT_ATTRS:
+                return True
+    return False
+
+
+def audit(root, lines, cache):
+    """True when every flagged statement that holds one of lines ([(path, line)] of the pinned
+    tree at root) is in REVIEWED with the reviewed text; cache: {path: (statement index, lines)}."""
+    try:
+        return _audit(root, lines, cache)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _audit(root, lines, cache):
+    for path, ln in lines:
+        c = cache.get(path)
+        if c is None:
+            with open(os.path.join(root, path), encoding="utf-8") as f:
+                src = f.read()
+            c = cache[path] = (_stmt_index(src), src.split("\n"))
+        b = c[0].get(ln)
+        if b is None:
+            continue  # (a def line's PY_START or a docstring: no statement of its own here)
+        st = b[1]
+        if not _stmt_flagged(st):
+            continue
+        want = REVIEWED.get((path, st.lineno))
+        if want is None or c[1][st.lineno - 1].strip() != want:
+            return False
+    return True
 
 
 # --- step outputs ---------------------------------------------------------------------
@@ -383,23 +569,210 @@ def _blanked(tree):
     return ast.dump(tree, annotate_fields=False, include_attributes=False)
 
 
+# The pinned side of changed_functions, prepared at build time (build_old): for every
+# sqlglot/**/*.py of the pinned tree, keyed by the sha256 of its text, _functions(tree) and the
+# zlib-compressed _blanked(tree), made by the same interpreter (sys.version is checked). A text
+# that is not in the file (or no file) is parsed here as before.
+OLD_FILE = os.environ.get("BR_MEMO_OLD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "memo_old.bin"))
+_OLD = None
+
+
+def _old_key(text):
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest()
+
+
+def _old_entry(text):
+    global _OLD
+    if _OLD is None:
+        try:
+            import sys
+
+            with open(OLD_FILE, "rb") as f:
+                got = marshal.loads(zlib.decompress(f.read()))
+            _OLD = got["files"] if got.get("version") == sys.version else {}
+        except Exception:  # noqa: BLE001
+            _OLD = {}
+    try:
+        return _OLD.get(_old_key(text))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def build_old(root, out):
+    """Writes the pinned-side file for every sqlglot/**/*.py under root and checks it."""
+    import sys
+
+    files = {}
+    texts = []
+    for d, _, names in os.walk(os.path.join(root, "sqlglot")):
+        for name in sorted(names):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(d, name), encoding="utf-8", newline="") as f:
+                text = f.read()
+            try:
+                tree = ast.parse(text)
+                funcs = _functions(tree)
+                blank = _blanked(tree)
+            except (SyntaxError, ValueError, RecursionError):
+                continue
+            files[_old_key(text)] = (funcs, zlib.compress(blank.encode("utf-8", "surrogatepass"), 6))
+            texts.append(text)
+    blob = zlib.compress(marshal.dumps({"version": sys.version, "files": files}), 6)
+    with open(out, "wb") as f:
+        f.write(blob)
+    # check: the file read back gives the live computation for every text
+    global _OLD
+    _OLD = None
+    saved = OLD_FILE
+    try:
+        globals()["OLD_FILE"] = out
+        for text in texts:
+            e = _old_entry(text)
+            tree = ast.parse(text)
+            if e is None or e[0] != _functions(tree) or zlib.decompress(e[1]).decode("utf-8", "surrogatepass") != _blanked(tree):
+                raise SystemExit("memo_old check failed")
+    finally:
+        globals()["OLD_FILE"] = saved
+        _OLD = None
+    return len(files)
+
+
+def _sm_opcodes(a, b):
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+
+
+def _fast_opcodes(a, b):
+    """SequenceMatcher(None, a, b, autojunk=False).get_opcodes(), computed on the middle that is
+    left once the common prefix P (length p) and suffix S (length s) are cut off, or None when
+    that is not proven to give the same opcodes (then the caller runs the full matcher).
+    Proof sketch: an anchor is an index of a in P or S whose line occurs exactly once in a and
+    once in b; a block (a run a[i:i+k] == b[j:j+k]) that holds an anchor lies on the diagonal of
+    that anchor (j - i = 0 in P, m - n in S), so it is at most P's run (p) or S's diagonal run.
+    A block without an anchor is at most the longest anchor-free run of a in the searched range.
+    With these bounds the matcher's first find_longest_match picks P (p >= s; ties go to the
+    lowest end index, which is P's) or S (s > p, S unique of its length; it ends in the last
+    cell, so it must have no rival), and the second one picks the other; what is left is the
+    middle range X vs Y, on which the matcher runs as it would inside the full call (its search
+    depends only on the lines in the range when autojunk is False)."""
+    n, m = len(a), len(b)
+    lim = n if n < m else m
+    p = 0
+    while p < lim and a[p] == b[p]:
+        p += 1
+    s = 0
+    lim2 = lim - p
+    while s < lim2 and a[n - 1 - s] == b[m - 1 - s]:
+        s += 1
+    if p == 0 and s == 0:
+        return None
+    ca, cb = {}, {}
+    for x in a:
+        ca[x] = ca.get(x, 0) + 1
+    for x in b:
+        cb[x] = cb.get(x, 0) + 1
+
+    def anchor(i):
+        x = a[i]
+        return (i < p or i >= n - s) and ca[x] == 1 and cb.get(x, 0) == 1
+
+    def free_run(lo, hi):
+        best = run = 0
+        for i in range(lo, hi):
+            if anchor(i):
+                run = 0
+            else:
+                run += 1
+                if run > best:
+                    best = run
+        return best
+
+    d = m - n
+    # S's diagonal run below S over the whole range (a[t] == b[t + d] for t < n - s)
+    ext = 0
+    if s:
+        t = n - s - 1
+        while t >= 0 and t + d >= 0 and a[t] == b[t + d]:
+            ext += 1
+            t -= 1
+    if p >= s:
+        if p < free_run(0, n) or p < s + ext:
+            return None
+        # in a[p:], b[p:] the S run stops at p (the run below S needs a[n-s-1] == b[m-s-1], false
+        # unless X or Y is empty, and then it leaves the range)
+        if s and s <= free_run(p, n):
+            return None
+    else:
+        if ext or s <= free_run(0, n):
+            return None
+        if p and p < free_run(0, n - s):
+            return None
+    blocks = []
+    if p:
+        blocks.append((0, 0, p))
+    if p < n - s and p < m - s:
+        mid = difflib.SequenceMatcher(None, a[p:n - s], b[p:m - s], autojunk=False).get_matching_blocks()
+        blocks.extend((i + p, j + p, k) for i, j, k in mid if k)
+    if s:
+        blocks.append((n - s, m - s, s))
+    # the matcher's merge of adjacent blocks
+    merged = []
+    i1 = j1 = k1 = 0
+    for i2, j2, k2 in blocks:
+        if i1 + k1 == i2 and j1 + k1 == j2:
+            k1 += k2
+        else:
+            if k1:
+                merged.append((i1, j1, k1))
+            i1, j1, k1 = i2, j2, k2
+    if k1:
+        merged.append((i1, j1, k1))
+    merged.append((n, m, 0))
+    ops = []
+    i = j = 0
+    for ai, bj, size in merged:
+        tag = ""
+        if i < ai and j < bj:
+            tag = "replace"
+        elif i < ai:
+            tag = "delete"
+        elif j < bj:
+            tag = "insert"
+        if tag:
+            ops.append((tag, i, ai, j, bj))
+        i, j = ai + size, bj + size
+        if size:
+            ops.append(("equal", ai, i, bj, j))
+    return ops
+
+
 def changed_functions(old_text, new_text, firsts=None):
     """{qualname: (start, end) in the old text} of the functions that hold the edits, or None
     when an edit is outside a function (the two modules differ once every function and lambda
     body is blanked: module-level code, a decorator, a default, a dict key next to a lambda on
     the same line), the functions differ by name, or an added line compares by identity."""
+    old = _old_entry(old_text)
     try:
-        old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
-        old_funcs = _functions(old_tree)
-        new_funcs = _functions(new_tree)
-        if _blanked(old_tree) != _blanked(new_tree):
-            return None
+        if old is None:
+            old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
+            old_funcs = _functions(old_tree)
+            new_funcs = _functions(new_tree)
+            if _blanked(old_tree) != _blanked(new_tree):
+                return None
+        else:
+            new_tree = ast.parse(new_text)
+            old_funcs = old[0]
+            new_funcs = _functions(new_tree)
+            if zlib.decompress(old[1]).decode("utf-8", "surrogatepass") != _blanked(new_tree):
+                return None
     except (SyntaxError, ValueError, RecursionError):
         return None
     a, b = old_text.split("\n"), new_text.split("\n")
     out = {}
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    ops = _fast_opcodes(a, b)
+    if ops is None:
+        ops = _sm_opcodes(a, b)
+    for tag, i1, i2, j1, j2 in ops:
         if tag == "equal":
             continue
         for line in b[j1:j2]:
@@ -519,6 +892,7 @@ def prepare(store, files, old_texts, record=None):
     tcov, tsets = idx["tcov"], idx["tsets"]  # {path: {line: set id}}; ("F"|"A"|"E", task) tokens
     late, lsets = record.get("late", {}), record.get("sets", [])
     dirty, full, early, replan = set(), set(), set(), set()
+    touched = set()  # tasks with a changed line anywhere in the extent of their later work (type-only shortcut)
     textd, midd = set(), set()  # tasks whose DuckDB text / logger text may differ from the record's
     for path, spans in changed.items():
         f1 = first.get(path, ())
@@ -536,10 +910,13 @@ def prepare(store, files, old_texts, record=None):
                 sid = by_line.get(ln)
                 if sid is not None:
                     dirty.update(sets[sid])
+                    touched.update(int(x.split(":", 1)[0]) for x in sets[sid])
                 tid = t_line.get(ln)
                 toks = tsets[tid] if tid is not None else ()
                 seen = set()
                 for kind, q in toks:
+                    if kind in ("A", "F", "P"):
+                        touched.add(q)
                     if kind == "T":
                         textd.add(q)  # (the stage check's transpile(), not a part of the task)
                         continue
@@ -580,7 +957,7 @@ def prepare(store, files, old_texts, record=None):
     # (with or without noopt: StageCheck.optimize_stub also wraps a computed result that is pinned)
     nomid = set() if hook_changed else ({q for q, r in idx["queries"].items() if r.get("mtext") is not None} - midd)
     return {"d": sorted(dirty), "full": sorted(full), "noopt": sorted(noopt), "notext": sorted(notext), "nomid": sorted(nomid),
-            "hook": hook_changed, "hook_edit": hook_edit}
+            "hook": hook_changed, "hook_edit": hook_edit, "tq": sorted(touched)}
 
 
 # --- the copy of PythonExecutor._execute --------------------------------------------------

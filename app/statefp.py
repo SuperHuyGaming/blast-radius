@@ -14,6 +14,14 @@ _MARSHAL_OK = (dict, list, tuple, set, frozenset)
 
 
 _PRIM_NAME = {t: t.__name__ for t in _PRIMITIVE}
+_FUNCTION = types.FunctionType
+_CODE = types.CodeType
+_NONE_FP = ("NoneType", None)
+_FUNCTION_TYPES = frozenset((types.FunctionType, classmethod, staticmethod, property, types.MethodType))
+_TABLE_TYPES = frozenset((dict, set, frozenset))
+# builtin types whose __module__ is "builtins" (never "sqlglot..."), so snapshot() skips the lookup
+_PLAIN = frozenset((dict, list, tuple, set, frozenset, types.FunctionType, classmethod, staticmethod, property,
+                    types.MethodType, type, types.BuiltinFunctionType))
 
 
 class Fingerprinter:
@@ -65,19 +73,65 @@ class Fingerprinter:
         got = self.memo.get(key)
         if got is not None:
             return got
-        if key in self.busy or depth > 12:
+        busy = self.busy
+        if key in busy or depth > 12:
             return ("cycle", t.__name__)
-        self.busy.add(key)
-        try:
-            out = self._fp(v, t, depth)
-        finally:
-            self.busy.discard(key)
+        if t in _MARSHAL_OK:
+            # (as _fp's first step; marshal.dumps calls no fp, so v need not be in busy)
+            try:
+                out = hash(("m", t.__name__, marshal.dumps(v, 2)))
+            except ValueError:
+                pass
+            else:
+                self.memo[key] = out
+                return out
+            busy.add(key)
+            try:
+                out = self._fp_plain(v, t, depth)
+            finally:
+                busy.discard(key)
+        elif t is _FUNCTION:
+            busy.add(key)
+            try:
+                out = self._fp_function(v, depth)
+            finally:
+                busy.discard(key)
+        else:
+            busy.add(key)
+            try:
+                out = self._fp(v, t, depth)
+            finally:
+                busy.discard(key)
         try:
             out = hash(out)
         except TypeError:
             out = hash(repr(out))
         self.memo[key] = out
         return out
+
+    def _fp_plain(self, v, t, depth):
+        """_fp of a dict, list, tuple, set or frozenset that marshal cannot write."""
+        if t is dict:
+            return self._dict(v, depth)
+        if t is tuple and v and all(isinstance(x, type) for x in v):
+            return ("tc", frozenset(self._seq(v, depth + 1)))
+        if t in (list, tuple):
+            return (t.__name__, tuple(self._seq(v, depth + 1)))
+        return ("s", frozenset(self._seq(v, depth + 1)))
+
+    def _fp_function(self, v, depth):
+        """_fp of a plain function (type(v) is types.FunctionType), with fp's cheap cases inlined."""
+        cells = ()
+        if v.__closure__:
+            cells = tuple(self._cell(c, depth) for c in v.__closure__)
+        code = v.__code__
+        h = self.code_memo.get(id(code))
+        if h is None:
+            h = self.code(code)
+        d = v.__defaults__
+        k = v.__kwdefaults__
+        return ("F", v.__qualname__, h, _NONE_FP if d is None else self.fp(d, depth + 1),
+                _NONE_FP if k is None else self.fp(k, depth + 1), cells)
 
     def _fp(self, v, t, depth):
         if t in _MARSHAL_OK:
@@ -297,6 +351,48 @@ def class_paths():
     return paths
 
 
+def code_base():
+    """Fingerprinter.base_codes() of the code objects of the functions that the loaded sqlglot
+    modules hold (module globals, class attributes, and the functions in the tables (dict
+    values) there), for the snapshots of this process and of the processes forked from it. A
+    code object that this walk does not reach is hashed by the snapshot as before."""
+    f = Fingerprinter()
+    code = f.code
+    seen = set()
+    fn = types.FunctionType
+    wrappers = (classmethod, staticmethod)
+
+    def scan(x):
+        t = type(x)
+        if t is fn:
+            code(x.__code__)
+        elif t in wrappers:
+            x = x.__func__
+            if type(x) is fn:
+                code(x.__code__)
+        elif t is property:
+            for g in (x.fget, x.fset, x.fdel):
+                if type(g) is fn:
+                    code(g.__code__)
+        elif t is dict:
+            for y in x.values():
+                if type(y) is fn:
+                    code(y.__code__)
+        elif isinstance(x, type):
+            if x in seen:
+                return
+            seen.add(x)
+            for y in list(x.__dict__.values()):
+                scan(y)
+
+    for mod_name, m in sorted(sys.modules.items()):
+        if m is None or not (mod_name == "sqlglot" or mod_name.startswith("sqlglot.")):
+            continue
+        for v in list(vars(m).values()):
+            scan(v)
+    return f.base_codes()
+
+
 def snapshot(code_alias=None, base_codes=None, only=None):
     """{key: fingerprint} for the loaded sqlglot modules.
 
@@ -313,20 +409,31 @@ def snapshot(code_alias=None, base_codes=None, only=None):
     seen_classes = set()
     f.function_keys = set()  # keys whose value is a function (found by name at run time, also dynamically)
 
+    prim = _PRIM_NAME.get
+    fp = f.fp
+    function_types = _FUNCTION_TYPES
+    tables = _TABLE_TYPES
+    plain = _PLAIN
+
     def add_value(key, v):
         t = type(v)
-        if t in (types.FunctionType, classmethod, staticmethod, property, types.MethodType):
+        n = prim(t)
+        if n is not None:
+            out[key] = (n, v)  # (f.fp of a plain value; a builtin type: the steps below do nothing else)
+            return
+        if t in function_types:
             f.function_keys.add(key)
-        mod = getattr(t, "__module__", "") or ""
-        if mod.startswith("sqlglot") and not isinstance(v, (type, enum.Enum)) and t is not types.FunctionType:
-            state = f._state(v, t)
-            if state:
-                for name, x in state:
-                    out[("O",) + key[1:] + (name,)] = f.fp(x)
-                return
-        if t is dict or t is set or t is frozenset:
+        if t not in plain:  # (the type of a plain table, a function: its __module__ is not sqlglot's)
+            mod = getattr(t, "__module__", "") or ""
+            if mod.startswith("sqlglot") and not isinstance(v, (type, enum.Enum)) and t is not types.FunctionType:
+                state = f._state(v, t)
+                if state:
+                    for name, x in state:
+                        out[("O",) + key[1:] + (name,)] = fp(x)
+                    return
+        if t in tables:
             f.objects[key] = v
-        out[key] = f.fp(v)
+        out[key] = fp(v)
 
     def add_class(cls, mod=None, path=None):
         if cls in seen_classes:

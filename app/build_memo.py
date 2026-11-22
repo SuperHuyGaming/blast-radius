@@ -184,7 +184,7 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
             steps = [None] * len(order)
             fx = fixed_of(q, len(order))
             hot = set(fx["store"]) if fx is not None else None
-            run = {"keys": keys, "steps": steps, "order": [type(s).__name__ for s in order],
+            run = {"keys": keys, "steps": steps, "lkeys": memo.loose_keys(order, idx, plan.ctes), "order": [type(s).__name__ for s in order],
                    "feeds": [any(isinstance(d, (planner.Aggregate, planner.Sort, planner.SetOperation)) for d in s.dependents) for s in order],
                    "root": idx[id(plan.root)]}
             runs.append(run)
@@ -304,6 +304,7 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
             opt.setdefault("cpu", []).append(dt)
             opt.setdefault("in", []).append(fp_in)
             opt.setdefault("call", []).append((len(a), sorted(k.items())))
+            opt.setdefault("tb", []).append((memo.tb_fp(return_value), memo.type_sig(return_value)))
             if r == 1:
                 fp_out = stages.fingerprint(return_value)
                 data = memo.dump_expr(return_value)
@@ -369,6 +370,12 @@ def child(root, q, te, schema, tables, sqls, want, wfd):
         good_opt = (len(opt.get("in", ())) == 2 and opt["in"][0] == opt["in"][1] and opt["in"][0] is not None
                     and opt["call"][0] == opt["call"][1] == (2, [("dialect", None), ("leave_tables_isolated", True)])
                     and opt.get("out") == want[0])
+        # the type-only shortcut (StageCheck.type_only): the type-blind fingerprint of the optimized
+        # expression and the loose plan keys, equal in both runs, and the audit of the extent
+        tbs = opt.get("tb", [])
+        good_tb = len(tbs) == 2 and tbs[0] == tbs[1] and None not in tbs[0] and opt.get("out") == want[0]
+        out["tbfp"], out["tsig"] = tbs[0] if good_tb else (None, None)
+        out["lkeys"] = a["lkeys"] if a["lkeys"] is not None and a["lkeys"] == b["lkeys"] else None
         out.update(frame=lines_of("frame"), planl=lines_of("plan"), anyl=sorted(steps_all | set(lines_of("frame", "plan", "post"))),
                    early=lines_of("pre", "opt"), mid=lines_of("mid"),
                    opt={"in": opt["in"][0], "blob": opt["blob"], "cpu": round(min(opt["cpu"]), 5), "kfp": opt["kfp"]} if good_opt else None)
@@ -419,6 +426,7 @@ def main():
             del live[r]
             done[q] = marshal.loads(b"".join(chunks))
     queries, by_line, first, dat, skipped, t_line = {}, {}, {}, [], {}, {}
+    audit_cache = {}
     off = 0
     for q in sorted(done):
         o = done[q]
@@ -456,7 +464,8 @@ def main():
         queries[q] = {"keys": o["keys"], "outs": o["outs"], "cpu": o["cpu"], "store": store, "opt": opt,
                       "late": round(sum(o["cpu"]), 4), "order": o["order"], "subq": o["subq"], "cont": o["cont"],
                       "alias": o["alias"], "chash": o["chash"], "planl": True,
-                      "text": o["text"] is not None, "sqlh": o["sqlh"], "mtext": o["mtext"], "rname": o["rname"]}
+                      "text": o["text"] is not None, "sqlh": o["sqlh"], "mtext": o["mtext"], "rname": o["rname"],
+                      "tbfp": o.get("tbfp"), "tsig": o.get("tsig"), "lkeys": o.get("lkeys"), "tsafe": bool(memo.audit(root, o["anyl"], audit_cache))}
     sets, ids, cov = [], {}, {}
     for (path, ln), users in sorted(by_line.items()):
         key = tuple(sorted(users))

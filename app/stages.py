@@ -535,7 +535,145 @@ class StageCheck:
         self.ran.append((index, what))
         self.seq.append("d")
         self.task = None
-        return executor(*args, **kwargs).execute(plan(plan_input.expression))
+        made = None
+        if what == "expression":
+            value, made = self.type_only(index, args, kwargs, plan_input)
+            if value is not None:
+                self.seq[-1] = "y"
+                return value
+        return executor(*args, **kwargs).execute(made if made is not None else plan(plan_input.expression))
+
+    # -- the type-only shortcut ------------------------------------------------------------
+    # A task whose optimized expression differs from the pinned one only in type annotations
+    # (an edit of annotate_types, say) used to run its plan to the end. Its rows are the pinned
+    # rows when (memo.py, build_memo.py):
+    #   - its optimized expression equals the pinned one but for the _type slots (type-blind
+    #     fingerprint: the same graph, parents and every other slot included), and the tables
+    #     equal the pinned tables (compare()'s check);
+    #   - no line of the pinned extent of its later work (planner, executor frame, steps, post)
+    #     is in a function that the commit changes (memo.prepare "tq"; changed module-level code,
+    #     first-use lines and the executor frame give no memo at all), so that work runs pinned
+    #     code;
+    #   - every statement of that extent that can read above a node or read a type annotation is
+    #     one of the reviewed statements (memo.REVIEWED, checked at build time: "tsafe"), so the
+    #     only data that differs (the DataType objects under _type) is read only inside the
+    #     subtrees that the steps' definitions reach downward;
+    #   - the plan that the pinned planner makes from it has the pinned step definitions with all
+    #     that they reach downward, types included (loose keys; plan.ctes is only saved and
+    #     restored in such an extent, see memo.REVIEWED).
+    # Then every read of the later work gives the pinned value, the work runs as on the pinned
+    # commit, and the root's table comes from the step memo (memo.execute with the pinned keys).
+    # The test still compares the rows with the pinned rows (on_result). Anything else: the task
+    # runs to its end as before.
+
+    memo_info = None  # memo.prepare's answer for the commit (selector), when the memo applies
+    memo_loader = None  # () -> (memo.Store, memo.prepare's answer) or None, made when first needed
+    type_only_n = 0
+    maps_dir = None  # the maps of the step memo (memo.Store), for memo_loader
+
+    def _tables_differ(self, kwargs):
+        want = self.tasks[self.task_index_for_tables]
+        fixture = getattr(self.module, "_tables", None)
+        if isinstance(fixture, dict):
+            for name, table in dict.items(fixture):
+                if name not in self.rows0 and name not in self.rows_seen:
+                    t0 = time.process_time()
+                    try:
+                        self.rows_seen[name] = hash(tuple(table.rows))
+                    except Exception:  # noqa: BLE001
+                        return True
+                    self.rows_cpu += time.process_time() - t0
+        return fingerprint(kwargs["tables"], table_leaves(fixture)) != want[1]
+
+    def _to_why(self, dbg, where, value, made):
+        if dbg:
+            sys.stderr.write("type-only: no (%s)\n" % (where,))
+        return value, made
+
+    def type_only(self, index, args, kwargs, plan_input):
+        """(the root's table, None) for a task that the type-only shortcut answers, else (None,
+        the plan when one was made here and nothing ran on it, else None)."""
+        dbg = os.environ.get("BR_TO_DBG") == "1"
+        if os.environ.get("BR_TYPE_ONLY", "1") != "1":
+            return None, None
+        import memo
+
+        plan, executor = self.real
+        if self.memo_info is None and self.memo_loader is None:
+            return None, None  # (memo_hooks: the test of the step memo only)
+        try:
+            if self.memo is not None:
+                store = self.memo[0]
+            elif self.memo_loader is not None:
+                store = memo.Store(self.maps_dir) if self.maps_dir else None
+                if store is None or not store.ok():
+                    return self._to_why(dbg, "store", None, None)
+            else:
+                return self._to_why(dbg, "no memo", None, None)
+            rec = store.index["queries"].get(index)
+            if (rec is None or rec.get("tsafe") is not True or rec.get("tbfp") is None or rec.get("tsig") is None
+                    or rec.get("lkeys") is None or rec.get("planl") is not True or rec.get("order") is None):
+                return self._to_why(dbg, "record", None, None)
+            if args or list(kwargs) != ["tables"]:
+                return self._to_why(dbg, "call", None, None)
+            self.task_index_for_tables = index
+            if self._tables_differ(kwargs):
+                return self._to_why(dbg, "tables", None, None)
+            # (the cheap filter first: most other expressions differ in their node classes)
+            if memo.type_sig(plan_input.expression) != rec["tsig"] or memo.tb_fp(plan_input.expression) != rec["tbfp"]:
+                return self._to_why(dbg, "type-blind", None, None)
+            if self.memo_info is not None:
+                m = self.memo_info
+            elif self.memo_loader is not None:
+                loader, self.memo_loader = self.memo_loader, None
+                got = loader()
+                if got is None:
+                    return self._to_why(dbg, "prepare", None, None)
+                self.memo_loader = lambda: got
+                store, m = got
+                rec = store.index["queries"].get(index)
+                if rec is None:
+                    return self._to_why(dbg, "record", None, None)
+            else:
+                return self._to_why(dbg, "no prepare", None, None)
+            if index in m["tq"] or index in m["full"] or ("k:%d" % index) in m["d"]:
+                return self._to_why(dbg, "changed extent", None, None)
+            pre = "%d:" % index
+            if any(x.startswith(pre) for x in m["d"]):
+                return self._to_why(dbg, "dirty step", None, None)
+        except Exception:  # noqa: BLE001
+            return self._to_why(dbg, "error", None, None)
+        p = plan(plan_input.expression)  # (an error here is the task's own error: the caller plans again)
+        try:
+            co = memo.canon_order(p)
+            if co is None:
+                return self._to_why(dbg, "canon order", None, p)
+            order, idx = co
+            if [type(s).__name__ for s in order] != rec["order"]:
+                return self._to_why(dbg, "plan order", None, p)
+            lk = memo.loose_keys(order, idx, p.ctes)
+            if lk is None or lk[:-1] != rec["lkeys"][:-1]:  # (plan.ctes: see memo.REVIEWED)
+                return self._to_why(dbg, "loose keys", None, p)
+            tables = getattr(self.module, "_tables", None)
+            guard = set()
+            for t in (dict.values(tables) if isinstance(tables, dict) else ()):
+                guard.add(id(t))
+                guard.add(id(getattr(t, "rows", None)))
+            mods = (sys.modules["sqlglot.planner"],) + tuple(getattr(sys.modules["sqlglot.executor.table"], n) for n in ("Table", "RowReader", "RangeReader"))
+        except Exception:  # noqa: BLE001
+            return self._to_why(dbg, "setup", None, p)
+        rec["_stats"] = [0, 0, 0]
+        try:
+            value = memo.execute(executor(*args, **kwargs), p, index, rec, set(), store, self.spend, guard, mods)
+        except Exception:  # noqa: BLE001  (memo.Fallback or an error: the task runs to its end on a new plan)
+            if self.over:
+                raise _Same()
+            return self._to_why(dbg, "memo", None, None)
+        for k in range(3):
+            self.memo_stats[k] += rec["_stats"][k]
+        self.memo_used = True
+        self.type_only_n += 1
+        return value, None
 
     def spend(self, cost):
         if cost > self.budget - self.spent:
@@ -874,19 +1012,19 @@ def _entry_name(x):
     return type.__repr__(x) if isinstance(x, type) else repr(x)
 
 
-def state_before(effect, alias=None, every_table=False):
+def state_before(effect, alias=None, every_table=False, base_codes=None):
     """The state now, and for the tables that the pinned test fills (for every table when
     build_stages.py asks, which finds out which ones those are) the fingerprint of every entry
     under the name of its key (not the values: they can change in place)."""
     import statefp
 
-    state, f = statefp.snapshot(alias)
+    state, f = statefp.snapshot(alias, base_codes)
     keys = list(f.objects) if every_table else [k for k, e in effect.items() if e[0] == "entries"]
     tables = {k: {_entry_name(x): f.fp(v) for x, v in f.objects[k].items()} for k in keys if type(f.objects.get(k)) is dict}
     return state, tables
 
 
-def hold_state(effect, alias=None):
+def hold_state(effect, alias=None, base_codes=None):
     """Keeps the module state of this moment without computing its snapshot: a forked copy
     of this process waits, and computes state_before() only when held_state() asks for it.
     Most checks end without a verdict (a task with other rows, an error) and never ask: they
@@ -899,7 +1037,7 @@ def hold_state(effect, alias=None):
             os.close(ask_w)
             os.close(ans_r)
             if os.read(ask_r, 1):
-                view = memoryview(marshal.dumps(state_before(effect, alias)))
+                view = memoryview(marshal.dumps(state_before(effect, alias, base_codes=base_codes)))
                 while view:
                     view = view[os.write(ans_w, view):]
         except BaseException as e:  # noqa: BLE001  (no answer: the check gives no verdict)
@@ -945,14 +1083,14 @@ def held_state(holder):
         release(holder)
 
 
-def state_effect(before, alias=None):
+def state_effect(before, alias=None, base_codes=None):
     """What changed since state_before(): {key: ("value", fingerprint) or ("entries", {name of
     the entry's key: fingerprint}) or ("gone",)}. A table (dict) that only gained or changed
     entries gives "entries" when its entries were kept."""
     import statefp
 
     state0, tables0 = before
-    state1, f = statefp.snapshot(alias)
+    state1, f = statefp.snapshot(alias, base_codes)
     out = {}
     for k in statefp.diff(state0, state1):
         if k not in state1:
@@ -967,10 +1105,10 @@ def state_effect(before, alias=None):
     return out
 
 
-def state_ok(effect, before, alias=None):
+def state_ok(effect, before, alias=None, base_codes=None):
     """(True, []) when the state changed only as the pinned test changes it."""
     bad = []
-    for k, got in state_effect(before, alias).items():
+    for k, got in state_effect(before, alias, base_codes).items():
         want = effect.get(k)
         if want is None or want[0] != got[0]:
             bad.append(k)

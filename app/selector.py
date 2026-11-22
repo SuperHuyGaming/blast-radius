@@ -85,6 +85,7 @@ BASE_STATE = None
 SMALL_PLAN = float(os.environ.get("BR_SMALL_PLAN", "0.2"))  # CPU s; see small_plan in run()
 BASE_FUNCTION_KEYS = frozenset()
 BASE_OBJECTS = {}  # statefp key -> the pinned table (dict, set, frozenset) that it held at the snapshot
+CODE_BASE_TRIED = False  # ensure_code_base() ran
 BASE_CODES = None  # statefp code hashes of the snapshot of the pinned tree (statefp.Fingerprinter.base_codes)
 PRE_PATH = None  # sys.path before the parent imported the test modules' libraries (preimport_test_libraries)
 REGISTRY_CLEAR_AT = None  # first test after tests/test_dialect_entry_points.py (see registry_clear_at)
@@ -426,6 +427,59 @@ class Maps:
             self.test_cache[number] = rec
         return rec
 
+    def alt_tests(self):
+        """Tests with a second unit record (maps/t2, maps/u2: statement groups, see
+        tools/trace_units_g.py and compute_keeps): frozenset, empty without the files."""
+        alt = getattr(self, "_alt", None)
+        if alt is None:
+            try:
+                with open(os.path.join(self.path, "t2", "index.bin"), "rb") as f:
+                    alt = frozenset(marshal.loads(f.read()))
+            except (OSError, ValueError, EOFError, TypeError):
+                alt = frozenset()
+            self._alt = alt
+        return alt
+
+    def test_units2(self, number):
+        cache = getattr(self, "_t2", None)
+        if cache is None:
+            cache = self._t2 = {}
+        rec = cache.get(number, 0)
+        if rec == 0:
+            try:
+                with open(os.path.join(self.path, "t2", "%d.bin" % number), "rb") as f:
+                    rec = marshal.loads(_unz(f.read()))
+            except (OSError, ValueError, EOFError):
+                rec = None
+            cache[number] = rec
+        return rec
+
+    def unit_entries2(self, rel, line):
+        """unit_entries of the second unit records (maps/u2)."""
+        fid = self.meta["files"].get(rel)
+        if fid is None:
+            return {}
+        cache = getattr(self, "_u2", None)
+        if cache is None:
+            cache = self._u2 = {}
+        key = (fid, line // 256)
+        chunk = cache.get(key)
+        if chunk is None:
+            try:
+                with open(os.path.join(self.path, "u2", "%d_%d.bin" % key), "rb") as f:
+                    chunk = marshal.loads(_unz(f.read()))
+            except (OSError, ValueError, EOFError):
+                chunk = {}
+            cache[key] = chunk
+        raw = chunk.get(line)
+        if raw is None:
+            return {}
+        if isinstance(raw, bytes):
+            arr = array("H")
+            arr.frombytes(raw)
+            raw = chunk[line] = dict(zip(arr[0::2], arr[1::2]))
+        return raw
+
     def readers(self, name):
         """The function lines that read 'name': list of (path, line)."""
         if self._readers is None:
@@ -542,7 +596,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "istage", "class_broken", "coll_dead", "coll_names", "coll_extra", "vanished")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "guard", "prep", "suspects", "body", "econ", "settings", "iters", "swap", "swap_work", "klass", "class_work", "pre_keeps", "stage", "stage_info", "istage", "class_broken", "coll_dead", "coll_names", "coll_extra", "vanished", "alt", "memo_old")
 
     def __init__(self, commit):
         self.commit = commit
@@ -556,6 +610,7 @@ class Plan:
         self.lines = {}  # repo-relative .py path -> lines of the changed statements (call-time code)
         self.keeps = {}  # test -> (statements, fixture entries, pool tasks) to run; absent = whole test
         self.iters = {}  # test -> ((kept paths, their prefixes), rewritten sites, edits): see iterred.py
+        self.alt = set()  # tests whose keeps come from the second unit records (compute_keeps)
         self.pre_keeps = None  # (the keeps and iters it was made from, reduced code per test): prepare_keeps
         self.broken = []  # modules that fail to import with the patch
         self.class_broken = []  # test modules whose setUpClass raises (they import): see finish()
@@ -2429,6 +2484,7 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
     """For each candidate test whose independent parts are mapped: the parts that run the
     changed code or read a changed fixture entry. Other parts cannot change their result."""
     keeps = {}
+    plan.alt = set()
     if plan.mode not in ("hot", "fresh", "fresh_purge", "fresh_cone"):
         return keeps
     # The small-scale variants (reduce.SCALED) run on every path: their whole runs cost far
@@ -2514,9 +2570,68 @@ def compute_keeps(plan: Plan, maps: Maps, tests):
             plan.unaffected.add(n)
             continue
         keeps[n] = (keep_stmts, keep_files, keep_tasks, n in keeps, chosen)
+    if plan.mode == "hot" and code_lines and not fixtures and ALT_UNITS and maps.alt_tests():
+        alt_keeps(plan, maps, keeps, code_lines)
     if plan.mode == "hot" and ITERS_ON and plan.lines and None not in plan.lines.values():
         compute_iters(plan, maps, keeps)
     return keeps
+
+
+ALT_UNITS = os.environ.get("BR_NO_ALT_UNITS") != "1"  # the second unit records (alt_keeps)
+
+
+def alt_keeps(plan: Plan, maps: Maps, keeps, code_lines):
+    """Statement groups (maps/t2 and maps/u2, built by tools/trace_units_g.py and
+    tools/build_unitmap_g.py from the pinned commit). In the first unit record of a test, a
+    statement that binds a name which a later statement reads always runs (expr = parse_one(...)
+    before the checks of expr): the lines that it runs make the whole test run. In the second
+    record such a statement is a part too, in one group with the statements that read what it
+    binds, and the statements of a group are traced together and kept together.
+
+    Only the statements to keep come from the second record, and only in hot mode for a commit
+    that changes code lines and no fixture file. Everything else stays with the first record:
+    which tests are candidates, unaffected or run whole for another reason, and the cost
+    estimate (the chosen units of the first record, or none when that record runs the test
+    whole), so the hold rule, the budget and the CPU guard decide as they did."""
+    for n in maps.alt_tests():
+        if n not in plan.cands or n in plan.unaffected:
+            continue
+        old = keeps.get(n)
+        if old is not None and (old[0] is None or old[3]):
+            continue
+        trec = maps.test_units2(n)
+        if trec is None:
+            continue
+        units, patterns = trec[3], trec[4]
+        chosen = set()
+        seen = False
+        whole = False
+        for rel, ln in code_lines:
+            pat = maps.unit_entries2(rel, ln).get(n)
+            if pat is None:
+                continue
+            seen = True
+            if pat == BASE_PATTERN:
+                whole = True
+                break
+            chosen.update(patterns[pat])
+        if whole or not seen:
+            continue  # the first record decides (both records cover the same lines)
+        keep_stmts = set()
+        keep_files = {}
+        keep_tasks = set() if any(u[0] == "t" for u in units) else None
+        for ui in chosen:
+            kind, name, i, parent = units[ui]
+            if kind == "s":
+                keep_stmts.add(i)
+            elif kind == "f":
+                keep_files.setdefault(name, set()).add(i)
+            else:
+                keep_tasks.add(i)
+            if parent >= 0:
+                keep_stmts.add(parent)
+        keeps[n] = (keep_stmts, keep_files, keep_tasks, False, None if old is None else old[4])
+        plan.alt.add(n)
 
 
 def compute_iters(plan: Plan, maps: Maps, keeps):
@@ -2526,6 +2641,8 @@ def compute_iters(plan: Plan, maps: Maps, keeps):
 
     lines = {rel: lns for rel, lns in plan.lines.items() if rel.endswith(".py")}
     for n in plan.cands:
+        if n in plan.alt:
+            continue  # the loop maps were traced over the first unit record's statements
         rec = iterred.record(maps.path, n)
         if rec is None:
             continue
@@ -2598,7 +2715,7 @@ def _moved_shape(full, lines, shape):
     return (shape[0] + move, shape[1] + move) + tuple(shape[2:])
 
 
-def _reduction_inputs(maps: Maps, tests, n, keep_stmts, scaled, it, lines_cache, faithful):
+def _reduction_inputs(maps: Maps, tests, n, keep_stmts, scaled, it, lines_cache, faithful, alt=False):
     """The part of apply_keeps for test n that reads only the pinned test file and the maps:
     (test id, file, class name, method, old code, new code), with old = new = None when the
     whole method stays, or None when no reduction applies (the whole test runs). The caller
@@ -2607,7 +2724,7 @@ def _reduction_inputs(maps: Maps, tests, n, keep_stmts, scaled, it, lines_cache,
 
     test_id = tests[n]["id"]
     rel, cls_name, meth = test_id.split("::")
-    trec = maps.test_units(n)
+    trec = maps.test_units2(n) if alt else maps.test_units(n)  # (alt: the statement flags of the second record)
     shape = None
     if trec is not None:
         shape = (trec[0], trec[1], trec[2])
@@ -2658,7 +2775,7 @@ def prepare_keeps(plan: Plan, maps: Maps, tests):
     for n, (keep_stmts, keep_files, keep_tasks, scaled, _) in items:
         it = iters.get(n)
         try:
-            got = _reduction_inputs(maps, tests, n, keep_stmts, scaled, it, _PRE_LINES, faithful)
+            got = _reduction_inputs(maps, tests, n, keep_stmts, scaled, it, _PRE_LINES, faithful, n in plan.alt)
         except Exception:  # noqa: BLE001  (the child does it, as before)
             return
         pre[n] = None if got is None else got + (keep_files, keep_tasks, it)
@@ -2704,7 +2821,7 @@ def apply_keeps(plan: Plan, maps: Maps, tests):
         it = iters.get(n)
         test_id = tests[n]["id"]
         rel, cls_name, meth = test_id.split("::")
-        trec = maps.test_units(n)
+        trec = maps.test_units2(n) if n in plan.alt else maps.test_units(n)
         shape = None
         if trec is not None:
             shape = (trec[0], trec[1], trec[2])
@@ -2979,7 +3096,19 @@ def run_tokcheck(numbers, wfd):
     return found
 
 
-def memo_dirty(plan, record=None):
+def memo_old_texts(plan):
+    """{repo path: pinned text} of the files that the commit changes (parent side), or None."""
+    try:
+        old = {}
+        for p in plan.files:
+            with open(os.path.join(ROOT, p), encoding="utf-8", newline="") as f:
+                old[p] = f.read()
+        return old
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def memo_dirty(plan, record=None, old=None):
     """Parent side: what memo.prepare finds for the commit's changed functions ({"d": dirty step
     ids, "full": tasks without the memo, "noopt": tasks whose optimize() may be answered from
     the record}), or None (no memo). The pinned texts are read here, in the parent: the child
@@ -2990,13 +3119,47 @@ def memo_dirty(plan, record=None):
         store = memo.Store(MAPS)
         if not store.ok():
             return None
-        old = {}
-        for p in plan.files:
-            with open(os.path.join(ROOT, p), encoding="utf-8", newline="") as f:
-                old[p] = f.read()
+        if old is None:
+            old = {}
+            for p in plan.files:
+                with open(os.path.join(ROOT, p), encoding="utf-8", newline="") as f:
+                    old[p] = f.read()
         return memo.prepare(store, plan.files, old, record)
     except Exception:  # noqa: BLE001
         return None
+
+
+MEMO_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"  # (the test of the step memo, build_memo.py)
+
+
+def memo_hooks(check, plan, record, test_id, m):
+    """The type-only shortcut of the stage check (StageCheck.type_only): memo.prepare's answer when
+    the selector has it, else a loader that the check calls at its first task with another
+    optimized expression (from the pinned texts that the parent read: plan.memo_old)."""
+    if not MEMO or test_id != MEMO_TEST or plan.mode != "hot":
+        return
+    if m is not None:
+        if check.memo is not None:
+            check.memo_info = m
+        return
+
+    def load():
+        try:
+            import memo
+
+            old = getattr(plan, "memo_old", None)
+            if old is None:
+                return None
+            got = memo_dirty(plan, record, old)
+            if got is None:
+                return None
+            store = memo.Store(MAPS)
+            return (store, got) if store.ok() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    check.memo_loader = load
+    check.maps_dir = MAPS
 
 
 def memo_cost(m, cpu, active, later):
@@ -3058,9 +3221,10 @@ def _inline_verdict(plan: Plan, tests, case, real, code_pairs):
             check.hook_changed = m.get("hook_edit", True) is not False
             rowh = store.index.get("rowh")
             check.rowh = rowh if type(rowh) is dict and rowh else None
+    memo_hooks(check, plan, record, test_id, st.get("memo"))
     pairs = list(code_pairs) + list(plan.fpairs or ())
     alias = stages.code_alias(pairs) if pairs else None
-    holder = stages.hold_state(record["effect"], alias)
+    holder = stages.hold_state(record["effect"], alias, BASE_CODES)
     try:
         return _inline_run(plan, check, module, cls, case, real, record, holder, alias)
     finally:
@@ -3075,6 +3239,14 @@ def _inline_run(plan, check, module, cls, case, real, record, holder, alias):
     if not check.install(module, cls):
         return None
     reduce.STATE.task_hook = check.run_task
+    unparse = None
+    if plan.istage.get("pcache"):
+        try:
+            import parsecache
+
+            unparse = parsecache.install(module, cls, alias)
+        except Exception:  # noqa: BLE001  (no parse cache: the texts are parsed)
+            unparse = None
     try:
         module.initializer(getattr(module, record["schema"]), getattr(case, record["tables"]))
         if not check.rows_start():
@@ -3086,9 +3258,13 @@ def _inline_run(plan, check, module, cls, case, real, record, holder, alias):
             failed = True
     finally:
         reduce.STATE.task_hook = None
+        if unparse is not None:
+            unparse()
         check.remove()
     if DEBUG:
-        sys.stderr.write("inline check %s: failed %s over %s why %s seq %s\n" % (plan.commit, failed, check.over, check.why, "".join(check.seq)))
+        sys.stderr.write("inline check %s: failed %s over %s why %s seq %s type-only %d\n" % (plan.commit, failed, check.over, check.why, "".join(check.seq), check.type_only_n))
+        if "parsecache" in sys.modules:
+            sys.stderr.write("inline check %s: parse cache %s\n" % (plan.commit, sys.modules["parsecache"].STATS))
     if failed:
         return True
     if not check.complete():
@@ -3099,7 +3275,7 @@ def _inline_run(plan, check, module, cls, case, real, record, holder, alias):
         if not check.rows_ok():
             return None
         before = stages.held_state(holder)
-        ok = stages.state_ok(record["effect"], before, alias)[0] if before is not None else False
+        ok = stages.state_ok(record["effect"], before, alias, BASE_CODES)[0] if before is not None else False
         if not ok:
             return None
     return False
@@ -3257,17 +3433,26 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
                         info["memo_dirty"] = [len(m["d"]), len(m["full"]), len(m["noopt"])]
                 except Exception as e:  # noqa: BLE001  (no memo: the check runs as before)
                     info["memo_err"] = repr(e)[:200]
+            memo_hooks(check, plan, record, test_id, st.get("memo"))
         pairs = code_pairs + list(plan.fpairs or ())  # function bodies that the commit changes
         alias = stages.code_alias(pairs) if pairs else None
         # as for a test: the "S" line, the dialect registry of a full run, the CPU limit
         started(n)
-        holder = stages.hold_state(record["effect"], alias)  # the module state before the check
+        holder = stages.hold_state(record["effect"], alias, BASE_CODES)  # the module state before the check
         before_settings = _interpreter_settings()
         if not check.install(module, cls):
             info["why"] = "execute() is not the pinned one"
             return
         results = []
         reduce.STATE.task_hook = check.run_task
+        unparse = None
+        if st.get("pcache"):
+            try:
+                import parsecache
+
+                unparse = parsecache.install(module, cls, alias)
+            except Exception:  # noqa: BLE001  (no parse cache: the texts are parsed)
+                unparse = None
         try:
             if check.probe(case):
                 runner.run_tests([(n, test_id)], lambda number, failed: results.append(failed), False, keeps)
@@ -3275,6 +3460,9 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
                 results.append(False)  # (over: no verdict below)
         finally:
             reduce.STATE.task_hook = None
+            if unparse is not None:
+                unparse()
+                info["pcache"] = list(sys.modules["parsecache"].STATS[:3])
             check.remove()
             signal.setitimer(signal.ITIMER_PROF, 0)  # (started() set the CPU limit of the check)
         info["t_run"] = round(time.process_time() - t0, 3)
@@ -3302,7 +3490,7 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
                 verdict = None
             elif check.same or check.memo_used:
                 before = stages.held_state(holder)
-                ok, changed = stages.state_ok(record["effect"], before, alias) if before is not None else (False, [("no", "snapshot")])
+                ok, changed = stages.state_ok(record["effect"], before, alias, BASE_CODES) if before is not None else (False, [("no", "snapshot")])
                 if not ok:
                     info["state"] = [list(map(str, k)) for k in changed[:5]]
                     verdict = None
@@ -4037,6 +4225,25 @@ def fixture_batch_child(batch, tests, wfd):
         os._exit(0)
 
 
+def ensure_code_base():
+    """Sets BASE_CODES (when the saved base state was loaded, no snapshot of this process made
+    it): the hashes of the code objects that the loaded sqlglot modules hold, which the
+    snapshots of the forked children reuse (statefp.code_base). The list in BASE_CODES keeps
+    those code objects alive here and in every child, so an id in it names that very object.
+    Without it, each snapshot hashes every code object itself: the same values."""
+    global BASE_CODES, CODE_BASE_TRIED
+    if BASE_CODES is not None or CODE_BASE_TRIED or os.environ.get("BR_NO_BASE_CODES") == "1":
+        return
+    CODE_BASE_TRIED = True  # (once: a failure is not retried for every check)
+    try:
+        import statefp
+
+        BASE_CODES = statefp.code_base()
+    except Exception as e:  # noqa: BLE001  (no table: the snapshots hash every code object)
+        BASE_CODES = None
+        log("code base failed", repr(e)[:200])
+
+
 def run_fixture_batch_child(batch, tests, time_left):
     """Runs the tests of several fixture-only commits in one forked child (fixture_batch_child).
     batch: [(plan, tests to run, allowed seconds per test, skip_after_fail, cap)], as run_child
@@ -4169,6 +4376,8 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     import-time values differ from the pinned tree; on_diff(names) then decides what to run."""
     if plan.mode == "hot" and PRE_KEEPS and (plan.pre_keeps is None or plan.pre_keeps[0] is not plan.keeps):
         prepare_keeps(plan, MAPS_OBJ, tests)
+    if (plan.stage is not None or plan.istage is not None) and BASE_CODES is None:
+        ensure_code_base()  # (before the fork: the child's two state snapshots reuse the code hashes)
     r, w = os.pipe()
     plan_r = plan_w = None
     if on_diff is not None:
@@ -5177,7 +5386,7 @@ def run(t_start, deadline, state):
             debug_rows[c] = {
                 "mode": plan.mode, "status": status, "cands": sorted(plan.cands), "cpu": round(sum(os.times()[:4]), 3),
                 "verdicts": {str(k): int(v) for k, v in verdicts.items()}, "note": plan.note,
-                "reduced": sorted(plan.keeps), "iters": {str(n): len(v[0][0]) for n, v in plan.iters.items()}, "held": sorted(held), "ran": len(ran), "diff": plan.diff,
+                "reduced": sorted(plan.keeps), "alt": sorted(plan.alt), "iters": {str(n): len(v[0][0]) for n, v in plan.iters.items()}, "held": sorted(held), "ran": len(ran), "diff": plan.diff,
                 "must": sorted(plan.must), "sure": sorted(plan.sure_infected.intersection(held)), "tokcheck": plan.tokcheck,
                 "times": {str(k): round(v, 4) for k, v in plan.times.items()},
                 "body": {str(k): round(v, 4) for k, v in plan.body.items()},
@@ -5531,7 +5740,18 @@ def run(t_start, deadline, state):
             if not (active - later):
                 continue  # every task runs to its end: the check cannot stop one early
             memo_info = memo_dirty(plan, record) if MEMO and later else None
+            if memo_info is None and MEMO and tests[n]["id"] == MEMO_TEST:
+                plan.memo_old = memo_old_texts(plan)  # (for the type-only shortcut, read in the child when needed)
             plan.istage = {"n": n, "later": sorted(later), "memo": memo_info}
+            try:
+                import parsecache
+
+                plan.istage["pcache"] = parsecache.plan_ok(plan, ROOT)
+            except Exception as e:  # noqa: BLE001  (no parse cache: the texts are parsed)
+                if DEBUG:
+                    log("parse cache plan:", repr(e))
+            if DEBUG:
+                log(plan.commit, "parse cache plan:", plan.istage.get("pcache"), parsecache.WHY if "parsecache" in sys.modules else None)
             plan.note.append("inline stage check: %d of %d tasks" % (len(active - later), len(active)))
             return
 
@@ -5579,6 +5799,8 @@ def run(t_start, deadline, state):
             to_end = sum(cpu[i][0] + cpu[i][1] for i in active & later)
             est = STAGE_STATE_SECONDS + fixed + sum(cpu[i][0] for i in active - later) + to_end
             memo_info = memo_dirty(plan, record) if MEMO and plan.mode == "hot" and later else None
+            if memo_info is None and MEMO and plan.mode == "hot" and tests[n]["id"] == MEMO_TEST:
+                plan.memo_old = memo_old_texts(plan)  # (for the type-only shortcut, read in the child when needed)
             if memo_info is not None:
                 est = STAGE_STATE_SECONDS + fixed + memo_cost(memo_info, cpu, active, later)
             most = STAGE_GAIN * (seconds[n] + WORKER_COST)  # what a check may cost when it saves the whole test
@@ -5600,6 +5822,12 @@ def run(t_start, deadline, state):
                 "deciders": {k for k in ran if tests[k]["id"].rsplit("::", 1)[0] == cls_id or fixtures & fixtures_of(k)},
                 "memo": memo_info,
             }
+            try:
+                import parsecache
+
+                plan.stage["pcache"] = parsecache.plan_ok(plan, ROOT, preload=False)
+            except Exception:  # noqa: BLE001  (no parse cache: the texts are parsed)
+                pass
             return
 
     def execute(c, plan, index):
@@ -6300,7 +6528,8 @@ def run(t_start, deadline, state):
                 if rec is not None:
                     plan.cands.update(maps.tests(rec[7]))
                     plan.cands.update(maps.tests(rec[8]))
-            plan.keeps = {n: k for n, k in plan.keeps.items() if k[4] is None}
+            plan.keeps = {n: k for n, k in plan.keeps.items() if k[4] is None and n not in plan.alt}
+            plan.alt = set()
     preimport_once()
     for c in fresh:
         if c == pandas_turn:
