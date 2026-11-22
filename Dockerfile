@@ -70,6 +70,10 @@ ENV PYTHONHASHSEED=0 \
 #    files are stored without zlib compression (rawmaps.py; rawz.py reads both forms, and every
 #    converted file is read back and compared). If a step fails, the selector works as before.
 COPY app /app
+# The step memo of the stage check of test_execute_tpcds (build_memo.py, memo.py): the outputs of
+# the executor steps of every TPC-DS query on the pinned commit. If it fails, the check runs as before.
+RUN (cd /repo && SKIP_INTEGRATION=0 timeout 150 python /app/build_memo.py /repo /app/maps/stages.bin /app/maps 4) \
+    || (echo "no step memo" >&2; rm -f /app/maps/memo.bin /app/maps/memo.dat)
 RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
     && mkdir -p /app/cache \

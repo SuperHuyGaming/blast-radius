@@ -122,8 +122,8 @@ SHORT_RERUN = os.environ.get("BR_SHORT_RERUN", "1") == "1"
 SHORT_MIN = float(os.environ.get("BR_SHORT_MIN", "2.0"))  # packed seconds of those tests at least
 SHORT_PASS = float(os.environ.get("BR_SHORT_PASS", "0.75"))  # share of them that pass (labeled mutants: 0.77)
 # charged seconds per estimated CPU second (a run costs about 0.7 of its estimate in local CPU,
-# and the scoring machine charges about 0.6 of that)
-SHORT_PRICE = float(os.environ.get("BR_SHORT_PRICE", "0.3"))
+# and the scoring machine charges about 0.6 of that; the board measured about 0.59 per local CPU second)
+SHORT_PRICE = float(os.environ.get("BR_SHORT_PRICE", "0.6"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 # A plain pytest run stops at collection when a test file cannot be imported (see finish()).
 # BR_STOP_AT_COLLECTION=0: such a commit also gets the tests that fail when they run.
@@ -132,6 +132,7 @@ STOP_AT_COLLECTION = os.environ.get("BR_STOP_AT_COLLECTION", "1") == "1"
 # test without a run: "1" on, "0" off. For validation: "always" = whenever the test is held,
 # "force" = the test is always held and checked.
 STAGE = os.environ.get("BR_STAGE", "1")
+MEMO = os.environ.get("BR_MEMO", "1") == "1"  # the step memo of the stage check (memo.py); BR_MEMO=0 turns it off
 # CPU seconds (as measured when the stage map was built) that a check may cost for each
 # second that leaving the test out of the answer saves. A check that proves a pass costs CPU
 # for all its tasks; at 1.3 it still pays when a CPU second is charged at 0.6 score seconds.
@@ -2495,6 +2496,52 @@ def run_tokcheck(numbers, wfd):
     return found
 
 
+def memo_dirty(plan, record=None):
+    """Parent side: what memo.prepare finds for the commit's changed functions ({"d": dirty step
+    ids, "full": tasks without the memo, "noopt": tasks whose optimize() may be answered from
+    the record}), or None (no memo). The pinned texts are read here, in the parent: the child
+    sees the patched tree."""
+    try:
+        import memo
+
+        store = memo.Store(MAPS)
+        if not store.ok():
+            return None
+        old = {}
+        for p in plan.files:
+            with open(os.path.join(ROOT, p), encoding="utf-8", newline="") as f:
+                old[p] = f.read()
+        return memo.prepare(store, plan.files, old, record)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def memo_cost(m, cpu, active, later):
+    """Build-time CPU seconds of the check's tasks with the memo (memo.prepare's answer m): a
+    task's early part without optimize() where the record answers it; a later task with a
+    record: its dirty steps, plus restoring the root's output; any other later task: to its end."""
+    import memo
+
+    store = memo.Store(MAPS)
+    queries = store.index["queries"]
+    dirty, full, noopt = set(m["d"]), set(m["full"]), set(m["noopt"])
+    total = 0.0
+    for i in active:
+        early, late = cpu.get(i, (0.0, 0.0))
+        rec = queries.get(i)
+        if i in noopt and rec is not None and rec.get("opt") is not None and os.environ.get("BR_MEMO_OPT", "1") == "1":
+            early = max(0.0, early - rec["opt"]["cpu"])
+        total += early
+        if i not in later:
+            continue
+        if rec is None or i in full:
+            total += late
+            continue
+        steps = [k for k in range(len(rec["keys"])) if "%d:%d" % (i, k) in dirty]
+        total += sum(rec["cpu"][k] for k in steps) + 0.01 + 0.002 * len(rec["keys"])
+    return total
+
+
 def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, settings, code_pairs, wfd):
     """Child side, after the commit's other runs: the stage check of the held long test
     (stages.py), when the parent would select that test without a run. It reports what it
@@ -2559,6 +2606,19 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
             check = stage_audit.AuditCheck(record, set(st["later"]), st["to_end"] + budget, active)
         else:
             check = stages.StageCheck(record, set(st["later"]), st["to_end"] + budget, active)
+            if st.get("memo") is not None:
+                try:
+                    import memo
+
+                    store = memo.Store(MAPS)
+                    m = st["memo"]
+                    if store.ok():
+                        check.memo = (store, set(m["d"]))
+                        check.memo_full = set(m["full"])
+                        check.noopt = set(m["noopt"])
+                        info["memo_dirty"] = [len(m["d"]), len(m["full"]), len(m["noopt"])]
+                except Exception as e:  # noqa: BLE001  (no memo: the check runs as before)
+                    info["memo_err"] = repr(e)[:200]
         pairs = code_pairs + list(plan.fpairs or ())  # function bodies that the commit changes
         alias = stages.code_alias(pairs) if pairs else None
         # as for a test: the "S" line, the dialect registry of a full run, the CPU limit
@@ -2582,6 +2642,7 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
         info["t_run"] = round(time.process_time() - t0, 3)
         info.update(same=len(check.same), ran=[[i, why] for i, why in check.ran[:8]], nran=len(check.ran),
                     proved=len(check.proved), seq="".join(check.seq), spent=round(check.spent, 3), why=check.why,
+                    memo=getattr(check, "memo_stats", None), opt=getattr(check, "opt_stats", None),
                     run=None if not results else results[0])
         if not results or results[0] is None:
             verdict = None
@@ -2598,7 +2659,7 @@ def run_stage_check(plan: Plan, tests, started, keeps, seen, broken, forced, set
             if _interpreter_settings() != before_settings:
                 info["state"] = "settings"
                 verdict = None
-            elif check.same:
+            elif check.same or check.memo_used:
                 before = stages.held_state(holder)
                 ok, changed = stages.state_ok(record["effect"], before, alias) if before is not None else (False, [("no", "snapshot")])
                 if not ok:
@@ -4759,6 +4820,9 @@ def run(t_start, deadline, state):
             fixed = max(0.0, cost["check"] - sum(v[0] for v in cpu.values()))  # parsing, pickling, the DuckDB texts
             to_end = sum(cpu[i][0] + cpu[i][1] for i in active & later)
             est = STAGE_STATE_SECONDS + fixed + sum(cpu[i][0] for i in active - later) + to_end
+            memo_info = memo_dirty(plan, record) if MEMO and plan.mode == "hot" and later else None
+            if memo_info is not None:
+                est = STAGE_STATE_SECONDS + fixed + memo_cost(memo_info, cpu, active, later)
             most = STAGE_GAIN * (seconds[n] + WORKER_COST)  # what a check may cost when it saves the whole test
             if est > most and STAGE != "force":
                 continue
@@ -4776,6 +4840,7 @@ def run(t_start, deadline, state):
                 "forced": n in plan.must or n in plan.sure_infected,
                 # the tests whose failure selects this one in finish()
                 "deciders": {k for k in ran if tests[k]["id"].rsplit("::", 1)[0] == cls_id or fixtures & fixtures_of(k)},
+                "memo": memo_info,
             }
             return
 

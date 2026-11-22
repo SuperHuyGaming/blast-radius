@@ -249,6 +249,13 @@ class StageCheck:
         self.real = None
         self.cls = None
         self.helper = None
+        self.memo = None  # (memo.Store, dirty step ids) when the step memo applies (memo.py)
+        self.memo_task = False
+        self.memo_used = False
+        self.memo_stats = [0, 0, 0, 0]  # steps taken from the record, run, restored; tasks that fell back
+        self.memo_full = set()  # tasks that run to their end although the memo has a record (memo.prepare)
+        self.noopt = set()  # tasks whose optimize() may give the pinned optimized expression
+        self.opt_stats = [0, 0]  # optimize() calls answered from the record, calls that ran
 
     # -- the two names that execute() looks up in its module, and the test's comparison ----
 
@@ -288,13 +295,43 @@ class StageCheck:
                 return helper(case, i, table, tpch=tpch)
             return None
 
+        self.real_opt = None
+        if self.noopt and self.memo is not None and os.environ.get("BR_MEMO_OPT", "1") == "1":
+            real_opt = g.get("optimize")
+            if isinstance(real_opt, types.FunctionType):
+                self.real_opt = real_opt
+                g["optimize"] = self.optimize_stub
         g["Plan"], g["PythonExecutor"] = plan_stub, ExecutorStub
         cls.subtestHelper = subtest_helper
         return True
 
+    def optimize_stub(self, *args, **kwargs):
+        """optimize() as execute() calls it in a task: the pinned optimized expression when no
+        line that ran before or inside optimize() for this task on the pinned commit is in a
+        changed function (memo.prepare) and the input expression is the pinned one. The result
+        is checked like the computed one (compare(): the expression fingerprint)."""
+        import memo
+
+        index = self.task
+        if index is not None and index in self.noopt and len(args) == 2 and kwargs == {"leave_tables_isolated": True, "dialect": None}:
+            rec = self.memo[0].index["queries"].get(index)
+            o = rec.get("opt") if rec is not None else None
+            if o is not None and fingerprint(args[0]) == o["in"]:
+                try:
+                    value = memo.load_expr(self.memo[0].raw(o["blob"]))
+                except Exception:  # noqa: BLE001  (no record: optimize() runs)
+                    value = None
+                if value is not None:
+                    self.opt_stats[0] += 1
+                    return value
+        self.opt_stats[1] += 1
+        return self.real_opt(*args, **kwargs)
+
     def remove(self):
         if self.globals is not None:
             self.globals["Plan"], self.globals["PythonExecutor"] = self.real
+            if getattr(self, "real_opt", None) is not None:
+                self.globals["optimize"] = self.real_opt
             self.cls.subtestHelper = self.helper
             self.globals = None
 
@@ -346,6 +383,8 @@ class StageCheck:
                 self.task = None
             return executor(*args, **kwargs).execute(plan_input)
         what = self.compare(index, args, kwargs, plan_input)
+        if what is None and self.memo_task:
+            return self.memo_execute(index, args, kwargs, plan_input)
         if what is None:
             self.same.append(index)
             self.seq.append("s")
@@ -358,6 +397,53 @@ class StageCheck:
         self.ran.append((index, what))
         self.seq.append("d")
         self.task = None
+        return executor(*args, **kwargs).execute(plan(plan_input.expression))
+
+    def spend(self, cost):
+        if cost > self.budget - self.spent:
+            self.stop("budget")
+            return False
+        self.spent += cost
+        return True
+
+    def memo_execute(self, index, args, kwargs, plan_input):
+        """A "later" task with the pinned input: the patched planner and steps, with the pinned
+        outputs of the steps that run no changed line (memo.py)."""
+        import memo
+
+        plan, executor = self.real
+        store, dirty = self.memo
+        rec = store.index["queries"][index]
+        self.task = None
+        try:
+            tables = getattr(self.module, "_tables", None)
+            guard = set()
+            for t in (dict.values(tables) if isinstance(tables, dict) else ()):
+                guard.add(id(t))
+                guard.add(id(getattr(t, "rows", None)))
+            mods = (sys.modules["sqlglot.planner"],) + tuple(getattr(sys.modules["sqlglot.executor.table"], n) for n in ("Table", "RowReader", "RangeReader"))
+            rec["_stats"] = [0, 0, 0]
+            value = memo.execute(executor(*args, **kwargs), plan(plan_input.expression), index, rec, dirty, store, self.spend, guard, mods)
+            for k in range(3):
+                self.memo_stats[k] += rec["_stats"][k]
+            self.memo_used = True
+            self.ran.append((index, "memo"))
+            self.seq.append("m")
+            return value
+        except memo.Fallback as e:
+            if self.over:
+                raise _Same()
+            if os.environ.get("BR_DEBUG"):
+                sys.stderr.write("memo task %d: %s\n" % (index, e))
+            self.memo_stats[3] += 1
+        except Exception as e:  # noqa: BLE001  (an error in a step that runs: no verdict)
+            self.stop("memo task %d: %r" % (index, e))
+            raise _Same()
+        # as before the memo: the task runs on to its end
+        if not self.spend(self.cpu.get(index, (0.0, 0.0))[1]):
+            raise _Same()
+        self.ran.append((index, "memo-fallback"))
+        self.seq.append("f")
         return executor(*args, **kwargs).execute(plan(plan_input.expression))
 
     def on_result(self, index, table):
@@ -404,6 +490,26 @@ class StageCheck:
             self.seq.append("q")
             self.stop("sql text of task %d" % index)
             return None
+        if index in self.later and self.memo is not None and index in self.memo[0].index["queries"] and index not in self.memo_full:
+            if not self.spend(self.cpu.get(index, (0.0, 0.0))[0]):
+                self.seq.append("o")
+                return None
+            self.task = index
+            self.memo_task = True
+            try:
+                value = fn(*args, **kwargs)
+            except _Same:
+                return None
+            finally:
+                reached = self.task is None
+                self.task = None
+                self.memo_task = False
+            if not reached:
+                self.ran.append((index, "path"))
+                self.seq.append("p")
+            if value is None and not self.over and any(i == index for i, _ in self.ran):
+                self.proved.append(index)
+            return value
         if index in self.later:
             if not self.affordable(index, True):
                 self.seq.append("o")
